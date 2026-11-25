@@ -781,6 +781,7 @@ dependencies = [
 name = "rv-host-win"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.2.17",
  "openh264",
  "opus",
  "rv-crypto",
@@ -788,6 +789,7 @@ dependencies = [
  "rv-session",
  "rv-usb-link",
  "thiserror 2.0.21",
+ "tokio",
  "windows",
 ]
 

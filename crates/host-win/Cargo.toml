@@ -17,6 +17,8 @@ rv-usb-link = { path = "../usb-link" }
 openh264 = "0.9"
 opus = "0.4"
 thiserror = "2"
+getrandom = "0.2"
+tokio = { version = "1", features = ["rt", "net", "macros"] }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"

@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use rv_crypto::{derive_psk, HandshakeKind, Keypair, Psk, Responder};
-use rv_proto::{codec_flags, ControlMessage, InputEvent, Packet, VideoPacket};
+use rv_proto::{codec_flags, AudioPacket, ControlMessage, InputEvent, Packet, VideoPacket};
 use rv_transport::fec;
 
 use crate::channel::{random_session_id, Channel};
@@ -205,6 +205,27 @@ impl<I: DatagramIo> HostSession<I> {
             sent += 1;
         }
         Ok(sent)
+    }
+
+    /// Seal and send one audio frame (e.g. a 10 ms Opus packet, <= 1200 bytes).
+    pub fn send_audio(
+        &mut self,
+        seq_num: u16,
+        capture_ts_us: u32,
+        duration_ms: u8,
+        channels_rate: u8,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        let pkt = Packet::Audio(AudioPacket {
+            seq_num,
+            capture_ts_us,
+            duration_ms,
+            channels_rate,
+            payload,
+        });
+        let dg = self.channel()?.seal(&pkt)?;
+        self.io.send(&dg);
+        Ok(())
     }
 
     pub fn send_control(&mut self, msg: ControlMessage) -> Result<()> {

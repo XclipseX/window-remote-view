@@ -19,13 +19,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets
-      - run: cargo build --release -p rv-signal-relay
+      - run: cargo build --release -p rv-signal-relay -p rv-host-win
       - uses: actions/upload-artifact@v4
         with:
-          name: signal-relay-${{ matrix.os }}
+          name: binaries-${{ matrix.os }}
           path: |
             target/release/rv-signal-relay
             target/release/rv-signal-relay.exe
+            target/release/rv-host.exe
           if-no-files-found: ignore
 
   android:
