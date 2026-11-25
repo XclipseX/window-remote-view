@@ -1,4 +1,4 @@
-# PROMPT NGHIÊN CỨU SỐ 2 – TỐI ƯU THIẾT BỊ SAMSUNG & KẾT NỐI LAN + SERVER
+# PROMPT NGHIÊN CỨU SỐ 2 – TỐI ƯU THIẾT BỊ (SAMSUNG + ASUS VIVOBOOK) & KẾT NỐI LAN + SERVER
 
 ## 1. Vai trò và bối cảnh
 Bạn là chuyên gia về Android multimedia (MediaCodec, Codec2, vendor HAL), chip di động Samsung Exynos và MediaTek Dimensity, cùng mạng thời gian thực (UDP, QUIC, NAT traversal). Tôi đang phát triển một ứng dụng điều khiển máy tính từ xa mã nguồn mở, miễn phí: máy Windows phát hình (host), thiết bị Android điều khiển (client). Ứng dụng dùng codec mở (H.264, HEVC, AV1) với mã hóa/giải mã phần cứng, có phần mềm làm dự phòng. Kiến trúc tổng thể đang được nghiên cứu ở một phiên khác. Phiên này CHỈ tập trung vào hai chủ đề dưới đây, cần đi thật sâu, có trích dẫn nguồn (tài liệu Android, mã nguồn AOSP, GitHub issue của Moonlight, scrcpy, Sunshine, RustDesk, Parsec, Steam Link, diễn đàn XDA, benchmark) và ưu tiên thông tin năm 2025–2026. Thông tin nào chưa kiểm chứng được thì ghi rõ mức độ chắc chắn.
@@ -20,6 +20,22 @@ Nếu dữ liệu công khai về Exynos 2600 còn ít, hãy suy luận từ Exy
 6. **Nhập liệu đặc thù Samsung:** S Pen (áp lực, độ nghiêng, nút bên, hover) truyền sang Windows Pen Injection; Samsung DeX (chế độ cửa sổ, chuột/bàn phím ngoài); Book Cover Keyboard và phím tắt bị One UI chặn (phím Samsung DeX, phím tìm kiếm); `requestPointerCapture` cho chuột Bluetooth; bàn phím Samsung Keyboard với tiếng Việt Telex.
 7. **Cấu hình mặc định đề xuất** cho từng máy: codec, độ phân giải, FPS, bitrate, khi dùng LAN và khi qua Internet; kèm cấu hình “tiết kiệm pin”.
 8. **Kế hoạch kiểm thử** trên hai máy: công cụ đo (Perfetto, `dumpsys gfxinfo`, đo độ trễ bằng camera quay chậm), kịch bản thử, chỉ số chấp nhận.
+
+## 2b. Chủ đề A2 – Tối ưu máy Windows phát hình (host): ASUS Vivobook S14 OLED, Ryzen AI 9 HX 370
+
+### Thiết bị
+- **ASUS Vivobook S14 OLED** dùng **AMD Ryzen AI 9 HX 370** (Zen 5 + Zen 5c, iGPU Radeon 890M kiến trúc RDNA 3.5, bộ mã hóa video VCN, NPU XDNA 2), màn hình OLED độ phân giải cao, tần số quét cao, Windows 11. Hãy xác minh chính xác thông số màn hình (độ phân giải, Hz, HDR) và phiên bản VCN.
+
+### Câu hỏi cần trả lời
+1. **Mã hóa phần cứng qua AMD AMF:** VCN trên Radeon 890M mã hóa được H.264, HEVC, AV1 ở độ phân giải/FPS tối đa bao nhiêu; số phiên mã hóa đồng thời; có hỗ trợ HEVC/AV1 YUV 4:4:4 không. So sánh chất lượng AMF với NVENC/QuickSync ở bitrate thấp, đặc biệt nội dung chữ văn phòng (AMF H.264 từng bị đánh giá kém — đến 2025–2026 đã cải thiện chưa?).
+2. **Cấu hình độ trễ thấp AMF:** usage ULTRA_LOW_LATENCY / LOW_LATENCY, tắt B-frame, intra-refresh, `AMF_VIDEO_ENCODER_LOWLATENCY_MODE`, rate control CBR/VBR/QVBR, pre-analysis, kích thước VBV; độ trễ mã hóa ước tính (ms/khung) ở 1080p60, 1440p120, độ phân giải gốc màn OLED.
+3. **Zero-copy pipeline:** DXGI Desktop Duplication hoặc Windows.Graphics.Capture → texture D3D11 → AMF trực tiếp, không copy về CPU; chuyển đổi màu BGRA→NV12 trên GPU; cách Sunshine và RustDesk làm với AMD.
+4. **Điện năng và nhiệt:** đây là laptop mỏng nhẹ, cần tối ưu pin khi làm host. So sánh tải CPU/GPU và công suất (W) giữa mã hóa phần cứng AMF và phần mềm (x264, SVT-AV1 trên Zen 5); ảnh hưởng của chế độ nguồn Windows, ASUS MyASUS (Whisper/Standard/Performance), AMD SmartShift, khi cắm sạc và khi chạy pin. Giảm FPS/không mã hóa khi màn hình tĩnh.
+5. **Màn hình OLED và HDR:** chụp nội dung HDR/10-bit, tone mapping sang SDR cho điện thoại, xử lý tần số quét cao và VRR; hiện tượng chống burn-in của OLED (dịch điểm ảnh, tự tắt màn) ảnh hưởng gì khi stream; tắt màn hình laptop khi đang được điều khiển để tiết kiệm điện mà vẫn chụp được hình (virtual display IddCx).
+6. **NPU XDNA 2 (≈50 TOPS):** có đáng dùng NPU cho việc gì không — ví dụ upscale/khử nhiễu, phát hiện vùng chữ để tăng chất lượng cục bộ (ROI encoding), dự đoán chuyển động con trỏ? Nếu không đáng, nói rõ lý do.
+7. **Driver và lỗi đã biết:** phiên bản driver AMD Adrenaline khuyến nghị, lỗi AMF trên RDNA 3.5 được ghi nhận trong GitHub issue của Sunshine/OBS/FFmpeg/RustDesk, cách khắc phục.
+8. **Mạng phía host:** card Wi-Fi của máy (Wi-Fi 6E/7?), tắt power-save Wi-Fi, cấu hình ưu tiên khi dùng LAN với S26+ và Tab S10+.
+9. **Cấu hình đề xuất** cho ba cặp: Vivobook → S26+, Vivobook → Tab S10+ (độ phân giải gốc 2800×1752@120), và chế độ tiết kiệm pin khi laptop chạy pin; gồm codec, độ phân giải, FPS, bitrate, chế độ nguồn.
 
 ## 3. Chủ đề B – Hỗ trợ đồng thời kết nối LAN và qua Server
 
@@ -47,5 +63,5 @@ Nếu dữ liệu công khai về Exynos 2600 còn ít, hãy suy luận từ Exy
 
 ## 4. Yêu cầu đầu ra
 - Viết bằng tiếng Việt, giữ thuật ngữ kỹ thuật tiếng Anh.
-- Mỗi chủ đề có: khuyến nghị cuối cùng, bảng so sánh, rủi ro và cách giảm thiểu, mã mẫu ngắn (Kotlin/C++ NDK cho cấu hình MediaCodec theo hãng; Rust/C++ cho discovery LAN và hole punching; file `docker-compose.yml` mẫu cho server).
-- Cuối bài: danh sách việc cần làm theo thứ tự ưu tiên và các câu hỏi còn bỏ ngỏ cần thử nghiệm thực tế trên S26+ và Tab S10+.
+- Mỗi chủ đề có: khuyến nghị cuối cùng, bảng so sánh, rủi ro và cách giảm thiểu, mã mẫu ngắn (Kotlin/C++ NDK cho cấu hình MediaCodec theo hãng; C++ cho pipeline D3D11 → AMF độ trễ thấp; Rust/C++ cho discovery LAN và hole punching; file `docker-compose.yml` mẫu cho server).
+- Cuối bài: danh sách việc cần làm theo thứ tự ưu tiên và các câu hỏi còn bỏ ngỏ cần thử nghiệm thực tế trên S26+, Tab S10+ và Vivobook S14 OLED.
