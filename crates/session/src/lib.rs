@@ -52,7 +52,11 @@ pub(crate) fn hs_parse(d: &[u8]) -> Result<(u8, u32, &[u8])> {
     if d.len() <= HS_HEADER_LEN || d[0] != HS_MAGIC {
         return Err(SessionError::Malformed);
     }
-    Ok((d[1], u32::from_be_bytes([d[2], d[3], d[4], d[5]]), &d[HS_HEADER_LEN..]))
+    Ok((
+        d[1],
+        u32::from_be_bytes([d[2], d[3], d[4], d[5]]),
+        &d[HS_HEADER_LEN..],
+    ))
 }
 
 #[cfg(test)]

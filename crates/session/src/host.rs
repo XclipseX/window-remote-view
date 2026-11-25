@@ -10,8 +10,13 @@ use crate::{hs_packet, hs_parse, DatagramIo, Result, SessionError, PROLOGUE};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostEvent {
     /// Handshake completed; carries the client's authenticated static key.
-    Established { client_static: [u8; 32] },
-    Input { seq: u16, event: InputEvent },
+    Established {
+        client_static: [u8; 32],
+    },
+    Input {
+        seq: u16,
+        event: InputEvent,
+    },
     Control(ControlMessage),
 }
 
@@ -84,7 +89,10 @@ impl<I: DatagramIo> HostSession<I> {
             return Err(SessionError::NotEstablished);
         };
         match ch.open(data)? {
-            Packet::Input(p) => self.events.push_back(HostEvent::Input { seq: p.input_seq, event: p.event }),
+            Packet::Input(p) => self.events.push_back(HostEvent::Input {
+                seq: p.input_seq,
+                event: p.event,
+            }),
             Packet::Control(c) => {
                 if let ControlMessage::FeedbackStats { loss_permille, .. } = &c.message {
                     self.loss = (f32::from(*loss_permille) / 1000.0).clamp(0.0, 1.0);
@@ -103,7 +111,13 @@ impl<I: DatagramIo> HostSession<I> {
                 if self.is_established() {
                     return Ok(()); // ignore stray/retransmitted msg1
                 }
-                let mut r = Responder::new(HandshakeKind::XxPsk3, &self.keypair, None, Some(&self.psk), PROLOGUE)?;
+                let mut r = Responder::new(
+                    HandshakeKind::XxPsk3,
+                    &self.keypair,
+                    None,
+                    Some(&self.psk),
+                    PROLOGUE,
+                )?;
                 r.read_message(msg)?;
                 let m2 = r.write_message(&self.session_id.to_be_bytes())?;
                 self.io.send(&hs_packet(2, self.session_id, &m2));
@@ -121,9 +135,12 @@ impl<I: DatagramIo> HostSession<I> {
                 // Wrong OTP surfaces here: the PSK is mixed into msg3.
                 r.read_message(msg)?;
                 let session = r.finish()?;
-                let client_static = session.remote_static().ok_or(SessionError::Handshake("no client key"))?;
+                let client_static = session
+                    .remote_static()
+                    .ok_or(SessionError::Handshake("no client key"))?;
                 self.state = State::Established(Box::new(Channel::new(session, self.session_id)));
-                self.events.push_back(HostEvent::Established { client_static });
+                self.events
+                    .push_back(HostEvent::Established { client_static });
                 Ok(())
             }
             _ => Err(SessionError::Handshake("unexpected step")),
@@ -139,7 +156,13 @@ impl<I: DatagramIo> HostSession<I> {
 
     /// FEC-encode `data` (one encoded video frame) and send all shards.
     /// Returns the number of datagrams sent.
-    pub fn send_video_frame(&mut self, frame_id: u32, capture_ts_us: u32, data: &[u8], keyframe: bool) -> Result<usize> {
+    pub fn send_video_frame(
+        &mut self,
+        frame_id: u32,
+        capture_ts_us: u32,
+        data: &[u8],
+        keyframe: bool,
+    ) -> Result<usize> {
         let loss = self.loss;
         let codec = self.codec;
         // Prefix the real length: VideoPacket has no frame_len field, and

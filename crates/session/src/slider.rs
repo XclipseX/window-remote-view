@@ -59,8 +59,14 @@ mod tests {
     #[test]
     fn anchors() {
         assert_eq!(slider_to_bitrate(1, 1920, 1080, 60, Codec::H264), 800_000);
-        assert_eq!(slider_to_bitrate(100, 1920, 1080, 60, Codec::H264), 45_000_000);
-        assert_eq!(slider_to_bitrate(100, 1920, 1080, 60, Codec::Hevc), 29_250_000);
+        assert_eq!(
+            slider_to_bitrate(100, 1920, 1080, 60, Codec::H264),
+            45_000_000
+        );
+        assert_eq!(
+            slider_to_bitrate(100, 1920, 1080, 60, Codec::Hevc),
+            29_250_000
+        );
         assert_eq!(slider_to_qp(1, Codec::Hevc), 44);
         assert_eq!(slider_to_qp(100, Codec::Hevc), 16);
         assert_eq!(slider_to_qp(100, Codec::Av1), 18);
@@ -77,10 +83,19 @@ mod tests {
         let d = slider_to_bitrate(DEFAULT_QUALITY, 1920, 1080, 60, DEFAULT_CODEC);
         assert!((12_000_000..=25_000_000).contains(&d), "{d}");
         // more pixels / fps => more bits
-        assert!(slider_to_bitrate(50, 2560, 1440, 60, Codec::Hevc) > slider_to_bitrate(50, 1920, 1080, 60, Codec::Hevc));
-        assert!(slider_to_bitrate(50, 1920, 1080, 120, Codec::Hevc) > slider_to_bitrate(50, 1920, 1080, 60, Codec::Hevc));
+        assert!(
+            slider_to_bitrate(50, 2560, 1440, 60, Codec::Hevc)
+                > slider_to_bitrate(50, 1920, 1080, 60, Codec::Hevc)
+        );
+        assert!(
+            slider_to_bitrate(50, 1920, 1080, 120, Codec::Hevc)
+                > slider_to_bitrate(50, 1920, 1080, 60, Codec::Hevc)
+        );
         // out-of-range clamps
         assert_eq!(slider_to_bitrate(0, 1920, 1080, 60, Codec::H264), 800_000);
-        assert_eq!(slider_to_bitrate(200, 1920, 1080, 60, Codec::H264), 45_000_000);
+        assert_eq!(
+            slider_to_bitrate(200, 1920, 1080, 60, Codec::H264),
+            45_000_000
+        );
     }
 }

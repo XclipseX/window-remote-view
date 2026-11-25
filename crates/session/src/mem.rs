@@ -20,7 +20,13 @@ pub struct MemIo {
 
 impl MemIo {
     pub fn new(q: Queue, loss: f64, seed: u64) -> Self {
-        Self { q, loss, rng: seed | 1, sent: 0, dropped: 0 }
+        Self {
+            q,
+            loss,
+            rng: seed | 1,
+            sent: 0,
+            dropped: 0,
+        }
     }
 
     fn next_f64(&mut self) -> f64 {

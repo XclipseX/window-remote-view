@@ -9,8 +9,20 @@ use rv_session::*;
 fn main() {
     let (to_host, to_client) = (queue(), queue());
     let host_id = b"example-host-id";
-    let mut host = HostSession::new(MemIo::new(to_client.clone(), 0.05, 1), Keypair::generate().unwrap(), "123456", host_id).unwrap();
-    let mut client = ClientSession::new(MemIo::new(to_host.clone(), 0.0, 2), Keypair::generate().unwrap(), "123456", host_id).unwrap();
+    let mut host = HostSession::new(
+        MemIo::new(to_client.clone(), 0.05, 1),
+        Keypair::generate().unwrap(),
+        "123456",
+        host_id,
+    )
+    .unwrap();
+    let mut client = ClientSession::new(
+        MemIo::new(to_host.clone(), 0.0, 2),
+        Keypair::generate().unwrap(),
+        "123456",
+        host_id,
+    )
+    .unwrap();
     host.set_loss(0.10);
 
     client.start().unwrap();
@@ -27,14 +39,19 @@ fn main() {
     let (w, h, fps) = (1920, 1080, 60);
     let bps = slider_to_bitrate(DEFAULT_QUALITY, w, h, fps, DEFAULT_CODEC);
     let frame_len = (bps / 8 / u64::from(fps)) as usize;
-    println!("slider {DEFAULT_QUALITY} -> {} Mbps, frame ~{} bytes", bps as f64 / 1e6, frame_len);
+    println!(
+        "slider {DEFAULT_QUALITY} -> {} Mbps, frame ~{} bytes",
+        bps as f64 / 1e6,
+        frame_len
+    );
 
     let n = 600u32;
     let (mut got, mut bytes) = (0u32, 0u64);
     let t = Instant::now();
     for id in 0..n {
         let data: Vec<u8> = (0..frame_len).map(|i| (i as u32 ^ id) as u8).collect();
-        host.send_video_frame(id, id.wrapping_mul(16_667), &data, id % 120 == 0).unwrap();
+        host.send_video_frame(id, id.wrapping_mul(16_667), &data, id % 120 == 0)
+            .unwrap();
         for d in drain(&to_client) {
             client.handle_datagram(&d).unwrap();
         }

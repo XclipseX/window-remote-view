@@ -18,9 +18,14 @@ pub(crate) struct Channel {
 
 impl Channel {
     pub fn new(session: Session, session_id: u32) -> Self {
-        Self { session, session_id, tx_nonce: 0, ctrl_seq: 0, input_seq: 0 }
+        Self {
+            session,
+            session_id,
+            tx_nonce: 0,
+            ctrl_seq: 0,
+            input_seq: 0,
+        }
     }
-
 
     pub fn seal(&mut self, packet: &Packet) -> Result<Vec<u8>> {
         if self.tx_nonce > NONCE_MAX {
@@ -42,7 +47,9 @@ impl Channel {
         if hdr.session_id != self.session_id {
             return Err(SessionError::SessionId);
         }
-        let plain = self.session.open(hdr.nonce_counter, &datagram[..n], &datagram[n..])?;
+        let plain = self
+            .session
+            .open(hdr.nonce_counter, &datagram[..n], &datagram[n..])?;
         let (pkt, _) = Packet::decode(hdr.packet_type, &plain)?;
         Ok(pkt)
     }
@@ -56,7 +63,11 @@ impl Channel {
 
     pub fn input(&mut self, event: InputEvent) -> Result<Vec<u8>> {
         let input_seq = self.input_seq;
-        let out = self.seal(&Packet::Input(InputPacket { input_seq, flags: 0, event }))?;
+        let out = self.seal(&Packet::Input(InputPacket {
+            input_seq,
+            flags: 0,
+            event,
+        }))?;
         self.input_seq = self.input_seq.wrapping_add(1);
         Ok(out)
     }

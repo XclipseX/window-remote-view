@@ -74,7 +74,13 @@ impl<I: DatagramIo> ClientSession<I> {
 
     /// Send handshake message 1 (call again to retransmit).
     pub fn start(&mut self) -> Result<()> {
-        let mut i = Initiator::new(HandshakeKind::XxPsk3, &self.keypair, None, Some(&self.psk), PROLOGUE)?;
+        let mut i = Initiator::new(
+            HandshakeKind::XxPsk3,
+            &self.keypair,
+            None,
+            Some(&self.psk),
+            PROLOGUE,
+        )?;
         let m1 = i.write_message(&[])?;
         self.io.send(&hs_packet(1, 0, &m1));
         self.state = State::WaitMsg2(Box::new(i));
@@ -160,9 +166,12 @@ impl<I: DatagramIo> ClientSession<I> {
         let m3 = i.write_message(&[])?;
         self.io.send(&hs_packet(3, sid, &m3));
         let session = i.finish()?;
-        let host_static = session.remote_static().ok_or(SessionError::Handshake("no host key"))?;
+        let host_static = session
+            .remote_static()
+            .ok_or(SessionError::Handshake("no host key"))?;
         self.state = State::Established(Box::new(Channel::new(session, sid)));
-        self.events.push_back(ClientEvent::Established { host_static });
+        self.events
+            .push_back(ClientEvent::Established { host_static });
         Ok(())
     }
 
