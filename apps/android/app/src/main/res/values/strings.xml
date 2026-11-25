@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Remote View</string>
+
+    <!-- Màn hình chính -->
+    <string name="home_title">Remote View</string>
+    <string name="home_connect_to">Kết nối tới</string>
+    <string name="home_id_hint">ID máy tính (ví dụ 123 456 789)</string>
+    <string name="home_connect_button">Kết nối</string>
+    <string name="home_lan_hosts">Máy trong mạng LAN</string>
+    <string name="home_lan_empty">Chưa tìm thấy máy nào trong mạng LAN</string>
+    <string name="home_scan_qr">Quét mã QR</string>
+    <string name="home_qr_todo">Quét QR: chưa triển khai</string>
+    <string name="home_settings">Cài đặt</string>
+
+    <!-- Cài đặt -->
+    <string name="settings_title">Cài đặt luồng hình</string>
+    <string name="settings_back">Quay lại</string>
+    <string name="settings_resolution">Độ phân giải: %1$d%%</string>
+    <string name="settings_fps">Tốc độ khung hình: %1$d FPS</string>
+    <string name="settings_quality">Chất lượng: %1$d%%</string>
+    <string name="settings_codec">Bộ mã hóa</string>
+    <string name="codec_auto">Tự động</string>
+    <string name="codec_h264">H.264</string>
+    <string name="codec_hevc">HEVC</string>
+    <string name="codec_av1">AV1</string>
+    <string name="settings_hw_decode">Giải mã bằng phần cứng</string>
+    <string name="settings_hw_decode_hint">Tắt để buộc dùng giải mã phần mềm (chậm, tốn pin)</string>
+    <string name="settings_allow_av1">Cho phép AV1 ở chế độ Tự động</string>
+    <string name="settings_raw_typing">Chế độ gõ thô (Raw typing)</string>
+    <string name="settings_raw_typing_hint">Gửi phím vật lý thay vì ký tự Unicode; để UniKey/EVKey trên Windows xử lý Telex</string>
+    <string name="settings_direct_present">Hiển thị trực tiếp (Direct Present)</string>
+    <string name="settings_direct_present_hint">Hiện khung ngay khi giải mã xong, bỏ đồng bộ Choreographer</string>
+    <string name="settings_trackpad">Chế độ Trackpad (con trỏ tương đối)</string>
+
+    <!-- Phiên điều khiển -->
+    <string name="session_connecting">Đang kết nối…</string>
+    <string name="session_native_missing">Chưa nạp được librv_core.so (lõi Rust chưa được tích hợp)</string>
+    <string name="session_exit">Thoát phiên</string>
+
+    <!-- Thanh phím -->
+    <string name="mod_win">Win</string>
+    <string name="mod_alt_tab">Alt+Tab</string>
+    <string name="mod_ctrl_alt_del">Ctrl+Alt+Del</string>
+    <string name="mod_esc">Esc</string>
+    <string name="mod_prtsc">PrtSc</string>
+    <string name="mod_keyboard">Bàn phím</string>
+</resources>
