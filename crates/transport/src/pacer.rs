@@ -141,7 +141,7 @@ mod tests {
         while p.pop_ready(t).is_some() {
             sent += 1;
         }
-        assert!(sent >= 1 && sent < 10);
+        assert!((1..10).contains(&sent));
         assert!(p.wait_time(t).unwrap() > Duration::ZERO);
         p.push(Priority::Control, vec![7]);
         assert_eq!(p.pop_ready(t).unwrap().priority, Priority::Control);

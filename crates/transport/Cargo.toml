@@ -7,7 +7,7 @@ version.workspace = true
 
 [dependencies]
 reed-solomon-simd = "3"
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 thiserror = "1"
 tokio = { version = "1", features = ["net", "time", "sync", "rt", "macros"] }
 tracing = "0.1"

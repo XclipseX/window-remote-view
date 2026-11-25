@@ -29,7 +29,7 @@ pub enum FecError {
 /// Number of parity shards for `k` data shards at the observed `loss` rate (0.0..=1.0).
 /// Returns 0 when loss is below [`LAN_LOSS_THRESHOLD`].
 pub fn parity_count(k: usize, loss: f32) -> usize {
-    if k == 0 || !(loss >= LAN_LOSS_THRESHOLD) {
+    if k == 0 || loss.is_nan() || loss < LAN_LOSS_THRESHOLD {
         return 0;
     }
     let ratio = (loss * 2.0 + 0.05).clamp(0.05, 0.5);
@@ -77,7 +77,7 @@ impl Shard {
             frame_len: u32at(10),
             data: b[HEADER_LEN..].to_vec(),
         };
-        if s.k == 0 || s.index >= s.k.saturating_add(s.m) || s.data.len() % 2 != 0 {
+        if s.k == 0 || s.index >= s.k.saturating_add(s.m) || !s.data.len().is_multiple_of(2) {
             return Err(FecError::Malformed);
         }
         Ok(s)
@@ -267,7 +267,7 @@ mod tests {
     fn recovers_with_dropped_shards() {
         let f = frame(40_000);
         let shards = encode_frame(7, &f, 0.1).unwrap();
-        let (k, m) = (shards[0].k as usize, shards[0].m as usize);
+        let m = shards[0].m as usize;
         assert!(m >= 2);
         // Drop m shards: first m data shards (worst case, forces decode).
         let mut r = FrameReassembler::new(Duration::from_secs(1));
@@ -276,7 +276,6 @@ mod tests {
         for s in shards.into_iter().skip(m) {
             out = r.push(s, now).or(out);
         }
-        assert_eq!(k + m > m, true);
         assert_eq!(out.unwrap(), f);
     }
 

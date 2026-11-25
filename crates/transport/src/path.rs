@@ -101,7 +101,7 @@ pub async fn race_connect(
             if now.duration_since(start) < starts[i] {
                 continue;
             }
-            if last_sent[i].map_or(true, |t| now.duration_since(t) >= retry) {
+            if last_sent[i].is_none_or(|t| now.duration_since(t) >= retry) {
                 last_sent[i] = Some(now);
                 let _ = sock.send_to(&encode_probe(nonces[i]), c.addr).await;
             }
