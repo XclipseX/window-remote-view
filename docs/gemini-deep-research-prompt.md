@@ -47,6 +47,27 @@ Nghiên cứu phải tính đến sự đa dạng thiết bị thực tế, khô
 
 Các kịch bản sử dụng điển hình cần đánh giá: làm việc văn phòng (gõ văn bản, Excel, cần chữ sắc nét, FPS thấp vẫn ổn); xem video và trình chiếu (cần chuyển động mượt); chơi game nhẹ hoặc điều khiển phần mềm đồ họa (cần độ trễ cực thấp, FPS cao); hỗ trợ kỹ thuật từ xa cho người thân (cần kết nối đơn giản nhất có thể, vượt được NAT); treo máy dài giờ để giám sát (cần tiết kiệm điện tối đa). Với mỗi kịch bản, hãy đề xuất một “cấu hình gợi ý” (preset) gồm codec, độ phân giải, FPS, mức thanh trượt chất lượng và chế độ nhập liệu, để người dùng chỉ cần bấm một nút.
 
+## 5b. Thiết bị mục tiêu ưu tiên số 1 (phải tối ưu riêng)
+Ngoài phần bao phủ chung, hãy nghiên cứu RIÊNG và CHI TIẾT cho hai thiết bị mà tôi dùng thực tế:
+- **Samsung Galaxy S26+ dùng chip Exynos 2600** (GPU Xclipse, One UI trên Android 16).
+- **Samsung Galaxy Tab S10+ dùng chip MediaTek Dimensity 9300+** (GPU Immortalis-G720, màn hình 12.4 inch 120 Hz, có S Pen).
+
+Với mỗi thiết bị, cần trả lời:
+1. Bộ giải mã phần cứng hỗ trợ những codec nào (H.264, HEVC Main/Main10, AV1, VP9), độ phân giải và FPS tối đa, có hỗ trợ YUV 4:4:4 không. Tên codec cụ thể trong MediaCodecList (ví dụ c2.exynos.*, c2.mtk.*) và cách kiểm tra.
+2. Các khóa low-latency riêng của hãng (Samsung/Exynos vendor keys, MediaTek vendor keys) và lỗi đã biết khiến giải mã bị trễ thêm khung hình; cách khắc phục đã được cộng đồng Moonlight, scrcpy, Parsec, Steam Link ghi nhận.
+3. Độ trễ giải mã thực tế ước tính (ms/khung) ở 1080p60, 1440p120, 2800x1752 (độ phân giải gốc Tab S10+).
+4. Tối ưu pin và nhiệt: Game Optimizing Service, chế độ tiết kiệm của One UI, adaptive refresh rate, cách giữ 120 Hz ổn định mà không quá nóng khi dùng lâu.
+5. Hỗ trợ S Pen (áp lực, nghiêng, nút bấm) truyền sang Windows Pen Injection, chế độ DeX, bàn phím Book Cover Keyboard, chuột Bluetooth với pointer capture.
+6. Cấu hình mặc định đề xuất (codec, độ phân giải, FPS, bitrate) cho từng máy trong LAN và qua Internet.
+Lưu ý: nếu thông tin về Exynos 2600 còn hạn chế, hãy nêu rõ và suy luận từ Exynos 2400/2500 kèm mức độ chắc chắn.
+
+## 5c. Hai chế độ kết nối bắt buộc: LAN và Server
+Ứng dụng phải hỗ trợ đầy đủ CẢ HAI chế độ và tự động chọn đường tốt nhất:
+- **Chế độ LAN (không cần Internet):** tự phát hiện máy Windows trong cùng mạng bằng mDNS/DNS-SD hoặc UDP broadcast; kết nối trực tiếp bằng IP; ghép đôi bằng mã PIN hoặc QR một lần rồi ghi nhớ; hoạt động được khi mất Internet, qua Wi-Fi Direct, hotspot điện thoại hoặc cáp USB tethering. Tối ưu riêng cho LAN: bitrate cao (50–150 Mbps), FEC thấp, bộ đệm gần bằng 0.
+- **Chế độ Server (qua Internet):** máy chủ tự host miễn phí gồm signaling/ID server, STUN và relay (TURN hoặc kiểu hbbs/hbbr của RustDesk), triển khai bằng Docker trên VPS free tier hoặc máy nhà; ưu tiên P2P hole punching, chỉ relay khi thất bại; hỗ trợ IPv6; vượt CGNAT nhà mạng Việt Nam.
+- **Chuyển đổi liền mạch:** khi điện thoại rời Wi-Fi sang 4G/5G thì phiên tự chuyển từ LAN sang Server mà không ngắt (QUIC connection migration hoặc cơ chế tương tự), và ngược lại.
+- So sánh độ trễ, băng thông, chi phí của từng chế độ; đề xuất thứ tự ưu tiên khi kết nối (LAN trực tiếp → P2P → relay).
+
 ## 6. Danh sách câu hỏi cụ thể cần trả lời
 1. Với cùng một mức chất lượng cảm nhận ở 1080p60 nội dung văn phòng, H.264, HEVC và AV1 cần bitrate lần lượt khoảng bao nhiêu? Chênh lệch điện năng giải mã trên Android ra sao?
 2. Có nên dùng mã hóa YUV 4:4:4 hoặc chế độ “screen content coding” để chữ sắc nét hơn không? Phần cứng nào hỗ trợ và đổi lại tốn bao nhiêu băng thông?
