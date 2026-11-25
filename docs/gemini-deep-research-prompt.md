@@ -1,92 +1,43 @@
-# PROMPT GỬI GEMINI DEEP RESEARCH
+# PROMPT NGHIÊN CỨU SÂU (≈1500 chữ) – ỨNG DỤNG ĐIỀU KHIỂN TỪ XA ANDROID → WINDOWS
 
-> Copy toàn bộ phần dưới đây vào Gemini (chế độ Deep Research).
+## 1. Vai trò
+Bạn là một nhóm kỹ sư trưởng gồm chuyên gia video streaming thời gian thực, codec phần cứng, lập trình hệ thống Windows, Android native, mạng độ trễ thấp và tối ưu năng lượng. Nhiệm vụ của bạn là thực hiện một nghiên cứu kỹ thuật chuyên sâu, có trích dẫn nguồn đáng tin cậy (tài liệu chính thức của Microsoft, Google, NVIDIA, AMD, Intel; mã nguồn GitHub; bài báo khoa học; benchmark công khai), ưu tiên thông tin mới nhất giai đoạn 2025–2026. Khi một thông tin chưa được kiểm chứng, hãy ghi rõ mức độ chắc chắn.
 
----
+## 2. Bối cảnh và mục tiêu
+Tôi muốn xây dựng một ứng dụng điều khiển máy tính từ xa tương tự TeamViewer nhưng hoàn toàn miễn phí, mã nguồn mở, không giới hạn phiên, không quảng cáo và không phụ thuộc vào máy chủ trả phí. Ứng dụng chỉ tập trung vào hai chức năng cốt lõi:
+1. Cài đặt được trên Windows 10/11 (x64 và ARM64) và Android 8.0 trở lên.
+2. Cho phép điện thoại hoặc máy tính bảng Android điều khiển máy tính Windows một cách dễ dàng, mượt mà.
 
-## VAI TRÒ
-Bạn là một nhóm kỹ sư trưởng (Principal Engineers) chuyên về: video streaming thời gian thực, codec phần cứng (NVENC/AMF/QuickSync/MediaCodec), lập trình hệ thống Windows (DXGI/Direct3D11/Win32 input), Android native (NDK/MediaCodec/SurfaceView/Vulkan), mạng độ trễ thấp (UDP/QUIC/WebRTC/NAT traversal) và tối ưu năng lượng. Hãy nghiên cứu SÂU, có trích dẫn nguồn (docs chính thức, GitHub, paper, benchmark), ưu tiên thông tin mới nhất 2025–2026.
+Các tiêu chí tối ưu theo thứ tự ưu tiên: độ trễ thấp (mục tiêu dưới 30 ms trong mạng LAN và dưới 80 ms qua Internet), tiết kiệm điện năng (pin Android và tải CPU/GPU trên Windows), chất lượng hình ảnh sắc nét, tốc độ khung hình cao (30, 60, 90, 120, 144 FPS). Ứng dụng phải dễ sử dụng với người không rành kỹ thuật: kết nối bằng ID và mật khẩu, quét mã QR hoặc tự phát hiện máy trong mạng LAN.
 
-## MỤC TIÊU DỰ ÁN
-Xây dựng app điều khiển máy tính từ xa (tương tự TeamViewer) nhưng:
-- **100% miễn phí, mã nguồn mở**, không thu phí, không giới hạn phiên, không phụ thuộc server trả phí.
-- **Chỉ 2 chức năng chính:**
-  1. Cài được trên **Windows (10/11, x64 + ARM64)** và **Android (8.0+)**.
-  2. **Android điều khiển Windows** dễ dàng (host = Windows, client = Android).
-- **Tối ưu tối đa:** độ trễ end-to-end (mục tiêu < 30 ms LAN, < 80 ms Internet), điện năng (pin Android + CPU/GPU Windows), chất lượng hình ảnh, FPS (30/60/90/120/144).
-- **Chỉ dùng codec mở/không bản quyền độc quyền ngốn tài nguyên:** ưu tiên H.264/H.265(HEVC)/AV1/VP9 qua API phần cứng; phân tích chi phí bản quyền/patent của từng codec với dự án miễn phí.
-- **Hỗ trợ cả mã hóa/giải mã phần cứng VÀ phần mềm native** (fallback khi không có GPU phù hợp): ví dụ x264/OpenH264, libvpx, SVT-AV1/rav1e/dav1d.
-- **Tùy chỉnh trong app:** độ phân giải, FPS, và **thanh trượt chất lượng hình ảnh 1–100%** (map sang bitrate/QP/CRF thế nào cho hợp lý — đề xuất công thức cụ thể).
-- **Input đầy đủ:** bàn phím ảo + bàn phím vật lý/Bluetooth (kể cả phím đặc biệt: Ctrl+Alt+Del, Win, F1–F12, IME tiếng Việt/Unicode), touch (đa điểm, cử chỉ: chạm=click, 2 ngón=chuột phải/cuộn, pinch zoom), chế độ trackpad (rê chuột tương đối), chế độ chuột trực tiếp (tuyệt đối), chuột Bluetooth/OTG, bút stylus (áp lực nếu có).
-- **Dễ dùng:** kết nối bằng ID + mật khẩu hoặc quét QR; tự tìm máy trong LAN.
+## 3. Yêu cầu kỹ thuật bắt buộc
+- Chỉ sử dụng codec mở hoặc phổ biến, không dùng thuật toán độc quyền ngốn tài nguyên như TeamViewer. Cần đánh giá H.264, H.265/HEVC, VP9 và AV1, bao gồm cả vấn đề bằng sáng chế và giấy phép khi phân phối miễn phí.
+- Hỗ trợ cả mã hóa/giải mã bằng phần cứng (NVENC, AMF, Intel QuickSync/oneVPL, Media Foundation, D3D12 Video, Android MediaCodec) và phần mềm native làm phương án dự phòng (x264, OpenH264, libvpx, SVT-AV1, dav1d, FFmpeg).
+- Người dùng tùy chỉnh được độ phân giải, FPS và chất lượng hình ảnh bằng thanh trượt từ 1% đến 100%. Hãy đề xuất công thức ánh xạ giá trị thanh trượt sang bitrate, QP hoặc CRF theo độ phân giải và FPS, kèm chế độ tự động thích ứng băng thông.
+- Hỗ trợ đầy đủ các phương thức nhập liệu: bàn phím ảo, bàn phím vật lý hoặc Bluetooth, phím đặc biệt (Ctrl+Alt+Del, phím Windows, F1–F12, tổ hợp phím), gõ tiếng Việt và Unicode, cảm ứng đa điểm, cử chỉ, chế độ trackpad rê chuột tương đối, chế độ chạm trực tiếp tuyệt đối, chuột Bluetooth/OTG, bút cảm ứng có lực nhấn, đồng bộ clipboard.
 
-## YÊU CẦU: CHIA AGENT XỬ LÝ
-Hãy chia nghiên cứu thành các **Agent chuyên trách** dưới đây. Mỗi agent phải trả về: (a) phương án đề xuất, (b) so sánh tối thiểu 2–3 lựa chọn thay thế bằng bảng, (c) rủi ro & cách giảm thiểu, (d) code mẫu/pseudo-code hoặc API cụ thể, (e) nguồn tham khảo có link.
+## 4. Phân chia agent nghiên cứu
+Hãy tổ chức nghiên cứu thành các agent chuyên trách. Mỗi agent trả về: phương án đề xuất, bảng so sánh ít nhất ba lựa chọn, rủi ro và cách giảm thiểu, đoạn mã mẫu hoặc API cụ thể, danh sách nguồn có đường dẫn.
 
-### Agent 1 — Kiến trúc tổng thể & tham khảo dự án mở
-- Phân tích kiến trúc của: **RustDesk, Sunshine + Moonlight, Parsec (phần công khai), scrcpy, Apache Guacamole, Chrome Remote Desktop, KasmVNC, Selkies**.
-- Rút ra điểm mạnh/yếu về độ trễ, CPU, pin; dự án nào có license cho phép fork/tái sử dụng (GPL/AGPL/MIT/Apache) và hệ quả pháp lý.
-- Đề xuất: **tự viết mới** hay **fork/nhúng** (vd: fork Sunshine làm host + client Android riêng)? Đưa ra khuyến nghị rõ ràng.
-- Chọn ngôn ngữ/stack: Rust vs C++ vs Kotlin/C++ NDK vs Flutter cho UI; vẽ sơ đồ module (capture → encode → transport → decode → render; input ngược chiều).
+**Agent 1 – Kiến trúc và dự án tham khảo.** Phân tích RustDesk, Sunshine kết hợp Moonlight, scrcpy, Parsec (phần công khai), Chrome Remote Desktop, Apache Guacamole và Selkies. Đánh giá điểm mạnh, điểm yếu về độ trễ, CPU, pin; xem xét giấy phép (GPL, AGPL, MIT, Apache) để quyết định nên tự viết mới hay fork. So sánh ngôn ngữ Rust, C++, Kotlin với NDK và các framework giao diện. Vẽ sơ đồ luồng: chụp màn hình → mã hóa → truyền tải → giải mã → hiển thị, cùng luồng nhập liệu theo chiều ngược lại.
 
-### Agent 2 — Capture màn hình Windows
-- So sánh **DXGI Desktop Duplication**, **Windows.Graphics.Capture (WGC)**, GDI, NvFBC (đã bị hạn chế?).
-- Zero-copy GPU: capture texture D3D11 → encoder phần cứng không qua RAM CPU.
-- Xử lý: đa màn hình, HDR, DPI scaling, màn hình khóa/UAC/Secure Desktop (cần chạy như Windows Service + chuyển session), máy không có màn hình (virtual display driver/IddCx), con trỏ chuột vẽ riêng (gửi cursor shape riêng để giảm băng thông).
-- Chỉ gửi khi có thay đổi (dirty rects) để tiết kiệm điện khi màn hình tĩnh.
+**Agent 2 – Chụp màn hình Windows.** So sánh DXGI Desktop Duplication, Windows.Graphics.Capture và GDI. Thiết kế đường đi zero-copy từ texture Direct3D 11 vào bộ mã hóa phần cứng, không qua RAM CPU. Xử lý đa màn hình, HDR, DPI scaling, màn hình khóa, UAC, Secure Desktop (chạy dưới dạng Windows Service), máy không gắn màn hình (virtual display driver IddCx), gửi hình con trỏ riêng và chỉ mã hóa khi có vùng thay đổi để tiết kiệm điện.
 
-### Agent 3 — Codec & Encoder (Windows)
-- So sánh **NVENC (NVIDIA), AMF (AMD), Intel QSV/oneVPL, Media Foundation, D3D12 Video Encode** cho H.264 / HEVC / AV1.
-- Cấu hình độ trễ thấp: preset ultra-low-latency, không B-frame, intra-refresh thay keyframe, VBV/HRD nhỏ, slice mode, CBR vs VBR, lookahead=0.
-- Fallback phần mềm: x264 (tune zerolatency) / OpenH264 / SVT-AV1 — CPU cost bao nhiêu ở 1080p60.
-- **Bản quyền/patent:** H.264, HEVC, AV1, VP9 — cái nào an toàn cho app miễn phí phân phối nhị phân (OpenH264 của Cisco, phần cứng đã trả license...).
-- Đề xuất **công thức slider chất lượng 1–100%** → bitrate/QP theo độ phân giải và FPS; adaptive bitrate tự động theo mạng.
+**Agent 3 – Mã hóa video trên Windows.** So sánh NVENC, AMF, QuickSync, Media Foundation và D3D12 Video Encode với H.264, HEVC, AV1. Đưa ra cấu hình độ trễ thấp chi tiết: không dùng B-frame, intra-refresh thay cho keyframe định kỳ, bộ đệm VBV nhỏ, chia slice, tắt lookahead, chọn CBR hoặc VBR. Đo chi phí CPU của phương án phần mềm ở 1080p60. Phân tích giấy phép từng codec và đề xuất công thức thanh trượt chất lượng.
 
-### Agent 4 — Decode & Render Android
-- **MediaCodec** (NDK `AMediaCodec`) low-latency: `KEY_LOW_LATENCY`, `KEY_PRIORITY`, vendor-specific low-latency keys (Qualcomm, MediaTek, Exynos, Tensor), output thẳng vào `Surface`/`SurfaceView` (không qua TextureView).
-- Kiểm tra codec hỗ trợ (`MediaCodecList`), chọn tự động H.264/HEVC/AV1 theo máy.
-- Fallback phần mềm: **dav1d**, FFmpeg/libavcodec (h264), libvpx.
-- Frame pacing (Choreographer, `setFrameRate`), màn hình 90/120Hz, tránh jitter buffer.
-- Tiết kiệm pin: giải mã phần cứng, giảm FPS khi màn hình tĩnh, tắt khi app vào background, Wi-Fi low-latency lock (`WIFI_MODE_FULL_LOW_LATENCY`).
+**Agent 4 – Giải mã và hiển thị trên Android.** Nghiên cứu MediaCodec qua NDK ở chế độ độ trễ thấp (KEY_LOW_LATENCY, KEY_PRIORITY, khóa riêng của Qualcomm, MediaTek, Exynos, Tensor), xuất trực tiếp vào SurfaceView. Tự động chọn codec theo khả năng thiết bị, dự phòng bằng dav1d hoặc FFmpeg. Đồng bộ khung hình với Choreographer, tận dụng màn hình 90/120 Hz, giảm FPS khi hình tĩnh, khóa Wi-Fi độ trễ thấp và tạm dừng khi ứng dụng chạy nền.
 
-### Agent 5 — Mạng & truyền tải
-- So sánh: **raw UDP + FEC tự viết (như Moonlight)**, **WebRTC**, **QUIC (quinn/msquic)**, **KCP**, **SRT**, TCP.
-- NAT traversal miễn phí: STUN/TURN tự host (coturn), UDP hole punching, relay server tự host (như RustDesk hbbs/hbbr), Tailscale/WireGuard tích hợp?
-- Discovery LAN: mDNS/Bonjour.
-- Congestion control & ABR (GCC, BBR), FEC (Reed-Solomon), xử lý mất gói, ưu tiên kênh input (độ trễ input < video).
-- Chi phí server signaling/relay tối thiểu — làm sao để **vận hành gần như 0 đồng** (P2P ưu tiên, relay fallback chạy VPS free tier).
+**Agent 5 – Mạng và truyền tải.** So sánh UDP thuần kèm FEC, WebRTC, QUIC, KCP, SRT và TCP. Thiết kế xuyên NAT bằng STUN, UDP hole punching, máy chủ trung chuyển tự dựng (coturn hoặc tương tự RustDesk hbbs/hbbr), khám phá LAN bằng mDNS. Đề xuất thuật toán kiểm soát nghẽn, thích ứng bitrate, sửa lỗi Reed-Solomon, ưu tiên kênh nhập liệu. Tính toán chi phí vận hành gần bằng không.
 
-### Agent 6 — Input injection (Windows) & UX điều khiển (Android)
-- Windows: `SendInput`, ViGEm (gamepad), **Touch Injection API (`InjectSyntheticPointerInput`)**, pen injection, Unicode input, scan code vs virtual key, đặc quyền SYSTEM để gõ Ctrl+Alt+Del (SAS), đồng bộ clipboard.
-- Android: thiết kế cử chỉ — chế độ Touch trực tiếp vs Trackpad, kéo thả, cuộn 2 ngón, zoom/pan, nhấn giữ = chuột phải, thanh phím đặc biệt nổi, hỗ trợ bàn phím/chuột Bluetooth và **pointer capture** (`requestPointerCapture`), IME tiếng Việt.
-- Đo và tối ưu độ trễ input (gửi ngay, không gom theo frame; dự đoán con trỏ cục bộ – local cursor rendering).
+**Agent 6 – Nhập liệu và trải nghiệm điều khiển.** Phía Windows: SendInput, scan code và virtual key, Touch Injection, Pen Injection, gửi Ctrl+Alt+Del qua quyền SYSTEM, nhập Unicode. Phía Android: thiết kế cử chỉ (chạm để nhấp, giữ để nhấp phải, hai ngón để cuộn, chụm để phóng to), thanh phím đặc biệt nổi, pointer capture cho chuột ngoài, bộ gõ tiếng Việt, hiển thị con trỏ cục bộ để giảm cảm giác trễ.
 
-### Agent 7 — Bảo mật
-- Mã hóa đầu cuối (DTLS/TLS 1.3/Noise protocol), xác thực bằng mật khẩu một lần + khóa công khai, chống brute-force, xác nhận kết nối phía Windows, không lưu dữ liệu trên server.
+**Agent 7 – Bảo mật.** Mã hóa đầu cuối bằng TLS 1.3, DTLS hoặc Noise Protocol; xác thực bằng mật khẩu một lần và khóa công khai; chống dò mật khẩu; yêu cầu xác nhận trên Windows; không lưu dữ liệu người dùng trên máy chủ.
 
-### Agent 8 — Tối ưu điện năng & hiệu năng, đo đạc
-- Phương pháp đo **độ trễ glass-to-glass** (camera 240fps, LED/photodiode), đo CPU/GPU/pin (Windows: PresentMon, GPUView, ETW; Android: Battery Historian, Perfetto, `dumpsys batterystats`).
-- Bảng mục tiêu: bitrate/FPS/độ trễ/công suất cho các cấu hình 720p30, 1080p60, 1440p120, 4K60.
-- So sánh số liệu thực tế với TeamViewer/AnyDesk/RustDesk/Parsec/Moonlight nếu có benchmark công khai.
+**Agent 8 – Đo lường hiệu năng và năng lượng.** Đề xuất phương pháp đo độ trễ từ màn hình đến màn hình (camera tốc độ cao, cảm biến quang), công cụ PresentMon, GPUView, ETW, Perfetto, Battery Historian. Lập bảng mục tiêu bitrate, FPS, độ trễ, công suất cho 720p30, 1080p60, 1440p120 và 4K60; so sánh với TeamViewer, AnyDesk, RustDesk, Parsec, Moonlight.
 
-### Agent 9 — Đóng gói, phân phối & UI
-- Windows: installer (MSIX/WiX/Inno Setup), chạy dưới dạng Service, tự khởi động, ký code miễn phí (SignPath for OSS?), tránh bị Windows Defender/SmartScreen chặn.
-- Android: phát hành APK trên GitHub Releases / F-Droid / Google Play (chính sách Accessibility/remote control).
-- UI tối giản: màn hình chính chỉ có "ID của tôi / Kết nối tới", trang cài đặt có slider Độ phân giải / FPS / Chất lượng 1–100% / Codec (Tự động/H.264/HEVC/AV1) / Phần cứng–Phần mềm.
-- CI/CD miễn phí bằng GitHub Actions.
+**Agent 9 – Đóng gói, phân phối và giao diện.** Trình cài đặt Windows (MSIX, WiX, Inno Setup), chạy nền như dịch vụ, ký mã miễn phí cho dự án mã nguồn mở, tránh bị SmartScreen chặn. Phát hành APK qua GitHub Releases, F-Droid, Google Play. Giao diện tối giản: màn hình chính chỉ có “ID của tôi” và “Kết nối tới”; trang cài đặt gồm độ phân giải, FPS, thanh trượt chất lượng, chọn codec, chọn phần cứng hoặc phần mềm. Thiết lập CI/CD bằng GitHub Actions.
 
-### Agent 10 — Tổng hợp (Lead Architect)
-Tổng hợp kết quả của 9 agent thành:
-1. **Kiến trúc cuối cùng** (sơ đồ + lý do chọn).
-2. **Tech stack cụ thể** (thư viện + phiên bản + license).
-3. **Lộ trình MVP → v1.0** chia theo sprint 2 tuần, mỗi sprint có tiêu chí hoàn thành đo được.
-4. **Cấu trúc thư mục repo** (monorepo: `host-windows/`, `client-android/`, `protocol/`, `relay-server/`, `docs/`).
-5. **Định nghĩa giao thức** (định dạng gói video, input, control, cài đặt) dạng bảng hoặc protobuf/flatbuffers.
-6. **Danh sách rủi ro lớn nhất** và cách xử lý.
-7. Các **quyết định còn mở** cần người phát triển chọn.
+**Agent 10 – Kiến trúc sư tổng hợp.** Tổng hợp kết quả thành: kiến trúc cuối cùng kèm lý do; tech stack với phiên bản và giấy phép; lộ trình từ MVP đến bản 1.0 chia thành các sprint hai tuần với tiêu chí đo được; cấu trúc thư mục monorepo; định nghĩa giao thức gói tin video, nhập liệu, điều khiển; danh sách rủi ro lớn nhất và các quyết định còn bỏ ngỏ.
 
-## RÀNG BUỘC ĐẦU RA
-- Viết bằng **tiếng Việt**, thuật ngữ kỹ thuật giữ tiếng Anh.
-- Mọi khẳng định quan trọng phải có **nguồn trích dẫn**; ghi rõ khi thông tin chưa chắc chắn.
-- Ưu tiên giải pháp **miễn phí, mã nguồn mở, ít tài nguyên**; không đề xuất SDK/codec trả phí.
-- Có bảng so sánh, số liệu ước lượng, và code mẫu ngắn cho các phần then chốt (capture → NVENC, MediaCodec low-latency, SendInput/Touch injection, slider → bitrate).
+## 5. Yêu cầu đầu ra
+Trình bày bằng tiếng Việt, giữ nguyên thuật ngữ kỹ thuật tiếng Anh. Mọi khẳng định quan trọng phải có nguồn. Ưu tiên giải pháp miễn phí, mã nguồn mở, tiêu tốn ít tài nguyên; không đề xuất SDK hoặc codec trả phí. Bao gồm bảng so sánh, số liệu ước lượng và mã mẫu ngắn cho các phần then chốt: chụp màn hình sang NVENC, cấu hình MediaCodec độ trễ thấp, SendInput và Touch Injection, công thức thanh trượt chất lượng sang bitrate. Kết thúc bằng một bản tóm tắt điều hành dài khoảng một trang.
