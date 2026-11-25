@@ -1,4 +1,4 @@
-# PROMPT NGHIÊN CỨU SÂU (≈1500 chữ) – ỨNG DỤNG ĐIỀU KHIỂN TỪ XA ANDROID → WINDOWS
+# PROMPT NGHIÊN CỨU SÂU (≈2000 chữ) – ỨNG DỤNG ĐIỀU KHIỂN TỪ XA ANDROID → WINDOWS
 
 ## 1. Vai trò
 Bạn là một nhóm kỹ sư trưởng gồm chuyên gia video streaming thời gian thực, codec phần cứng, lập trình hệ thống Windows, Android native, mạng độ trễ thấp và tối ưu năng lượng. Nhiệm vụ của bạn là thực hiện một nghiên cứu kỹ thuật chuyên sâu, có trích dẫn nguồn đáng tin cậy (tài liệu chính thức của Microsoft, Google, NVIDIA, AMD, Intel; mã nguồn GitHub; bài báo khoa học; benchmark công khai), ưu tiên thông tin mới nhất giai đoạn 2025–2026. Khi một thông tin chưa được kiểm chứng, hãy ghi rõ mức độ chắc chắn.
@@ -39,5 +39,26 @@ Hãy tổ chức nghiên cứu thành các agent chuyên trách. Mỗi agent tr�
 
 **Agent 10 – Kiến trúc sư tổng hợp.** Tổng hợp kết quả thành: kiến trúc cuối cùng kèm lý do; tech stack với phiên bản và giấy phép; lộ trình từ MVP đến bản 1.0 chia thành các sprint hai tuần với tiêu chí đo được; cấu trúc thư mục monorepo; định nghĩa giao thức gói tin video, nhập liệu, điều khiển; danh sách rủi ro lớn nhất và các quyết định còn bỏ ngỏ.
 
-## 5. Yêu cầu đầu ra
+## 5. Môi trường phần cứng và kịch bản sử dụng cần bao phủ
+Nghiên cứu phải tính đến sự đa dạng thiết bị thực tế, không chỉ máy cấu hình cao:
+- **Windows:** laptop văn phòng chỉ có GPU tích hợp Intel UHD/Iris Xe hoặc AMD Radeon Vega; máy chơi game có NVIDIA GeForce GTX 10xx đến RTX 50xx, AMD RX 6000–9000; máy ARM64 dùng Snapdragon X; máy cũ không có bộ mã hóa phần cứng, buộc phải dùng phần mềm. Với mỗi nhóm, hãy cho biết codec nào nên chọn mặc định và mức FPS, độ phân giải khả thi.
+- **Android:** điện thoại giá rẻ dùng chip MediaTek Helio hoặc Unisoc, tầm trung Snapdragon 6/7 series, cao cấp Snapdragon 8 Gen, Dimensity 9000+, Google Tensor, Samsung Exynos; máy tính bảng màn hình lớn; Android TV box. Chỉ rõ thiết bị nào giải mã được AV1, HEVC bằng phần cứng và những lỗi đã biết của từng hãng.
+- **Mạng:** Wi-Fi 5/6/6E cùng phòng, Wi-Fi qua tường, 4G/5G, mạng có CGNAT của nhà mạng Việt Nam, mạng công ty chặn UDP, kết nối chập chờn có tỷ lệ mất gói 1–5%.
+
+Các kịch bản sử dụng điển hình cần đánh giá: làm việc văn phòng (gõ văn bản, Excel, cần chữ sắc nét, FPS thấp vẫn ổn); xem video và trình chiếu (cần chuyển động mượt); chơi game nhẹ hoặc điều khiển phần mềm đồ họa (cần độ trễ cực thấp, FPS cao); hỗ trợ kỹ thuật từ xa cho người thân (cần kết nối đơn giản nhất có thể, vượt được NAT); treo máy dài giờ để giám sát (cần tiết kiệm điện tối đa). Với mỗi kịch bản, hãy đề xuất một “cấu hình gợi ý” (preset) gồm codec, độ phân giải, FPS, mức thanh trượt chất lượng và chế độ nhập liệu, để người dùng chỉ cần bấm một nút.
+
+## 6. Danh sách câu hỏi cụ thể cần trả lời
+1. Với cùng một mức chất lượng cảm nhận ở 1080p60 nội dung văn phòng, H.264, HEVC và AV1 cần bitrate lần lượt khoảng bao nhiêu? Chênh lệch điện năng giải mã trên Android ra sao?
+2. Có nên dùng mã hóa YUV 4:4:4 hoặc chế độ “screen content coding” để chữ sắc nét hơn không? Phần cứng nào hỗ trợ và đổi lại tốn bao nhiêu băng thông?
+3. Độ trễ đóng góp của từng khâu (chụp, mã hóa, mạng, bộ đệm, giải mã, hiển thị) thường là bao nhiêu mili giây, và khâu nào dễ cắt giảm nhất?
+4. Làm sao xử lý khi người dùng xoay màn hình điện thoại, thay đổi độ phân giải Windows hoặc cắm thêm màn hình giữa phiên kết nối mà không bị gián đoạn?
+5. Cách đơn giản nhất để kết nối qua Internet mà không cần người dùng mở cổng router hay cấu hình gì, trong khi vẫn giữ chi phí máy chủ gần bằng không?
+6. Ứng dụng có thể truyền âm thanh hệ thống từ Windows sang Android với độ trễ thấp bằng codec Opus không? Nếu có, đồng bộ âm thanh và hình ảnh thế nào?
+7. Có cần ứng dụng Android sử dụng AccessibilityService hoặc quyền đặc biệt nào không, và điều đó ảnh hưởng gì tới việc phát hành trên Google Play?
+8. Những bẫy pháp lý nào cần tránh khi phát hành một ứng dụng điều khiển từ xa miễn phí, chẳng hạn bị lạm dụng để lừa đảo, và nên thiết kế tính năng nào để hạn chế điều đó?
+
+## 7. Tiêu chí đánh giá phương án
+Khi so sánh các lựa chọn, hãy chấm điểm từ 1 đến 5 theo các tiêu chí: độ trễ, mức tiêu thụ điện, chất lượng hình ảnh, độ ổn định, độ phức tạp khi triển khai, khả năng bảo trì lâu dài, mức độ tương thích thiết bị và rủi ro giấy phép. Đưa ra tổng điểm có trọng số, trong đó độ trễ và điện năng có trọng số cao nhất, sau đó là chất lượng và độ dễ dùng.
+
+## 8. Yêu cầu đầu ra
 Trình bày bằng tiếng Việt, giữ nguyên thuật ngữ kỹ thuật tiếng Anh. Mọi khẳng định quan trọng phải có nguồn. Ưu tiên giải pháp miễn phí, mã nguồn mở, tiêu tốn ít tài nguyên; không đề xuất SDK hoặc codec trả phí. Bao gồm bảng so sánh, số liệu ước lượng và mã mẫu ngắn cho các phần then chốt: chụp màn hình sang NVENC, cấu hình MediaCodec độ trễ thấp, SendInput và Touch Injection, công thức thanh trượt chất lượng sang bitrate. Kết thúc bằng một bản tóm tắt điều hành dài khoảng một trang.
