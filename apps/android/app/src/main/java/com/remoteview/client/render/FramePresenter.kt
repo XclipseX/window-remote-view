@@ -1,0 +1,108 @@
+package com.remoteview.client.render
+
+import android.os.Handler
+import android.os.Looper
+import android.view.Choreographer
+import com.remoteview.client.decoder.FrameReleaser
+import java.util.concurrent.atomic.AtomicLong
+
+// UNBUILT: chưa biên dịch.
+
+/**
+ * Trình chiếu "Latest-Frame Rendering":
+ * - CHOREOGRAPHER: gom output của codec, mỗi vsync chỉ render khung MỚI NHẤT, các khung cũ
+ *   trả về bằng releaseOutputBuffer(idx, false) (bỏ khung stale thay vì tích trễ).
+ * - DIRECT: render ngay khi giải mã xong (releaseOutputBuffer(idx, System.nanoTime())), cắt trễ vsync.
+ *
+ * Tạo trên main thread. [onOutput] gọi từ thread callback của codec.
+ */
+class FramePresenter(
+    private val releaser: FrameReleaser,
+    @Volatile var mode: Mode = Mode.CHOREOGRAPHER,
+    /** Gọi trên main thread khi hình đứng yên > [IDLE_MS] (true) hoặc có khung mới trở lại (false). */
+    private val onIdleChanged: ((idle: Boolean) -> Unit)? = null,
+) : Choreographer.FrameCallback {
+
+    enum class Mode { CHOREOGRAPHER, DIRECT }
+
+    val presented = AtomicLong()
+    val droppedStale = AtomicLong()
+
+    private val main = Handler(Looper.getMainLooper())
+    private val lock = Any()
+    private val pending = ArrayList<Int>(4)
+    private var scheduled = false
+    private var idle = false
+
+    private val idleRunnable = Runnable {
+        if (!idle) {
+            idle = true
+            onIdleChanged?.invoke(true)
+        }
+    }
+
+    /** Callback từ LowLatencyDecoder.onOutput. */
+    fun onOutput(index: Int, @Suppress("UNUSED_PARAMETER") ptsUs: Long) {
+        if (mode == Mode.DIRECT) {
+            releaser.releaseAt(index, System.nanoTime())
+            presented.incrementAndGet()
+            noteFrame()
+            return
+        }
+        synchronized(lock) {
+            pending.add(index)
+            if (!scheduled) {
+                scheduled = true
+                main.post { Choreographer.getInstance().postFrameCallback(this) }
+            }
+        }
+    }
+
+    override fun doFrame(frameTimeNanos: Long) {
+        val batch: IntArray
+        synchronized(lock) {
+            scheduled = false
+            if (pending.isEmpty()) return
+            batch = pending.toIntArray()
+            pending.clear()
+        }
+        for (i in 0 until batch.size - 1) {
+            releaser.release(batch[i], false)
+            droppedStale.incrementAndGet()
+        }
+        releaser.releaseAt(batch.last(), frameTimeNanos)
+        presented.incrementAndGet()
+        noteFrame()
+    }
+
+    private fun noteFrame() {
+        main.removeCallbacks(idleRunnable)
+        main.post {
+            if (idle) {
+                idle = false
+                onIdleChanged?.invoke(false)
+            }
+        }
+        main.postDelayed(idleRunnable, IDLE_MS)
+    }
+
+    /** Trả hết khung đang chờ (gọi trước flush/recreate/stop). */
+    fun clear() {
+        val batch: IntArray
+        synchronized(lock) {
+            batch = pending.toIntArray()
+            pending.clear()
+        }
+        for (i in batch) releaser.release(i, false)
+    }
+
+    fun stop() {
+        clear()
+        main.removeCallbacksAndMessages(null)
+        Choreographer.getInstance().removeFrameCallback(this)
+    }
+
+    companion object {
+        const val IDLE_MS = 500L
+    }
+}
