@@ -1,0 +1,24 @@
+[package]
+name = "rv-signal-relay"
+description = "Signaling (register/lookup/hole-punch notify) and blind UDP relay server"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+name = "rv_signal_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rv-signal-relay"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = "1"
+tokio = { version = "1", features = ["net", "time", "sync", "rt-multi-thread", "macros", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

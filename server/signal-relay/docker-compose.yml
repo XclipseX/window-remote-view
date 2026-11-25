@@ -1,0 +1,14 @@
+services:
+  signal-relay:
+    build:
+      context: ../..
+      dockerfile: server/signal-relay/Dockerfile
+    image: rv-signal-relay:latest
+    restart: unless-stopped
+    ports:
+      - "21116:21116/udp"
+    environment:
+      RV_PORT: "21116"
+      RV_REGISTER_TTL: "60"
+      RV_SESSION_IDLE: "60"
+      RUST_LOG: "info"

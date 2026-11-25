@@ -1,0 +1,16 @@
+[package]
+name = "rv-transport"
+description = "Low-latency UDP transport helpers: adaptive FEC, LAN discovery, send pacer, path racing"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+reed-solomon-simd = "3"
+socket2 = "0.5"
+thiserror = "1"
+tokio = { version = "1", features = ["net", "time", "sync", "rt", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
