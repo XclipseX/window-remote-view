@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use rv_signal_relay::server::{serve, Config, State};
-use tokio::net::UdpSocket;
+use rv_signal_relay::server::{serve, serve_tcp, Config, State};
+use tokio::net::{TcpListener, UdpSocket};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Signal + relay server (UDP)")]
@@ -25,6 +25,13 @@ struct Args {
     max_registrations: usize,
     #[arg(long, env = "RV_MAX_SESSIONS", default_value_t = 10_000)]
     max_sessions: usize,
+    /// Per-session relay bandwidth cap in bits/s (0 = unlimited). Default 25 Mbps.
+    #[arg(long, env = "RV_MAX_BPS", default_value_t = rv_signal_relay::server::DEFAULT_MAX_BPS)]
+    max_bps: u64,
+    /// TCP fallback port (framed datagrams for UDP-blocked networks); use 443 behind
+    /// restrictive firewalls. 0 disables the TCP listener.
+    #[arg(long, env = "RV_TCP_PORT", default_value_t = 21117)]
+    tcp_port: u16,
 }
 
 #[tokio::main]
@@ -41,7 +48,16 @@ async fn main() -> std::io::Result<()> {
         session_idle: Duration::from_secs(args.session_idle),
         max_registrations: args.max_registrations,
         max_sessions: args.max_sessions,
+        max_bps: args.max_bps,
     }));
+    let tcp = if args.tcp_port != 0 {
+        let l = TcpListener::bind(SocketAddr::new(args.bind, args.tcp_port)).await?;
+        tracing::info!("tcp fallback listening on tcp://{}", l.local_addr()?);
+        Some(tokio::spawn(serve_tcp(l, state.clone(), sock.clone())))
+    } else {
+        None
+    };
+    let _tcp_guard = tcp;
     tokio::select! {
         r = serve(sock, state) => r,
         _ = tokio::signal::ctrl_c() => { tracing::info!("shutting down"); Ok(()) }

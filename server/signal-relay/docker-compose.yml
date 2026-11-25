@@ -7,8 +7,12 @@ services:
     restart: unless-stopped
     ports:
       - "21116:21116/udp"
+      # TCP fallback for UDP-blocked networks; map "443:21117/tcp" to present as HTTPS
+      - "21117:21117/tcp"
     environment:
       RV_PORT: "21116"
       RV_REGISTER_TTL: "60"
       RV_SESSION_IDLE: "60"
+      RV_TCP_PORT: "21117"
+      RV_MAX_BPS: "25000000"
       RUST_LOG: "info"

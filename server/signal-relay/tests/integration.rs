@@ -63,3 +63,48 @@ async fn register_lookup_relay() {
     probe[4] = 2;
     assert_eq!(&b[..n], &probe);
 }
+
+#[tokio::test]
+async fn tcp_client_bridges_with_udp_peer() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let server = udp.local_addr().unwrap();
+    let state = Arc::new(State::new(Config::default()));
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let taddr = l.local_addr().unwrap();
+    tokio::spawn(serve(udp.clone(), state.clone()));
+    tokio::spawn(rv_signal_relay::server::serve_tcp(l, state, udp));
+
+    let token = [0x77; 16];
+    let mut tcp = TcpStream::connect(taddr).await.unwrap();
+    let send = |m: Vec<u8>| {
+        let mut f = (m.len() as u16).to_be_bytes().to_vec();
+        f.extend_from_slice(&m);
+        f
+    };
+    tcp.write_all(&send(Msg::RelayJoin { token }.encode())).await.unwrap();
+    assert_eq!(tcp_read(&mut tcp).await, Msg::RelayJoinAck { token, paired: false });
+
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    peer.send_to(&Msg::RelayJoin { token }.encode(), server).await.unwrap();
+    assert_eq!(recv(&peer).await, Msg::RelayJoinAck { token, paired: true });
+    assert_eq!(tcp_read(&mut tcp).await, Msg::RelayJoinAck { token, paired: true });
+
+    // UDP -> TCP
+    peer.send_to(&Msg::RelayData { token, payload: b"hello-tcp".to_vec() }.encode(), server).await.unwrap();
+    assert_eq!(tcp_read(&mut tcp).await, Msg::RelayData { token, payload: b"hello-tcp".to_vec() });
+    // TCP -> UDP
+    tcp.write_all(&send(Msg::RelayData { token, payload: b"hello-udp".to_vec() }.encode())).await.unwrap();
+    assert_eq!(recv(&peer).await, Msg::RelayData { token, payload: b"hello-udp".to_vec() });
+}
+
+async fn tcp_read(tcp: &mut tokio::net::TcpStream) -> Msg {
+    use tokio::io::AsyncReadExt;
+    let mut l = [0u8; 2];
+    timeout(Duration::from_secs(2), tcp.read_exact(&mut l)).await.expect("timeout").unwrap();
+    let mut b = vec![0u8; u16::from_be_bytes(l) as usize];
+    tcp.read_exact(&mut b).await.unwrap();
+    Msg::decode(&b).unwrap()
+}

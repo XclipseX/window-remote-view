@@ -6,7 +6,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::mpsc;
 
 use crate::proto::{ErrorCode, Id, Msg};
 
@@ -18,7 +20,12 @@ pub struct Config {
     pub session_idle: Duration,
     pub max_registrations: usize,
     pub max_sessions: usize,
+    /// Per-session forwarding cap in bits per second (0 = unlimited).
+    pub max_bps: u64,
 }
+
+/// Default per-session cap: 25 Mbps.
+pub const DEFAULT_MAX_BPS: u64 = 25_000_000;
 
 impl Default for Config {
     fn default() -> Self {
@@ -27,6 +34,39 @@ impl Default for Config {
             session_idle: Duration::from_secs(60),
             max_registrations: 100_000,
             max_sessions: 10_000,
+            max_bps: DEFAULT_MAX_BPS,
+        }
+    }
+}
+
+/// Token bucket in bytes; burst is 100 ms worth of traffic (at least one full packet).
+struct TokenBucket {
+    rate: f64, // bytes per second, 0 = unlimited
+    burst: f64,
+    tokens: f64,
+    last: Instant,
+}
+
+impl TokenBucket {
+    fn new(bps: u64, now: Instant) -> Self {
+        let rate = bps as f64 / 8.0;
+        let burst = (rate / 10.0).max(4096.0);
+        Self { rate, burst, tokens: burst, last: now }
+    }
+
+    fn allow(&mut self, bytes: usize, now: Instant) -> bool {
+        if self.rate <= 0.0 {
+            return true;
+        }
+        let dt = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + dt * self.rate).min(self.burst);
+        let need = bytes as f64;
+        if self.tokens >= need {
+            self.tokens -= need;
+            true
+        } else {
+            false
         }
     }
 }
@@ -35,6 +75,7 @@ struct Session {
     a: SocketAddr,
     b: Option<SocketAddr>,
     last: Instant,
+    bucket: TokenBucket,
 }
 
 #[derive(Default)]
@@ -49,11 +90,13 @@ pub type Outbox = Vec<(SocketAddr, Vec<u8>)>;
 pub struct State {
     cfg: Config,
     inner: Mutex<Inner>,
+    /// Peers connected over TCP: datagrams addressed to them are written to their stream.
+    tcp_peers: Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>,
 }
 
 impl State {
     pub fn new(cfg: Config) -> Self {
-        Self { cfg, inner: Mutex::new(Inner::default()) }
+        Self { cfg, inner: Mutex::new(Inner::default()), tcp_peers: Mutex::new(HashMap::new()) }
     }
 
     pub fn registered_hosts(&self) -> usize {
@@ -71,6 +114,22 @@ impl State {
         g.hosts.retain(|_, (_, t)| now.saturating_duration_since(*t) < ttl);
         let idle = self.cfg.session_idle;
         g.sessions.retain(|_, s| now.saturating_duration_since(s.last) < idle);
+    }
+
+    /// Send `out` to its destinations: TCP-connected peers through their stream, the rest
+    /// via `udp`.
+    pub async fn deliver(&self, out: Outbox, udp: &UdpSocket) {
+        for (to, bytes) in out {
+            let tx = self.tcp_peers.lock().unwrap().get(&to).cloned();
+            match tx {
+                Some(tx) => {
+                    let _ = tx.try_send(bytes); // slow TCP peer: drop rather than block others
+                }
+                None => {
+                    let _ = udp.send_to(&bytes, to).await;
+                }
+            }
+        }
     }
 
     pub fn handle(&self, from: SocketAddr, data: &[u8], now: Instant) -> Outbox {
@@ -104,7 +163,7 @@ impl State {
                 if !g.sessions.contains_key(&token) && g.sessions.len() >= self.cfg.max_sessions {
                     return vec![err(from, ErrorCode::Full)];
                 }
-                let s = g.sessions.entry(token).or_insert(Session { a: from, b: None, last: now });
+                let s = g.sessions.entry(token).or_insert(Session { a: from, b: None, last: now, bucket: TokenBucket::new(self.cfg.max_bps, now) });
                 s.last = now;
                 if s.a != from && s.b.is_none() {
                     s.b = Some(from);
@@ -132,6 +191,9 @@ impl State {
                     _ => return vec![err(from, ErrorCode::NotPaired)],
                 };
                 s.last = now;
+                if !s.bucket.allow(payload.len(), now) {
+                    return Vec::new(); // over the per-session cap: drop (video tolerates loss)
+                }
                 // Forwarded blindly: payload is opaque (end-to-end encrypted by peers).
                 vec![(to, Msg::RelayData { token, payload }.encode())]
             }
@@ -171,9 +233,8 @@ pub async fn serve(sock: Arc<UdpSocket>, state: Arc<State>) -> io::Result<()> {
     let res = loop {
         match sock.recv_from(&mut buf).await {
             Ok((n, from)) => {
-                for (to, bytes) in state.handle(from, &buf[..n], Instant::now()) {
-                    let _ = sock.send_to(&bytes, to).await;
-                }
+                let out = state.handle(from, &buf[..n], Instant::now());
+                state.deliver(out, &sock).await;
             }
             // Windows reports ICMP port-unreachable as recv errors; keep serving.
             Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
@@ -182,6 +243,54 @@ pub async fn serve(sock: Arc<UdpSocket>, state: Arc<State>) -> io::Result<()> {
     };
     sweeper.abort();
     res
+}
+
+/// Accept TCP clients (u16 big-endian length-prefixed datagrams) and bridge them into the
+/// same session table as UDP peers. `udp` is used to reach UDP-side peers of a session.
+pub async fn serve_tcp(listener: TcpListener, state: Arc<State>, udp: Arc<UdpSocket>) -> io::Result<()> {
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => continue,
+            Err(e) => return Err(e),
+        };
+        let _ = stream.set_nodelay(true);
+        let (state, udp) = (state.clone(), udp.clone());
+        tokio::spawn(async move {
+            let (mut rd, mut wr) = stream.into_split();
+            let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
+            state.tcp_peers.lock().unwrap().insert(peer, tx);
+            let writer = tokio::spawn(async move {
+                while let Some(d) = rx.recv().await {
+                    let mut f = Vec::with_capacity(2 + d.len());
+                    f.extend_from_slice(&(d.len() as u16).to_be_bytes());
+                    f.extend_from_slice(&d);
+                    if wr.write_all(&f).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let mut len = [0u8; 2];
+            let mut buf = Vec::new();
+            // Idle TCP connections are closed so dead peers do not pin resources.
+            let idle = state.cfg.session_idle;
+            loop {
+                let r = tokio::time::timeout(idle, async {
+                    rd.read_exact(&mut len).await?;
+                    buf.resize(u16::from_be_bytes(len) as usize, 0);
+                    rd.read_exact(&mut buf).await
+                })
+                .await;
+                if !matches!(r, Ok(Ok(_))) {
+                    break;
+                }
+                let out = state.handle(peer, &buf, Instant::now());
+                state.deliver(out, &udp).await;
+            }
+            state.tcp_peers.lock().unwrap().remove(&peer);
+            writer.abort();
+        });
+    }
 }
 
 #[cfg(test)]
@@ -219,5 +328,36 @@ mod tests {
         let d = Msg::RelayData { token: [5; 16], payload: vec![1] }.encode();
         let out = st.handle(a("3.3.3.3:3"), &d, t);
         assert_eq!(Msg::decode(&out[0].1).unwrap(), Msg::Error { code: ErrorCode::NotPaired });
+    }
+
+    #[test]
+    fn bandwidth_cap_drops_excess_and_refills() {
+        let cfg = Config { max_bps: 8_000_000, ..Config::default() }; // 1 MB/s, burst 100 KB
+        let st = State::new(cfg);
+        let t = Instant::now();
+        let (x, y) = (a("1.1.1.1:1"), a("2.2.2.2:2"));
+        let j = Msg::RelayJoin { token: [9; 16] }.encode();
+        st.handle(x, &j, t);
+        st.handle(y, &j, t);
+        let d = Msg::RelayData { token: [9; 16], payload: vec![0; 1000] }.encode();
+        let forwarded = (0..300).filter(|_| !st.handle(x, &d, t).is_empty()).count();
+        // burst of ~100 KB at the same instant: roughly 100 packets pass, rest dropped
+        assert!((90..=110).contains(&forwarded), "{forwarded}");
+        // 50 ms later ~50 KB of tokens are back
+        let later = t + Duration::from_millis(50);
+        let again = (0..100).filter(|_| !st.handle(x, &d, later).is_empty()).count();
+        assert!((40..=60).contains(&again), "{again}");
+    }
+
+    #[test]
+    fn zero_cap_means_unlimited() {
+        let st = State::new(Config { max_bps: 0, ..Config::default() });
+        let t = Instant::now();
+        let (x, y) = (a("1.1.1.1:1"), a("2.2.2.2:2"));
+        let j = Msg::RelayJoin { token: [9; 16] }.encode();
+        st.handle(x, &j, t);
+        st.handle(y, &j, t);
+        let d = Msg::RelayData { token: [9; 16], payload: vec![0; 1400] }.encode();
+        assert!((0..2000).all(|_| !st.handle(x, &d, t).is_empty()));
     }
 }

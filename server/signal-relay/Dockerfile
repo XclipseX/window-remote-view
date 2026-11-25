@@ -9,6 +9,6 @@ RUN cargo build --release -p rv-signal-relay
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /src/target/release/rv-signal-relay /usr/local/bin/rv-signal-relay
 ENV RV_PORT=21116
-EXPOSE 21116/udp
+EXPOSE 21116/udp 21117/tcp
 USER nonroot
 ENTRYPOINT ["/usr/local/bin/rv-signal-relay"]
