@@ -383,6 +383,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "inout"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -655,6 +665,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rv-session"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "rv-crypto",
+ "rv-proto",
+ "rv-transport",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "rv-signal-relay"
 version = "0.1.0"
 dependencies = [
@@ -669,6 +691,7 @@ dependencies = [
 name = "rv-transport"
 version = "0.1.0"
 dependencies = [
+ "if-addrs",
  "reed-solomon-simd",
  "socket2 0.5.10",
  "thiserror 1.0.69",

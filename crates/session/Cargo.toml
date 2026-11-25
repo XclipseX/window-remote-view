@@ -1,0 +1,17 @@
+[package]
+name = "rv-session"
+description = "End-to-end session glue: Noise handshake + sealed packets + FEC video + input/control for window-remote-view"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+rv-proto = { path = "../proto" }
+rv-crypto = { path = "../crypto" }
+rv-transport = { path = "../transport" }
+thiserror = "2"
+getrandom = "0.2"
+tokio = { version = "1", features = ["net", "rt", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
