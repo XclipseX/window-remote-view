@@ -1,0 +1,11 @@
+[package]
+name = "rv-usb-link"
+description = "USB (Android Open Accessory bulk) and ADB-reverse TCP datagram links for window-remote-view"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+rv-session = { path = "../session" }
+rusb = { version = "0.9", features = ["vendored"] }
+thiserror = "2"
