@@ -42,6 +42,7 @@ fun HomeScreen(
     lanHosts: List<LanHost>,
     onConnect: (target: String) -> Unit,
     onOpenSettings: () -> Unit,
+    onUsbDisplay: () -> Unit = {},
 ) {
     var id by rememberSaveable { mutableStateOf("") }
     val context = LocalContext.current
@@ -75,6 +76,11 @@ fun HomeScreen(
                     Text(stringResource(R.string.home_scan_qr)) // TODO: quét QR (CameraX + ML Kit)
                 }
             }
+
+            Button(onClick = onUsbDisplay, modifier = Modifier.fillMaxWidth()) {
+                Text(stringResource(R.string.home_usb_display))
+            }
+            Text(stringResource(R.string.home_usb_display_hint), style = MaterialTheme.typography.bodySmall)
 
             Text(stringResource(R.string.home_lan_hosts), style = MaterialTheme.typography.titleMedium)
             if (lanHosts.isEmpty()) {

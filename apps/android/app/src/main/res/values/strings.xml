@@ -12,6 +12,8 @@
     <string name="home_scan_qr">Quét mã QR</string>
     <string name="home_qr_todo">Quét QR: chưa triển khai</string>
     <string name="home_settings">Cài đặt</string>
+    <string name="home_usb_display">Màn hình phụ (USB)</string>
+    <string name="home_usb_display_hint">Dùng máy này làm màn hình thứ hai của PC qua cáp USB. Cắm cáp là tự hiện, không cần bật chế độ nhà phát triển.</string>
 
     <!-- Cài đặt -->
     <string name="settings_title">Cài đặt luồng hình</string>
@@ -31,12 +33,23 @@
     <string name="settings_raw_typing_hint">Gửi phím vật lý thay vì ký tự Unicode; để UniKey/EVKey trên Windows xử lý Telex</string>
     <string name="settings_direct_present">Hiển thị trực tiếp (Direct Present)</string>
     <string name="settings_direct_present_hint">Hiện khung ngay khi giải mã xong, bỏ đồng bộ Choreographer</string>
+    <string name="settings_audio">Âm thanh</string>
+    <string name="settings_audio_hint">Phát âm thanh của máy tính (48 kHz stereo, độ trễ thấp)</string>
+    <string name="settings_usb_mod_bar">Hiện thanh phím ở chế độ Màn hình phụ</string>
+    <string name="settings_usb_mod_bar_hint">Mặc định ẩn để dùng trọn màn hình</string>
     <string name="settings_trackpad">Chế độ Trackpad (con trỏ tương đối)</string>
 
     <!-- Phiên điều khiển -->
     <string name="session_connecting">Đang kết nối…</string>
     <string name="session_native_missing">Chưa nạp được librv_core.so (lõi Rust chưa được tích hợp)</string>
     <string name="session_exit">Thoát phiên</string>
+
+    <!-- Màn hình phụ (USB) -->
+    <string name="usb_waiting">Đang chờ kết nối USB…</string>
+    <string name="usb_connected_aoa">Đã kết nối qua USB (Open Accessory)</string>
+    <string name="usb_connected_adb">Đã kết nối qua USB (ADB reverse)</string>
+    <string name="usb_disconnected">Đã rút cáp USB</string>
+    <string name="usb_permission_denied">Chưa được cấp quyền truy cập USB</string>
 
     <!-- Thanh phím -->
     <string name="mod_win">Win</string>

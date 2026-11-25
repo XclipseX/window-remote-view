@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Host Windows nhận dạng bằng cặp manufacturer/model khi chuyển điện thoại sang chế độ AOA. -->
+    <usb-accessory
+        manufacturer="RemoteView"
+        model="RemoteViewHost" />
+</resources>

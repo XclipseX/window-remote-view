@@ -19,6 +19,10 @@ data class StreamSettings(
     val rawTyping: Boolean = false,
     val directPresent: Boolean = false,
     val touchMode: TouchMode = TouchMode.DIRECT,
+    /** Phát âm thanh của host (48 kHz stereo). */
+    val audioEnabled: Boolean = true,
+    /** Hiện thanh phím ở chế độ Màn hình phụ (USB); mặc định ẩn. */
+    val usbShowModifierBar: Boolean = false,
 ) {
     /** Placeholder: 5..120 Mbps tuyến tính theo chất lượng (mặc định LAN 60–120 Mbps). */
     fun targetBitrateKbps(): Int = 5_000 + ((qualityPercent.coerceIn(1, 100) - 1) / 99f * 115_000).toInt()
@@ -45,6 +49,8 @@ class SettingsRepository(context: Context) {
             directPresent = prefs.getBoolean("direct", d.directPresent),
             touchMode = runCatching { TouchMode.valueOf(prefs.getString("touch", null) ?: "") }
                 .getOrDefault(d.touchMode),
+            audioEnabled = prefs.getBoolean("audio", d.audioEnabled),
+            usbShowModifierBar = prefs.getBoolean("usb_mod_bar", d.usbShowModifierBar),
         )
     }
 
@@ -59,6 +65,8 @@ class SettingsRepository(context: Context) {
             .putBoolean("raw", s.rawTyping)
             .putBoolean("direct", s.directPresent)
             .putString("touch", s.touchMode.name)
+            .putBoolean("audio", s.audioEnabled)
+            .putBoolean("usb_mod_bar", s.usbShowModifierBar)
             .apply()
     }
 }

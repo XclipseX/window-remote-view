@@ -29,6 +29,9 @@ object NativeBridge {
         fun onConnectionState(state: Int, message: String?)
         fun onHostDiscovered(name: String, address: String)
         fun onStats(rttMs: Float, bitrateKbps: Int, lossPercent: Float)
+
+        /** Gói âm thanh từ host. codec: 0 = PCM s16le 48 kHz stereo, 1 = Opus. Mặc định bỏ qua. */
+        fun onAudioPacket(data: ByteArray, ptsUs: Long, codec: Int) {}
     }
 
     const val FLAG_KEYFRAME = 1
@@ -53,6 +56,16 @@ object NativeBridge {
     external fun nativeSetBitrate(handle: Long, kbps: Int)
     external fun nativeSetMaxFps(handle: Long, fps: Int)
 
+    // --- Liên kết datagram qua USB (AOA / ADB reverse): Kotlin chuyển byte, Rust lo giao thức ---
+    /**
+     * Tạo phiên chạy trên liên kết datagram do Kotlin cấp (thay vì tự mở socket).
+     * [helloJson] chứa caps gửi trong Hello (độ phân giải gốc, tần số quét, cảm ứng, âm thanh...).
+     * Gói gửi đi được Rust trả ngược qua [onSendDatagramFromNative]. TODO(rust-core).
+     */
+    external fun nativeConnectLink(helloJson: String): Long
+    /** Đẩy một datagram nhận từ liên kết USB vào lõi Rust. */
+    external fun nativePushDatagram(handle: Long, data: ByteArray)
+
     // --- Khám phá LAN (mDNS) ---
     external fun nativeStartDiscovery()
     external fun nativeStopDiscovery()
@@ -72,6 +85,27 @@ object NativeBridge {
         inRange: Boolean, inContact: Boolean, barrel: Boolean, eraser: Boolean,
     )
     external fun nativeSendSas(handle: Long)
+    /**
+     * Cảm ứng đa điểm (không phải chuột). x,y tuyệt đối chuẩn hóa 0..65535; phase theo
+     * [com.remoteview.client.input.TouchPhase] ordinal (DOWN, MOVE, UP, CANCEL); pressure 0..1024.
+     */
+    external fun nativeSendTouch(handle: Long, id: Int, x: Int, y: Int, phase: Int, pressure: Int)
+
+    // --- Âm thanh ---
+    /**
+     * Giải mã một gói Opus -> PCM s16 xen kẽ stereo 48 kHz vào [pcmOut]. Trả về số frame/kênh,
+     * hoặc <= 0 nếu lỗi. TODO(rust-core): triển khai bằng crate opus trong rv_core.
+     */
+    external fun nativeDecodeOpus(packet: ByteArray, pcmOut: ShortArray): Int
+
+    /** Bọc an toàn: no-op (trả -1) khi chưa có librv_core.so hoặc hàm chưa được triển khai. */
+    fun decodeOpus(packet: ByteArray, pcmOut: ShortArray): Int {
+        if (!available) return -1
+        return try { nativeDecodeOpus(packet, pcmOut) } catch (_: UnsatisfiedLinkError) { -1 }
+    }
+
+    /** Rust yêu cầu gửi một datagram ra liên kết USB; [datagramSender] do SessionController đặt. */
+    @Volatile var datagramSender: ((ByteArray) -> Unit)? = null
 
     // --- Hàm Rust gọi ngược (qua JNI) để đẩy dữ liệu lên Kotlin ---
     @JvmStatic @Keep
@@ -87,6 +121,16 @@ object NativeBridge {
     @JvmStatic @Keep
     fun onHostDiscoveredFromNative(name: String, address: String) {
         callbacks?.onHostDiscovered(name, address)
+    }
+
+    @JvmStatic @Keep
+    fun onSendDatagramFromNative(data: ByteArray) {
+        datagramSender?.invoke(data)
+    }
+
+    @JvmStatic @Keep
+    fun onAudioFromNative(data: ByteArray, ptsUs: Long, codec: Int) {
+        callbacks?.onAudioPacket(data, ptsUs, codec)
     }
 
     @JvmStatic @Keep
@@ -110,6 +154,9 @@ class NativeInputSink(private val handleProvider: () -> Long) : InputSink {
             is RemoteInput.Pen -> NativeBridge.nativeSendPen(
                 h, event.nx, event.ny, event.pressure, event.tiltX, event.tiltY,
                 event.inRange, event.inContact, event.barrelButton, event.eraser,
+            )
+            is RemoteInput.Touch -> NativeBridge.nativeSendTouch(
+                h, event.id, event.x, event.y, event.phase.ordinal, event.pressure,
             )
             RemoteInput.SecureAttention -> NativeBridge.nativeSendSas(h)
         }

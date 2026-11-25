@@ -105,6 +105,12 @@ fun SettingsScreen(
             SwitchRow(R.string.settings_trackpad, null, settings.touchMode == TouchMode.TRACKPAD) {
                 onChange(settings.copy(touchMode = if (it) TouchMode.TRACKPAD else TouchMode.DIRECT))
             }
+            SwitchRow(R.string.settings_audio, R.string.settings_audio_hint, settings.audioEnabled) {
+                onChange(settings.copy(audioEnabled = it))
+            }
+            SwitchRow(R.string.settings_usb_mod_bar, R.string.settings_usb_mod_bar_hint, settings.usbShowModifierBar) {
+                onChange(settings.copy(usbShowModifierBar = it))
+            }
         }
     }
 }

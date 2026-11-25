@@ -8,6 +8,7 @@ import android.view.SurfaceView
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
+import com.remoteview.client.input.DirectTouchMapper
 import com.remoteview.client.input.KeyboardBridge
 import com.remoteview.client.input.StylusMapper
 import com.remoteview.client.input.TouchGestureMapper
@@ -27,6 +28,7 @@ class RemoteSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     private var touch: TouchGestureMapper? = null
     private var stylus: StylusMapper? = null
     private var keyboard: KeyboardBridge? = null
+    private var direct: DirectTouchMapper? = null
     private var zoom = 1f
 
     init {
@@ -35,7 +37,13 @@ class RemoteSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         holder.addCallback(this)
     }
 
-    fun bind(touch: TouchGestureMapper, stylus: StylusMapper, keyboard: KeyboardBridge) {
+    fun bind(
+        touch: TouchGestureMapper,
+        stylus: StylusMapper,
+        keyboard: KeyboardBridge,
+        direct: DirectTouchMapper? = null,
+    ) {
+        this.direct = direct
         this.touch = touch
         this.stylus = stylus
         this.keyboard = keyboard
@@ -68,7 +76,8 @@ class RemoteSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     // ---- Input
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (stylus?.onTouch(this, event) == true) return true
-        if (touch?.onTouchEvent(event, width, height) == true) return true
+        direct?.let { d -> if (d.onTouchEvent(this, event)) return true }
+        if (direct == null && touch?.onTouchEvent(event, width, height) == true) return true
         return super.onTouchEvent(event)
     }
 

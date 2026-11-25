@@ -33,6 +33,27 @@ Máy đích: Galaxy S26+ (Exynos 2600, `c2.exynos.*`) và Galaxy Tab S10+ (Dimen
 | `session/SessionController.kt` | Nối decoder, presenter, watchdog, ADPF, thermal, input cho một phiên. |
 | `ui/` | `HomeScreen` (ID + danh sách LAN + nút QR giả), `SettingsScreen` (độ phân giải, FPS 30/60/90/120, chất lượng 1–100, codec, HW/SW…), `ModifierBar` (Win, Alt+Tab, Ctrl+Alt+Del, Esc, PrtSc), `RemoteSurfaceView`, `SessionScreen`. |
 
+## Chế độ "Màn hình phụ (USB)" (kiểu spacedesk qua cáp) + âm thanh
+
+Biến máy Android thành màn hình thứ hai của PC qua cáp USB; host tạo màn hình ảo khớp độ phân giải gốc của máy.
+
+- **Đường chính: Android Open Accessory (AOA)** — `usb/AccessoryLink.kt`. Host Windows đưa điện thoại vào chế độ accessory
+  (manufacturer `RemoteView`, model `RemoteViewHost`); Android phát `USB_ACCESSORY_ATTACHED`, app tự mở và vào phiên ("cắm là hiện").
+  **Không cần bật tùy chọn nhà phát triển hay gỡ lỗi USB.** Bộ lọc: `res/xml/accessory_filter.xml`.
+- **Dự phòng: ADB reverse** — `usb/AdbReverseLink.kt`. Host chạy `adb reverse tcp:47810 tcp:47810`, app kết nối `127.0.0.1:47810`.
+  **Cần bật Gỡ lỗi USB (USB debugging).**
+- Cả hai dùng cùng khung: `u32` big-endian độ dài + payload (tối đa 64 KiB) — `usb/DatagramLink.kt`. Kotlin chỉ chuyển byte;
+  Rust (`nativeConnectLink` / `nativePushDatagram` / `onSendDatagramFromNative`) lo giao thức.
+- Thứ tự ưu tiên (`usb/LinkSelector.kt`): USB accessory (đã cắm) → ADB reverse → USB tether/LAN → server.
+- Chế độ hiển thị: toàn màn hình immersive, luôn sáng (`FLAG_KEEP_SCREEN_ON`), ẩn thanh phím (bật lại trong Cài đặt).
+  Cảm ứng trực tiếp 1:1 (`input/DirectTouchMapper.kt`): tuyệt đối chuẩn hóa 0..65535, tối đa 10 điểm gửi dạng sự kiện **touch**
+  (không phải chuột); S Pen gửi sự kiện **pen**. Hello caps gồm độ phân giải gốc + tần số quét cao nhất (ví dụ 2800x1752@120)
+  để host tạo màn hình ảo tương ứng (`usb/DisplayCaps.kt`; tên trường JSON chưa chốt với giao thức).
+- **Âm thanh đi kèm** (`audio/AudioPlayer.kt`): PCM 48 kHz stereo qua `AudioTrack` `PERFORMANCE_MODE_LOW_LATENCY`, bộ đệm nhỏ,
+  jitter buffer ~30 ms (tối đa 40 ms, bỏ gói cũ nhất khi trễ). Opus giải mã trong lõi Rust qua `NativeBridge.decodeOpus`
+  (TODO(rust-core); thiếu `librv_core.so` thì gói Opus bị bỏ qua, PCM thô vẫn phát). Bật/tắt ở Cài đặt → "Âm thanh".
+  Oboe/AAudio qua JNI là việc tương lai.
+
 Chuỗi tiếng Việt: `app/src/main/res/values/strings.xml`.
 
 ## Việc còn thiếu / điểm cần xác minh trên máy thật

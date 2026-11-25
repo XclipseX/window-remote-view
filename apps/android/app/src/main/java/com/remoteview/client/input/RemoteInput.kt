@@ -4,6 +4,8 @@ package com.remoteview.client.input
 
 enum class MouseButtonId { LEFT, RIGHT, MIDDLE, X1, X2 }
 
+enum class TouchPhase { DOWN, MOVE, UP, CANCEL }
+
 /** Sự kiện nhập liệu trung lập, được lõi Rust đóng gói gửi sang host Windows. */
 sealed interface RemoteInput {
     /** Vị trí tuyệt đối chuẩn hóa 0..1 trên khung hình host. */
@@ -31,6 +33,18 @@ sealed interface RemoteInput {
         val inContact: Boolean,
         val barrelButton: Boolean,
         val eraser: Boolean,
+    ) : RemoteInput
+
+    /**
+     * Một điểm chạm của cảm ứng đa điểm (tối đa 10). x, y tuyệt đối chuẩn hóa 0..65535 trên màn hình host;
+     * pressure 0..1024. Host chuyển thành POINTER_TOUCH_INFO (không phải chuột).
+     */
+    data class Touch(
+        val id: Int,
+        val x: Int,
+        val y: Int,
+        val phase: TouchPhase,
+        val pressure: Int,
     ) : RemoteInput
 
     /** Ctrl+Alt+Del: host gọi SendSAS(FALSE) (không thể giả lập bằng SendInput). */
