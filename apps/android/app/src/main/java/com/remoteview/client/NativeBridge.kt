@@ -40,7 +40,11 @@ object NativeBridge {
     const val STATE_ESTABLISHED = 1
     const val STATE_CLOSED = 2
     const val STATE_FAILED = 3
+    /** Host im lặng 5 s; lõi tự bắt tay lại, state 1 sẽ đến khi nối lại được. */
+    const val STATE_DISCONNECTED = 4
     const val STATE_DISPLAY_CONFIG = 10
+    /** message = "<codec> WxH@fps <kbps>kbps", codec: h264|hevc|av1. */
+    const val STATE_STREAM_CONFIG = 11
 
     @Volatile var callbacks: Callbacks? = null
 

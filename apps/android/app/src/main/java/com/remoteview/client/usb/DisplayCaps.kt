@@ -4,6 +4,9 @@ import android.app.Activity
 import android.os.Build
 import android.util.DisplayMetrics
 import com.remoteview.client.StreamSettings
+import com.remoteview.client.decoder.CodecPreference
+import com.remoteview.client.decoder.CodecSelector
+import com.remoteview.client.decoder.MimeTypes
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.roundToInt
@@ -32,6 +35,26 @@ object DisplayCaps {
     }
 
     /**
+     * Danh sách codec quảng bá cho host theo thứ tự ưu tiên ("hevc"/"h264"/"av1").
+     * HEVC chỉ khi có decoder phần cứng; AV1 chỉ khi cài đặt cho phép (hoặc người dùng chọn AV1) và có decoder phần cứng.
+     * h264 luôn có mặt (mọi máy giải được) trừ khi bị lọc bởi lựa chọn codec... nó luôn là phương án cuối.
+     */
+    fun advertisedCodecs(settings: StreamSettings): List<String> {
+        val hevc = CodecSelector.hasHardwareDecoder(MimeTypes.HEVC)
+        val av1 = (settings.allowAv1 || settings.codec == CodecPreference.AV1) &&
+            CodecSelector.hasHardwareDecoder(MimeTypes.AV1)
+        val out = ArrayList<String>()
+        when (settings.codec) {
+            CodecPreference.H264 -> {}
+            CodecPreference.HEVC -> if (hevc) out += "hevc"
+            CodecPreference.AV1 -> { if (av1) out += "av1"; if (hevc) out += "hevc" }
+            CodecPreference.AUTO -> { if (av1) out += "av1"; if (hevc) out += "hevc" }
+        }
+        out += "h264"
+        return out
+    }
+
+    /**
      * JSON caps cho Hello. Ở chế độ [usbDisplay], host dùng display_width/height/refresh để tạo
      * màn hình ảo khớp (IDD) thay vì chụp màn hình có sẵn.
      * Lõi Rust đọc display_width/height/refresh_hz (-> ControlMessage::Hello) và "otp" (PIN ghép đôi với host).
@@ -49,6 +72,7 @@ object DisplayCaps {
             put("touch", JSONObject().put("max_points", 10).put("absolute_max", 65535))
             put("otp", settings.usbOtp)
             put("pen", true)
+            put("codecs", JSONArray().also { a -> advertisedCodecs(settings).forEach { a.put(it) } })
             put("audio", JSONObject().apply {
                 put("enabled", settings.audioEnabled)
                 put("sample_rate", 48000)

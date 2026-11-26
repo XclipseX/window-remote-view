@@ -6,6 +6,19 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Text
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import com.remoteview.client.R
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -74,6 +87,25 @@ fun SessionScreen(controller: SessionController, showModifierBar: Boolean = true
             },
             onRelease = { controller.release() },
         )
+        val reconnecting by controller.reconnecting.collectAsState()
+        if (reconnecting) {
+            // Không chặn cảm ứng: chỉ là nhãn nổi, phiên vẫn giữ.
+            Row(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 24.dp)
+                    .background(Color(0xCC000000), RoundedCornerShape(24.dp))
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                CircularProgressIndicator(Modifier.size(18.dp), color = Color.White, strokeWidth = 2.dp)
+                Text(
+                    stringResource(R.string.session_reconnecting),
+                    color = Color.White,
+                    modifier = Modifier.padding(start = 12.dp),
+                )
+            }
+        }
         if (showModifierBar) {
             ModifierBar(
                 keyboard = controller.keyboard,

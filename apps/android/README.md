@@ -120,3 +120,9 @@ bằng bộ mã hóa phần cứng (H.264/HEVC/AV1; không có B-frame, chỉ 1 
 
 Chưa xác minh trên máy thật: mã chưa biên dịch; `getInputImage` + Image flexible trên encoder Exynos/MTK ở 2800x1752;
 ImageReader PRIVATE làm đích của decoder; đơn vị CURRENT_NOW khác nhau theo hãng (đã đoán µA/mA); độ chính xác ADPF.
+
+## Giao thức v2: codec và mất kết nối
+
+- Hello quảng bá `"codecs"` (theo thứ tự ưu tiên): `hevc` khi có decoder HEVC phần cứng, `av1` chỉ khi bật AV1 trong cài đặt, `h264` luôn có; lựa chọn Auto/H.264/HEVC/AV1 lọc và sắp xếp danh sách (`DisplayCaps.advertisedCodecs`). Không còn ép H.264 ở chế độ USB.
+- Lõi Rust báo `STATE_STREAM_CONFIG` (11, `"hevc 2800x1752@120 80000kbps"`): `SessionController` dựng lại `LowLatencyDecoder` với đúng mime/kích thước/fps khi có thay đổi.
+- `STATE_DISCONNECTED` (4): hiện nhãn "Mất kết nối — đang kết nối lại…" (không thoát phiên); khi `STATE_ESTABLISHED` quay lại thì flush decoder và đợi keyframe. `STATE_FAILED` vẫn đưa về hộp thoại PIN.

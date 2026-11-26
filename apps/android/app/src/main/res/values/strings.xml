@@ -320,4 +320,5 @@
     <string name="bench_live">Nhiệt: %1$s | pin %2$d%% (%3$s °C) | màn hình %4$s Hz | ADPF %5$s</string>
     <string name="bench_min">%1$d phút</string>
     <string name="bench_sec">%1$d giây</string>
+    <string name="session_reconnecting">Mất kết nối — đang kết nối lại…</string>
 </resources>

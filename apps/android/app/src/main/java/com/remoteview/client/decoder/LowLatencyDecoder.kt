@@ -45,6 +45,8 @@ data class DecoderPolicy(
     val preference: CodecPreference = CodecPreference.AUTO,
     val allowAv1: Boolean = false,
     val preferHardware: Boolean = true,
+    /** Khác null: chỉ dùng đúng mime này (host đã chọn codec qua STREAM_CONFIG), không rơi về codec khác. */
+    val forcedMime: String? = null,
 )
 
 data class CodecPick(val name: String, val mime: String, val vendor: Vendor, val hardware: Boolean)
@@ -91,7 +93,7 @@ object CodecSelector {
         exclude: Set<String> = emptySet(),
     ): CodecPick? {
         val infos = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { !it.isEncoder }
-        for (mime in mimeOrder(policy.preference, policy.allowAv1)) {
+        for (mime in policy.forcedMime?.let { listOf(it) } ?: mimeOrder(policy.preference, policy.allowAv1)) {
             val cands = infos.filter { info ->
                 info.name !in exclude &&
                     info.supportedTypes.any { it.equals(mime, ignoreCase = true) } &&
@@ -112,6 +114,15 @@ object CodecSelector {
         }
         return null
     }
+
+    /** Có bộ giải mã phần cứng cho [mime] (dùng để quảng bá codec trong Hello). */
+    fun hasHardwareDecoder(mime: String): Boolean = runCatching {
+        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { info ->
+            !info.isEncoder && isHardware(info) &&
+                info.supportedTypes.any { it.equals(mime, ignoreCase = true) } &&
+                !isFakeHardwareAv1(info.name, mime)
+        }
+    }.getOrDefault(false)
 
     // unisoc.av1.decoder thực chất là dav1d phần mềm giả danh phần cứng (Meta 2025).
     private fun isFakeHardwareAv1(name: String, mime: String) =

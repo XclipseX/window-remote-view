@@ -11,10 +11,10 @@ import com.remoteview.client.NativeInputSink
 import com.remoteview.client.StreamSettings
 import com.remoteview.client.audio.AudioPlayer
 import com.remoteview.client.decoder.AnnexB
-import com.remoteview.client.decoder.CodecPreference
 import com.remoteview.client.decoder.DecoderPolicy
 import com.remoteview.client.decoder.EncodedFrame
 import com.remoteview.client.decoder.LowLatencyDecoder
+import com.remoteview.client.decoder.MimeTypes
 import com.remoteview.client.decoder.StallWatchdog
 import com.remoteview.client.input.DirectTouchMapper
 import com.remoteview.client.input.KeyboardBridge
@@ -28,6 +28,8 @@ import com.remoteview.client.render.FramePresenter
 import com.remoteview.client.ui.RemoteSurfaceView
 import com.remoteview.client.usb.DatagramLink
 import com.remoteview.client.usb.DisplayCaps
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 
 // UNBUILT: chưa biên dịch.
 
@@ -57,9 +59,18 @@ class SessionController(
     /** Lõi Rust báo phiên lỗi (sai PIN, host không trả lời...). Gọi từ thread nền. */
     var onNativeFailed: ((String?) -> Unit)? = null
 
+    private val _reconnecting = MutableStateFlow(false)
+    /** true khi host im lặng (state 4): UI hiện lớp phủ "đang kết nối lại", không thoát phiên. */
+    val reconnecting: StateFlow<Boolean> = _reconnecting
+
+    /** Cấu hình luồng do host báo (state 11). */
+    private data class StreamConfig(val mime: String, val width: Int, val height: Int, val fps: Int)
+    @Volatile private var streamConfig: StreamConfig? = null
+    private val videoLock = Any()
+
     private var view: RemoteSurfaceView? = null
     private var capture: PointerCaptureController? = null
-    private var decoder: LowLatencyDecoder? = null
+    @Volatile private var decoder: LowLatencyDecoder? = null
     private var presenter: FramePresenter? = null
     private var watchdog: StallWatchdog? = null
     private var adpf: AdpfSession? = null
@@ -103,36 +114,7 @@ class SessionController(
         DisplayLock.lockHighestRefresh(activity)
         DisplayLock.applyFrameRate(s, effectiveFps.toFloat())
 
-        val (w, h) = decodeSize()
-        val keyFrame = { if (NativeBridge.available && nativeHandle != 0L) NativeBridge.nativeRequestKeyFrame(nativeHandle) }
-        val dec = LowLatencyDecoder(
-            w, h, effectiveFps,
-            // rv-host hiện chỉ gửi H.264 (OpenH264) ở chế độ USB.
-            DecoderPolicy(if (usbDisplay) CodecPreference.H264 else settings.codec, settings.allowAv1, settings.hardwareDecode),
-            object : LowLatencyDecoder.Listener {
-                override fun onKeyFrameNeeded() = keyFrame()
-                override fun onFatal(reason: String) {
-                    // TODO: báo host hạ về H.264 / báo UI.
-                }
-            },
-        )
-        val pres = FramePresenter(
-            dec,
-            if (settings.directPresent) FramePresenter.Mode.DIRECT else FramePresenter.Mode.CHOREOGRAPHER,
-        ) { idle -> surface?.let { DisplayLock.setIdle(it, idle, effectiveFps.toFloat()) } }
-        dec.onOutput = pres::onOutput
-        decoder = dec
-        presenter = pres
-
-        if (dec.start(s)) {
-            watchdog = StallWatchdog(object : StallWatchdog.Host {
-                override val lastInputMs get() = dec.lastInputMs
-                override val lastOutputMs get() = dec.lastOutputMs
-                override fun flushDecoder() { pres.clear(); dec.flush() }
-                override fun recreateDecoder() { pres.clear(); dec.recreate(escalate = true) }
-                override fun requestKeyFrame() = keyFrame()
-            }).also { it.start() }
-        }
+        startVideo(s)
 
         adpf = AdpfSession(activity, intArrayOf(Process.myTid()), effectiveFps)
         thermal = ThermalGovernor(activity, object : ThermalGovernor.Listener {
@@ -161,9 +143,92 @@ class SessionController(
         }
     }
 
-    /** Trạng thái từ lõi Rust: 0 đang nối, 1 đã bắt tay, 2 đóng, 3 lỗi, 10 cấu hình màn hình "WxH@fps". */
-    fun onNativeState(state: Int, message: String?) {
-        if (state == NativeBridge.STATE_FAILED) onNativeFailed?.invoke(message)
+    /** Dựng decoder + presenter + watchdog theo [streamConfig] (nếu có) hoặc kích thước màn hình. */
+    private fun startVideo(s: Surface) {
+      synchronized(videoLock) {
+        stopVideo()
+        val cfg = streamConfig
+        val (dw, dh) = decodeSize()
+        val w = cfg?.width ?: dw
+        val h = cfg?.height ?: dh
+        val fps = cfg?.fps ?: effectiveFps
+        val keyFrame = { if (NativeBridge.available && nativeHandle != 0L) NativeBridge.nativeRequestKeyFrame(nativeHandle) }
+        val dec = LowLatencyDecoder(
+            w, h, fps,
+            DecoderPolicy(settings.codec, settings.allowAv1, settings.hardwareDecode, forcedMime = cfg?.mime),
+            object : LowLatencyDecoder.Listener {
+                override fun onKeyFrameNeeded() = keyFrame()
+                override fun onFatal(reason: String) {
+                    // TODO: báo host hạ về H.264 / báo UI.
+                }
+            },
+        )
+        val pres = FramePresenter(
+            dec,
+            if (settings.directPresent) FramePresenter.Mode.DIRECT else FramePresenter.Mode.CHOREOGRAPHER,
+        ) { idle -> surface?.let { DisplayLock.setIdle(it, idle, effectiveFps.toFloat()) } }
+        dec.onOutput = pres::onOutput
+        decoder = dec
+        presenter = pres
+        if (dec.start(s)) {
+            watchdog = StallWatchdog(object : StallWatchdog.Host {
+                override val lastInputMs get() = dec.lastInputMs
+                override val lastOutputMs get() = dec.lastOutputMs
+                override fun flushDecoder() { pres.clear(); dec.flush() }
+                override fun recreateDecoder() { pres.clear(); dec.recreate(escalate = true) }
+                override fun requestKeyFrame() = keyFrame()
+            }).also { it.start() }
+        }
+      }
+    }
+
+    private fun stopVideo() {
+      synchronized(videoLock) {
+        watchdog?.stop(); watchdog = null
+        presenter?.stop(); presenter = null
+        decoder?.stop(); decoder = null
+      }
+    }
+
+    private fun parseStreamConfig(msg: String?): StreamConfig? {
+        val m = Regex("""^\s*(\w+)\s+(\d+)x(\d+)@(\d+)""").find(msg ?: return null) ?: return null
+        val mime = when (m.groupValues[1].lowercase()) {
+            "h264" -> MimeTypes.AVC
+            "hevc" -> MimeTypes.HEVC
+            "av1" -> MimeTypes.AV1
+            else -> return null
+        }
+        val w = m.groupValues[2].toIntOrNull() ?: return null
+        val h = m.groupValues[3].toIntOrNull() ?: return null
+        val fps = m.groupValues[4].toIntOrNull() ?: return null
+        if (w <= 0 || h <= 0 || fps <= 0) return null
+        return StreamConfig(mime, w, h, fps)
+    }
+
+        fun onNativeState(state: Int, message: String?) {
+        when (state) {
+            NativeBridge.STATE_FAILED -> onNativeFailed?.invoke(message)
+            NativeBridge.STATE_DISCONNECTED -> _reconnecting.value = true
+            NativeBridge.STATE_ESTABLISHED -> {
+                val was = _reconnecting.value
+                _reconnecting.value = false
+                if (was) {
+                    // Nối lại: bỏ dữ liệu cũ, chờ keyframe tiếp theo.
+                    presenter?.clear()
+                    decoder?.flush()
+                }
+            }
+            NativeBridge.STATE_STREAM_CONFIG -> {
+                val cfg = parseStreamConfig(message) ?: return
+                val old = streamConfig
+                streamConfig = cfg
+                val s = surface ?: return
+                val cur = decoder
+                val same = old != null && cur != null && old.mime == cfg.mime &&
+                    old.width == cfg.width && old.height == cfg.height && old.fps == cfg.fps
+                if (!same) startVideo(s) // mime/kích thước/fps đổi (hoặc decoder chưa đúng cấu hình): dựng lại
+            }
+        }
     }
 
     fun submitFrame(data: ByteArray, ptsUs: Long, flags: Int) {
@@ -178,9 +243,7 @@ class SessionController(
     fun onSurfaceDestroyed() {
         NativeBridge.callbacks = null
         thermal?.stop(); thermal = null
-        watchdog?.stop(); watchdog = null
-        presenter?.stop(); presenter = null
-        decoder?.stop(); decoder = null
+        stopVideo()
         adpf?.close(); adpf = null
         surface = null
     }
