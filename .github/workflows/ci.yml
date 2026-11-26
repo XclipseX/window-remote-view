@@ -1,4 +1,7 @@
 name: CI
+permissions:
+  contents: write
+
 on:
   push:
   pull_request:
@@ -48,3 +51,30 @@ jobs:
         with:
           name: android-debug-apk
           path: apps/android/app/build/outputs/apk/debug/*.apk
+
+  publish:
+    needs: [rust, android]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+      - name: Collect files
+        run: |
+          mkdir out
+          cp dl/android-debug-apk/*.apk out/RemoteView-debug.apk
+          cp dl/binaries-windows-latest/rv-host.exe out/ || true
+          cp dl/binaries-windows-latest/rv-signal-relay.exe out/ || true
+          ls -la out
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-build
+          name: Bản build mới nhất (tự động)
+          prerelease: true
+          make_latest: false
+          body: |
+            Bản build tự động từ commit ${{ github.sha }}.
+            - RemoteView-debug.apk: cài lên Android (Tab S10+ / S26+)
+            - rv-host.exe: chạy trên Windows
+          files: out/*
