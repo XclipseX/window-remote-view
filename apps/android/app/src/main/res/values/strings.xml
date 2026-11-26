@@ -284,4 +284,40 @@
 7. Hoặc cài Samsung USB Driver for Mobile Phones từ trang Samsung Developer rồi cắm lại.
 </string>
     <string name="diag_win_explain">Windows 10/11 thường tự nhận NCM/RNDIS; khi không nhận, thiết bị hiện là thiết bị lạ và Android tắt tethering sau vài giây.</string>
+
+    <string name="home_bench">Kiểm tra giới hạn</string>
+    <string name="home_bench_hint">Stress test giải mã video ngay trên máy (không cần laptop): đo FPS tối đa, độ trễ, bóp xung nhiệt.</string>
+    <string name="bench_title">Kiểm tra giới hạn (Stress test)</string>
+    <string name="bench_back">Quay lại</string>
+    <string name="bench_unplug">Rút sạc để đo công suất chính xác. Màn hình được giữ sáng khi đang chạy.</string>
+    <string name="bench_plugged_warn">Đang cắm sạc: số công suất (W) không chính xác.</string>
+    <string name="bench_mode">Chế độ</string>
+    <string name="bench_mode_throughput">Throughput tối đa</string>
+    <string name="bench_mode_paced">Độ trễ ở FPS cố định</string>
+    <string name="bench_mode_sustained">Bền nhiệt (sustained, 120 fps)</string>
+    <string name="bench_codec">Codec</string>
+    <string name="bench_decoder">Bộ giải mã (phần cứng)</string>
+    <string name="bench_no_decoder">Không có bộ giải mã phần cứng cho codec này</string>
+    <string name="bench_resolution">Độ phân giải</string>
+    <string name="bench_fps">FPS</string>
+    <string name="bench_fps_fixed">FPS (cố định theo chế độ): %1$d</string>
+    <string name="bench_duration">Thời lượng</string>
+    <string name="bench_instances">Số decoder song song</string>
+    <string name="bench_bitrate">Bitrate clip (Mbps)</string>
+    <string name="bench_adpf">Bật ADPF (PerformanceHintManager)</string>
+    <string name="bench_allow_critical">Cho phép chạy tới CRITICAL (mặc định dừng ở SEVERE)</string>
+    <string name="bench_size_warn">Bộ giải mã báo không hỗ trợ kích thước/FPS này; vẫn có thể thử.</string>
+    <string name="bench_start">Bắt đầu</string>
+    <string name="bench_stop">Dừng</string>
+    <string name="bench_copy">Sao chép</string>
+    <string name="bench_share">Chia sẻ</string>
+    <string name="bench_saved">Đã lưu: %1$s</string>
+    <string name="bench_copied">Đã sao chép báo cáo + CSV</string>
+    <string name="bench_chart_fps">FPS giải mã</string>
+    <string name="bench_chart_latency">Độ trễ</string>
+    <string name="bench_chart_headroom">Thermal headroom (1.0 = bắt đầu bóp)</string>
+    <string name="bench_chart_power">Công suất ước tính</string>
+    <string name="bench_live">Nhiệt: %1$s | pin %2$d%% (%3$s °C) | màn hình %4$s Hz | ADPF %5$s</string>
+    <string name="bench_min">%1$d phút</string>
+    <string name="bench_sec">%1$d giây</string>
 </resources>

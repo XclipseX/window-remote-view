@@ -1,3 +1,5 @@
 target/
 *.swp
 apps/android/app/src/main/jniLibs/
+graphify-out/
+.graph/

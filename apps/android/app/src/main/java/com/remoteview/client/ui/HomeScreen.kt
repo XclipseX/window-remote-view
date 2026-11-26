@@ -54,6 +54,7 @@ fun HomeScreen(
     onPinSubmit: (String) -> Unit = {},
     onPinDismiss: () -> Unit = {},
     onDiagnostics: () -> Unit = {},
+    onBench: () -> Unit = {},
 ) {
     var id by rememberSaveable { mutableStateOf("") }
     val context = LocalContext.current
@@ -124,6 +125,11 @@ fun HomeScreen(
                 Text(stringResource(R.string.home_diag))
             }
             Text(stringResource(R.string.home_diag_hint), style = MaterialTheme.typography.bodySmall)
+
+            OutlinedButton(onClick = onBench, modifier = Modifier.fillMaxWidth()) {
+                Text(stringResource(R.string.home_bench))
+            }
+            Text(stringResource(R.string.home_bench_hint), style = MaterialTheme.typography.bodySmall)
 
             Text(stringResource(R.string.home_lan_hosts), style = MaterialTheme.typography.titleMedium)
             if (lanHosts.isEmpty()) {

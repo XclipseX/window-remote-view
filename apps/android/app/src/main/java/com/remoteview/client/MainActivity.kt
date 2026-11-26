@@ -16,6 +16,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import com.remoteview.client.bench.BenchScreen
 import com.remoteview.client.net.LanLocks
 import com.remoteview.client.net.NetworkWatcher
 import com.remoteview.client.net.UsbTetherDetector
@@ -32,7 +33,7 @@ import com.remoteview.client.ui.SettingsScreen
 
 // UNBUILT: chưa biên dịch.
 
-internal enum class Screen { HOME, SETTINGS, SESSION, DIAG }
+internal enum class Screen { HOME, SETTINGS, SESSION, DIAG, BENCH }
 
 class MainActivity : ComponentActivity() {
 
@@ -155,7 +156,12 @@ class MainActivity : ComponentActivity() {
                 },
                 onPinDismiss = { pinPrompt = null },
                 onDiagnostics = { screen = Screen.DIAG },
+                onBench = { screen = Screen.BENCH },
             )
+            Screen.BENCH -> {
+                BackHandler { screen = Screen.HOME }
+                BenchScreen(onBack = { screen = Screen.HOME })
+            }
             Screen.DIAG -> {
                 BackHandler { screen = Screen.HOME }
                 DiagnosticsScreen(onBack = { screen = Screen.HOME })

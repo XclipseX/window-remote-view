@@ -103,3 +103,20 @@ Xuất báo cáo: "Sao chép báo cáo", "Chia sẻ", và tự lưu `diagnostics
 - Bậc ladder Exynos 2600 / MTK chỉ dựa trên tài liệu; khóa nào máy không báo hỗ trợ sẽ bị bỏ qua và ghi log (tag `RvDecoder`).
 - Quét QR là chỗ giữ chỗ; kích thước giải mã ban đầu lấy theo màn hình (cần lấy từ host).
 - Chưa có icon launcher, chưa cấu hình ký bản release.
+
+## Kiểm tra giới hạn (Stress test)
+
+Nút "Kiểm tra giới hạn" trên màn hình chính mở `bench/BenchScreen`. Không cần laptop: máy tự mã hóa một clip thử 2 s
+bằng bộ mã hóa phần cứng (H.264/HEVC/AV1; không có B-frame, chỉ 1 IDR đầu clip, nội dung gồm nhiễu cuộn + vạch tương phản
++ bộ đếm khung), giữ trong RAM rồi lặp lại cho các bộ giải mã phần cứng (gồm biến thể `.lowlatency`) với khóa vendor của
+`LowLatencyDecoder.buildTiers`. Đầu ra đi vào `ImageReader` ngoài màn hình.
+
+- Chế độ: Throughput tối đa; Độ trễ ở FPS cố định (60/120/144, đo queueInput -> onOutputBufferAvailable); Bền nhiệt (120 fps, 1 hoặc 2 phút).
+- 1–4 decoder song song, bật/tắt ADPF, bitrate clip 20–120 Mbps, độ phân giải native/2800x1752/2560x1440/1920x1080.
+- Mỗi giây: fps, p50/p99 trễ, thermal headroom (10 s), thermal status, pin %, nhiệt pin, dòng CURRENT_NOW × điện áp = W ước tính, tần số quét.
+- Tự dừng khi thermal status >= SEVERE (công tắc "Cho phép chạy tới CRITICAL" nâng ngưỡng dừng lên CRITICAL).
+- Kết luận "bị bóp xung": fps giảm > 10% hoặc p99 tăng > 30% giữa 15 s đầu và 15 s cuối, kèm headroom >= 0.9 hoặc status >= MODERATE.
+- Xuất: sao chép (báo cáo + CSV), chia sẻ (báo cáo), tự lưu `.txt`/`.csv` vào `getExternalFilesDir(null)/bench/`.
+
+Chưa xác minh trên máy thật: mã chưa biên dịch; `getInputImage` + Image flexible trên encoder Exynos/MTK ở 2800x1752;
+ImageReader PRIVATE làm đích của decoder; đơn vị CURRENT_NOW khác nhau theo hãng (đã đoán µA/mA); độ chính xác ADPF.
