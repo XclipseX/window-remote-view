@@ -24,11 +24,14 @@ pub fn emit(v: &Value) {
     let _ = out.flush();
 }
 
-/// Logs to stderr always; in JSON mode also as a `log` event on stdout.
+/// Logs to the log file (when [`crate::logfile::init`] ran). In JSON mode it
+/// is a `log` event on stdout (the GUI shows and files it), otherwise a stderr line.
 pub fn log(level: Level, msg: &str) {
-    eprintln!("[{}] {msg}", level.as_str());
+    crate::logfile::write_line(level.as_str(), msg);
     if json_mode() {
         emit(&log_json(level, msg));
+    } else {
+        eprintln!("[{}] {msg}", level.as_str());
     }
 }
 

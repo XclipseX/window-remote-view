@@ -17,6 +17,8 @@ use rv_crypto::Keypair;
 use crate::audio::{LoopbackCapture, OpusFrameEncoder, CHANNELS_RATE, FRAME_MS};
 use crate::capture::{list_outputs, pick_output, CapturedFrame, Capturer, DesktopDuplicator};
 use crate::control::{self, Command, DeviceItem, Level, State, Stats};
+use crate::cursor::{CursorTracker, CursorUpdate};
+use crate::logfile::{LogAssembler, WarnGate};
 use crate::encode::{
     cap_software, create_encoder, is_blocked, on_hw_failure, CodecPref, EncoderConfig, EncoderKind, EncoderPref, HwFailAction,
     HwSupervisor, VideoEncoder,
@@ -31,11 +33,12 @@ use rv_usb_link::{adb, aoa, UsbDatagramLink};
 const USAGE: &str = "rv-host [--usb | --adb | --lan] [--otp N] [--width W --height H] [--fps F]
         [--quality 1-100] [--codec auto|hevc|h264] [--encoder auto|hw|sw]
         [--display mirror|extend] [--json-status]
-        [--mode WxH@Hz] [--output N] [--bitrate-mbps N] [--bind ADDR:PORT]
+        [--mode WxH@Hz] [--output N] [--monitor NAME] [--bitrate-mbps N] [--bind ADDR:PORT]
         [--scan-all] [--list]
   --usb   AOA bulk link, falls back to `adb reverse` (default when a device is attached)
   --adb   only the adb-reverse TCP fallback
   --lan   UDP on --bind (default 0.0.0.0:47800)
+  --monitor NAME  display to share, e.g. \\.\DISPLAY1 (default: the laptop's own panel)
   --json-status  machine-readable JSON lines on stdout / commands on stdin
                  (see CONTROL_PROTOCOL.md)";
 
@@ -62,6 +65,8 @@ struct Args {
     mirror: bool,
     display_mode: DisplayMode,
     output: Option<usize>,
+    /// GDI device name of the output to share in mirror mode (None = auto: internal panel).
+    monitor: Option<String>,
     fps: u32,
     width: u32,
     height: u32,
@@ -82,6 +87,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         mirror: false,
         display_mode: DisplayMode::TAB_S10_PLUS,
         output: None,
+        monitor: None,
         fps: 60,
         width: 0,
         height: 0,
@@ -113,6 +119,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
                 explicit_mode = true;
             }
             "--output" => a.output = Some(val("--output")?.parse().map_err(|_| "bad --output")?),
+            "--monitor" => a.monitor = Some(val("--monitor")?).filter(|m| !m.trim().is_empty()),
             "--fps" => {
                 a.fps = val("--fps")?.parse().map_err(|_| "bad --fps")?;
                 if !(1..=240).contains(&a.fps) {
@@ -330,6 +337,10 @@ struct Shared {
     peer_name: Mutex<Option<String>>,
     /// Ask the device poller to publish a fresh list now.
     dev_refresh: AtomicBool,
+    /// The input desktop is the lock screen / a secure desktop (nothing can be captured or injected).
+    locked: AtomicBool,
+    /// Desktop rectangle of the display being captured (follows mode changes).
+    cap_rect: Mutex<crate::Rect>,
 }
 
 impl Shared {
@@ -385,6 +396,17 @@ fn hw_gave_up(kind: EncoderKind, uses_d3d: bool, reason: &str) {
     }
 }
 
+/// Encode size for a capture of `nw x nh` when the client / GUI asked for at
+/// most `rw x rh` (0 = no limit): the capture's own aspect ratio is kept (the
+/// client letterboxes), the picture is never stretched or enlarged.
+fn fit_size(nw: u32, nh: u32, rw: u32, rh: u32) -> (u32, u32) {
+    if rw == 0 || rh == 0 || nw == 0 || nh == 0 || (rw >= nw && rh >= nh) {
+        return (nw, nh);
+    }
+    let k = (f64::from(rw) / f64::from(nw)).min(f64::from(rh) / f64::from(nh));
+    (((f64::from(nw) * k).round() as u32).max(2), ((f64::from(nh) * k).round() as u32).max(2))
+}
+
 fn video_thread(
     out_name: String,
     out_rect: crate::Rect,
@@ -395,6 +417,7 @@ fn video_thread(
     ev: Sender<VideoEvent>,
 ) {
     let mut cap = Capturer::new(Some(out_name), out_rect);
+    let thread_start = Instant::now();
     let mut sup = HwSupervisor::new();
     let mut first_input: Option<Instant> = None;
     let mut force_sw = false;
@@ -416,9 +439,28 @@ fn video_thread(
             std::thread::sleep(Duration::from_millis(5));
             continue;
         }
-        let acquired = cap.acquire(8).unwrap_or(None);
+        let locked = sh.locked.load(Ordering::Relaxed);
+        let acquired = if locked {
+            // Lock screen / secure desktop: nothing can be captured. Keep the last frame flowing.
+            std::thread::sleep(Duration::from_millis(8));
+            None
+        } else {
+            cap.acquire(8).unwrap_or(None)
+        };
         if let Some(f) = acquired {
             last_frame = Some(f);
+            dirty = true;
+        }
+        let r = cap.desktop_rect();
+        if let Ok(mut g) = sh.cap_rect.lock() {
+            if *g != r && r.width() > 0 && r.height() > 0 {
+                *g = r;
+            }
+        }
+        if last_frame.is_none() && (locked || thread_start.elapsed() > Duration::from_millis(1500)) {
+            // Nothing captured yet (locked at start, or capture failing): send black so the client does not time out.
+            let (w, h) = ((r.width().max(2) as u32) & !1, (r.height().max(2) as u32) & !1);
+            last_frame = Some(CapturedFrame::from_bgra(w, h, vec![0u8; (w * h * 4) as usize]));
             dirty = true;
         }
         let Some(frame) = last_frame.as_ref() else { continue };
@@ -442,7 +484,7 @@ fn video_thread(
         let (nw, nh) = (frame.width, frame.height);
         let rw = sh.width.load(Ordering::Relaxed);
         let rh = sh.height.load(Ordering::Relaxed);
-        let (tw, th) = if rw > 0 && rh > 0 { (rw.min(nw), rh.min(nh)) } else { (nw, nh) };
+        let (tw, th) = fit_size(nw, nh, rw, rh);
         let (tw, th) = (tw & !1, th & !1);
         let (tw, th) = if sw_mode { let c = cap_software(tw, th, fps); (c.0, c.1) } else { (tw, th) };
         let q = sh.quality.load(Ordering::Relaxed) as u8;

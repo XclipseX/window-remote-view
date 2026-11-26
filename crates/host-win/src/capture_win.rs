@@ -1,6 +1,7 @@
 //! DXGI Desktop Duplication (Windows 8+).
 
-use windows::core::Interface;
+use windows::core::{Interface, PCWSTR};
+use windows::Win32::Devices::Display::*;
 use windows::Win32::Foundation::{HMODULE, RECT};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
@@ -24,6 +25,100 @@ fn wstr(buf: &[u16]) -> String {
     String::from_utf16_lossy(&buf[..len])
 }
 
+/// Display-config view of one active target: which GDI source it feeds, its
+/// monitor name and connector technology.
+struct TargetInfo {
+    gdi_name: String,
+    friendly: String,
+    tech: i32,
+}
+
+fn display_targets() -> Vec<TargetInfo> {
+    let mut out = Vec::new();
+    unsafe {
+        let (mut np, mut nm) = (0u32, 0u32);
+        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm).0 != 0 {
+            return out;
+        }
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
+        if QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &mut np, paths.as_mut_ptr(), &mut nm, modes.as_mut_ptr(), None).0 != 0 {
+            return out;
+        }
+        paths.truncate(np as usize);
+        for p in &paths {
+            let mut src = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+            src.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            src.header.size = std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+            src.header.adapterId = p.sourceInfo.adapterId;
+            src.header.id = p.sourceInfo.id;
+            if DisplayConfigGetDeviceInfo(&mut src.header) != 0 {
+                continue;
+            }
+            let mut tgt = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
+            tgt.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+            tgt.header.size = std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
+            tgt.header.adapterId = p.targetInfo.adapterId;
+            tgt.header.id = p.targetInfo.id;
+            let (friendly, tech) = if DisplayConfigGetDeviceInfo(&mut tgt.header) == 0 {
+                (wstr(&tgt.monitorFriendlyDeviceName), tgt.outputTechnology.0)
+            } else {
+                (String::new(), p.targetInfo.outputTechnology.0)
+            };
+            out.push(TargetInfo { gdi_name: wstr(&src.viewGdiDeviceName), friendly, tech });
+        }
+    }
+    out
+}
+
+/// `EnumDisplayDevices`: (GDI name, adapter string, is primary).
+fn gdi_devices() -> Vec<(String, String, bool)> {
+    let mut v = Vec::new();
+    unsafe {
+        let mut i = 0;
+        loop {
+            let mut dd = DISPLAY_DEVICEW { cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32, ..Default::default() };
+            if !EnumDisplayDevicesW(PCWSTR::null(), i, &mut dd, 0).as_bool() {
+                break;
+            }
+            v.push((wstr(&dd.DeviceName), wstr(&dd.DeviceString), dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE.0 != 0));
+            i += 1;
+        }
+    }
+    v
+}
+
+/// One GPU adapter, for the startup log.
+#[derive(Debug, Clone)]
+pub struct AdapterInfo {
+    pub name: String,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub dedicated_mb: u64,
+    pub software: bool,
+}
+
+pub fn list_adapters() -> Vec<AdapterInfo> {
+    let mut v = Vec::new();
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else { return v };
+        let mut i = 0;
+        while let Ok(a) = factory.EnumAdapters1(i) {
+            if let Ok(d) = a.GetDesc1() {
+                v.push(AdapterInfo {
+                    name: wstr(&d.Description),
+                    vendor_id: d.VendorId,
+                    device_id: d.DeviceId,
+                    dedicated_mb: (d.DedicatedVideoMemory as u64) >> 20,
+                    software: d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+                });
+            }
+            i += 1;
+        }
+    }
+    v
+}
+
 /// One enumerated output with the COM objects needed to duplicate it.
 struct Found {
     adapter: IDXGIAdapter1,
@@ -36,6 +131,8 @@ struct Found {
 /// hybrid GPUs), so nothing here may be cached across re-inits.
 fn enumerate_all() -> Result<Vec<Found>> {
     let mut v = Vec::new();
+    let targets = display_targets();
+    let gdi = gdi_devices();
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
         let mut ai = 0;
@@ -44,13 +141,20 @@ fn enumerate_all() -> Result<Vec<Found>> {
             let mut oi = 0;
             while let Ok(out) = adapter.EnumOutputs(oi) {
                 if let Ok(d) = out.GetDesc() {
+                    let name = wstr(&d.DeviceName);
+                    let target = targets.iter().find(|t| t.gdi_name.eq_ignore_ascii_case(&name));
+                    let g = gdi.iter().find(|g| g.0.eq_ignore_ascii_case(&name));
                     let info = OutputInfo {
                         adapter_index: ai,
                         output_index: oi,
-                        name: wstr(&d.DeviceName),
                         adapter_name: adapter_name.clone(),
                         desktop_rect: from_rect(d.DesktopCoordinates),
                         attached: d.AttachedToDesktop.as_bool(),
+                        friendly_name: target.map(|t| t.friendly.clone()).unwrap_or_default(),
+                        device_string: g.map(|g| g.1.clone()).unwrap_or_default(),
+                        primary: g.is_some_and(|g| g.2),
+                        technology: target.map(|t| t.tech),
+                        name,
                     };
                     v.push(Found { adapter: adapter.clone(), output: out, info });
                 }

@@ -8,9 +8,13 @@
 pub mod audio;
 pub mod capture;
 pub mod control;
+pub mod cursor;
 pub mod encode;
 pub mod engine;
 pub mod input;
+pub mod logfile;
+pub mod session_state;
+pub mod sysinfo;
 pub mod vdisplay;
 
 #[cfg(windows)]
