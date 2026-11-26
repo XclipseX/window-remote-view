@@ -186,7 +186,7 @@
     <string name="diag_l_pkg">Gói</string>
     <string name="diag_apps_installed">Đã cài spacedesk.</string>
     <string name="diag_apps_none">Chưa cài spacedesk.</string>
-    <string name="diag_apps_explain">Chỉ báo có/không. Chế độ USB của spacedesk thường dựa trên USB tethering nên cần mục tethering của Android; nếu tethering bị ẩn thì chế độ đó không hoạt động offline.</string>
+    <string name="diag_apps_explain">Chỉ báo có/không. Chế độ USB của spacedesk dùng Android Open Accessory (AOA), không cần USB tethering: khi trình điều khiển spacedesk trên Windows chạy, mục 4 sẽ thấy accessory hãng datronicsoft.</string>
     <string name="diag_codec_missing">%1$s: không có bộ giải mã</string>
     <string name="diag_codec_item">%1$s | %2$s | %3$s | độ trễ thấp=%4$s | 2800x1752@120=%5$s | fps tối đa=%6$s | tham số vendor=%7$s</string>
     <string name="diag_size_unsupported">không hỗ trợ</string>
@@ -232,7 +232,7 @@
     <string name="diag_sum_data">Cáp có truyền dữ liệu (function: %1$s).</string>
     <string name="diag_sum_chargeonly">USB đang chỉ sạc / không có dữ liệu: kiểm tra cáp, cổng laptop, và chọn Truyền tệp trong thông báo USB.</string>
     <string name="diag_sum_nousb">Không phát hiện laptop qua USB: cắm cáp vào laptop đang bật rồi chạy lại.</string>
-    <string name="diag_sum_spacedesk">Đã cài spacedesk (chế độ USB của nó thường cần USB tethering hoạt động).</string>
+    <string name="diag_sum_spacedesk">Đã cài spacedesk (chế độ USB của nó dùng AOA, xem mục 4).</string>
     <string name="diag_sum_tether">USB tethering đang hoạt động (có giao diện rndis/usb/ncm).</string>
     <string name="diag_sum_aoa_ok">Đã có accessory RemoteView (AOA): đường USB chính sẵn sàng.</string>
     <string name="diag_sum_aoa_wait">Chưa có accessory RemoteView: cần chạy app host trên laptop để chuyển máy sang AOA.</string>
