@@ -1,6 +1,7 @@
 [package]
 name = "rv-host-win"
 description = "Windows host: DXGI capture, virtual display, encode, WASAPI audio, input injection"
+build = "build.rs"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
@@ -45,4 +46,8 @@ features = [
   "Win32_Media",
   "Win32_System_Ole",
   "Win32_Media_MediaFoundation",
+  "Win32_System_Power",
+  "Win32_System_StationsAndDesktops",
+  "Win32_System_SystemInformation",
+  "Win32_UI_HiDpi",
 ]

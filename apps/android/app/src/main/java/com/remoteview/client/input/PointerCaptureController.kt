@@ -10,7 +10,11 @@ import kotlin.math.roundToInt
  * Chuột Bluetooth/OTG: requestPointerCapture() (API 26+) -> nhận delta tương đối trong
  * OnCapturedPointerListener. View phải có focus và cửa sổ có focus khi gọi [enable].
  */
-class PointerCaptureController(private val view: View, private val sink: InputSink) {
+class PointerCaptureController(
+    private val view: View,
+    private val sink: InputSink,
+    private val onLocalMove: (dx: Int, dy: Int) -> Unit = { _, _ -> },
+) {
 
     var enabled = false
         private set
@@ -53,6 +57,7 @@ class PointerCaptureController(private val view: View, private val sink: InputSi
                     if (ix != 0 || iy != 0) {
                         remX -= ix; remY -= iy
                         sink.send(RemoteInput.MouseMoveRel(ix, iy))
+                        onLocalMove(ix, iy)
                     }
                 }
             }

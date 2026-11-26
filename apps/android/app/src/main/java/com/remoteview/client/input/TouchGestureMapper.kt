@@ -28,6 +28,8 @@ class TouchGestureMapper(
     context: Context,
     private val sink: InputSink,
     var mode: TouchMode,
+    /** Chế độ trackpad: delta pixel gửi đi, để UI dịch con trỏ cục bộ ngay lập tức. */
+    private val onLocalMove: (dx: Int, dy: Int) -> Unit = { _, _ -> },
     /** scaleFactor tức thời (>1 = phóng to) quanh điểm (focusX, focusY) tính theo pixel view. */
     private val onPinchZoom: (scaleFactor: Float, focusX: Float, focusY: Float) -> Unit = { _, _, _ -> },
 ) {
@@ -136,6 +138,7 @@ class TouchGestureMapper(
                 if (ix != 0 || iy != 0) {
                     remX -= ix; remY -= iy
                     sink.send(RemoteInput.MouseMoveRel(ix, iy))
+                    onLocalMove(ix, iy)
                 }
             }
         }

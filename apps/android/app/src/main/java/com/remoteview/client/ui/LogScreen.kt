@@ -5,7 +5,10 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.widget.Toast
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.material3.OutlinedButton
+import com.remoteview.client.LogShare
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
@@ -35,7 +38,7 @@ import com.remoteview.client.RvLog
 /** "Nhật ký kết nối": các dòng log gần nhất của app, chọn/sao chép được. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun LogScreen(onBack: () -> Unit) {
+fun LogScreen(onBack: () -> Unit, sessionHandle: () -> Long = { 0L }) {
     val ctx = LocalContext.current
     val ver by RvLog.version.collectAsState()
     val lines = remember(ver) { RvLog.lines() }
@@ -60,16 +63,50 @@ fun LogScreen(onBack: () -> Unit) {
             )
         },
     ) { padding ->
-        if (lines.isEmpty()) {
-            Text(stringResource(R.string.log_empty), modifier = Modifier.padding(padding).padding(16.dp))
-        } else {
-            SelectionContainer {
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier.fillMaxSize().padding(padding).padding(horizontal = 8.dp),
-                ) {
-                    items(lines) { l ->
-                        Text(l, fontFamily = FontFamily.Monospace, fontSize = 11.sp, style = MaterialTheme.typography.bodySmall)
+        val shareFail = stringResource(R.string.log_share_fail)
+        val upOk = stringResource(R.string.log_upload_ok)
+        val upFail = stringResource(R.string.log_upload_fail)
+        val needSession = stringResource(R.string.log_upload_need_session)
+        val connected = sessionHandle() != 0L
+        Column(Modifier.fillMaxSize().padding(padding)) {
+            Row(
+                Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedButton(onClick = {
+                    try { LogShare.share(ctx) } catch (t: Throwable) {
+                        RvLog.w("chia sẻ log lỗi", t)
+                        Toast.makeText(ctx, shareFail, Toast.LENGTH_SHORT).show()
+                    }
+                }) { Text(stringResource(R.string.log_share)) }
+                OutlinedButton(
+                    enabled = connected,
+                    onClick = {
+                        val h = sessionHandle()
+                        if (h == 0L) {
+                            Toast.makeText(ctx, needSession, Toast.LENGTH_SHORT).show()
+                        } else {
+                            Thread({
+                                val ok = LogShare.upload(h)
+                                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                                    Toast.makeText(ctx, if (ok) upOk else upFail, Toast.LENGTH_SHORT).show()
+                                }
+                            }, "rv-log-upload").start()
+                        }
+                    },
+                ) { Text(stringResource(R.string.log_upload)) }
+            }
+            if (lines.isEmpty()) {
+                Text(stringResource(R.string.log_empty), modifier = Modifier.padding(16.dp))
+            } else {
+                SelectionContainer {
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxSize().padding(horizontal = 8.dp),
+                    ) {
+                        items(lines) { l ->
+                            Text(l, fontFamily = FontFamily.Monospace, fontSize = 11.sp, style = MaterialTheme.typography.bodySmall)
+                        }
                     }
                 }
             }

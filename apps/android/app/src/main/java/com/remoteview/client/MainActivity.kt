@@ -108,6 +108,12 @@ class MainActivity : ComponentActivity() {
             override fun onAudioPacket(data: ByteArray, ptsUs: Long, codec: Int) {
                 session?.onAudio(data, codec)
             }
+            override fun onCursorShape(w: Int, h: Int, hotX: Int, hotY: Int, rgba: ByteArray) {
+                session?.onCursorShape(w, h, hotX, hotY, rgba)
+            }
+            override fun onCursorPos(x: Int, y: Int, visible: Boolean) {
+                session?.onCursorPos(x, y, visible)
+            }
         }
         RvLog.i("MainActivity.onCreate, API ${Build.VERSION.SDK_INT}, native=${NativeBridge.available}, intent=${intent?.action}")
 
@@ -189,19 +195,24 @@ class MainActivity : ComponentActivity() {
                         s.onLinkClosed = { reason ->
                             runOnUiThread {
                                 if (session === s) {
+                                    // Lỗi: thử gửi log trước (best-effort, tối đa 2 s) nếu handle native còn hợp lệ.
+                                    sendLogThenEnd(s, if (reason != null) 2000L else 0L) {
                                     endSession(); screen = Screen.HOME
                                     usbError = reason
                                     // Rút cáp -> thẻ biến mất; cắm lại sẽ tự kết nối lại.
                                     autoTriedKey = null
+                                    }
                                 }
                             }
                         }
                         s.onNativeFailed = { msg ->
                             runOnUiThread {
                                 if (session === s) {
+                                    sendLogThenEnd(s) {
                                     endSession(); screen = Screen.HOME
                                     if (otp != null) usbError = msg ?: "ghép đôi thất bại"
                                     else pinPrompt = PinPrompt(msg ?: "")
+                                    }
                                 }
                             }
                         }
@@ -271,7 +282,10 @@ class MainActivity : ComponentActivity() {
             }
             Screen.LOG -> {
                 BackHandler { screen = Screen.HOME }
-                LogScreen(onBack = { screen = Screen.HOME })
+                LogScreen(
+                    onBack = { screen = Screen.HOME },
+                    sessionHandle = { session?.takeIf { it.isConnected }?.nativeHandle ?: 0L },
+                )
             }
             Screen.BENCH -> {
                 BackHandler { screen = Screen.HOME }
@@ -307,6 +321,19 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /** Phiên lỗi: gửi log lên máy tính (nếu bật) rồi mới đóng phiên; tối đa chờ 3 giây. */
+    private fun sendLogThenEnd(s: SessionController, timeoutMs: Long = 3000L, then: () -> Unit) {
+        val h = s.nativeHandle
+        if (timeoutMs <= 0L || !settings.autoSendLogOnError || h == 0L || !NativeBridge.available) { then(); return }
+        val done = java.util.concurrent.atomic.AtomicBoolean(false)
+        val finish = { if (done.compareAndSet(false, true)) then() }
+        Thread({
+            LogShare.upload(h)
+            runOnUiThread { finish() }
+        }, "rv-log-autosend").also { it.isDaemon = true; it.start() }
+        window.decorView.postDelayed({ finish() }, timeoutMs)
     }
 
     private fun endSession() {

@@ -249,6 +249,8 @@ class LowLatencyDecoder(
             val cb = Callback(c)
             c.setCallback(cb, handler)
             c.configure(format, surf, null, 0)
+            // Không bao giờ kéo giãn: giữ tỉ lệ (SurfaceView đã được đặt đúng tỉ lệ luồng, nên vừa khít).
+            runCatching { c.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT) }
             c.start()
             Log.i(TAG, "Tier '${tier.label}' OK trên ${pick.name}")
             return c

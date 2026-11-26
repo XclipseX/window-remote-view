@@ -31,6 +31,8 @@ data class StreamSettings(
     val debugOverlay: Boolean = true,
     /** Tự kiểm tra bản cập nhật khi mở app (tối đa 6 giờ một lần). */
     val autoCheckUpdate: Boolean = true,
+    /** Tự gửi log hiện tại lên máy tính khi phiên kết thúc vì lỗi. */
+    val autoSendLogOnError: Boolean = true,
 ) {
     /** Placeholder: 5..120 Mbps tuyến tính theo chất lượng (mặc định LAN 60–120 Mbps). */
     fun targetBitrateKbps(): Int = 5_000 + ((qualityPercent.coerceIn(1, 100) - 1) / 99f * 115_000).toInt()
@@ -64,6 +66,7 @@ class SettingsRepository(context: Context) {
             autoConnectUsb = prefs.getBoolean("usb_auto", d.autoConnectUsb),
             debugOverlay = prefs.getBoolean("dbg_overlay", d.debugOverlay),
             autoCheckUpdate = prefs.getBoolean("upd_auto", d.autoCheckUpdate),
+            autoSendLogOnError = prefs.getBoolean("log_auto_send", d.autoSendLogOnError),
         )
     }
 
@@ -84,6 +87,7 @@ class SettingsRepository(context: Context) {
             .putBoolean("usb_auto", s.autoConnectUsb)
             .putBoolean("dbg_overlay", s.debugOverlay)
             .putBoolean("upd_auto", s.autoCheckUpdate)
+            .putBoolean("log_auto_send", s.autoSendLogOnError)
             .apply()
     }
 }

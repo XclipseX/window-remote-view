@@ -25,6 +25,9 @@ class RemoteSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
 
     var surfaceListener: SurfaceListener? = null
 
+    /** (zoom, pivotX, pivotY) mỗi khi zoom đổi, để lớp phủ con trỏ phóng theo. */
+    var onZoomChanged: ((Float, Float, Float) -> Unit)? = null
+
     private var touch: TouchGestureMapper? = null
     private var stylus: StylusMapper? = null
     private var keyboard: KeyboardBridge? = null
@@ -56,6 +59,7 @@ class RemoteSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         pivotY = focusY
         scaleX = zoom
         scaleY = zoom
+        onZoomChanged?.invoke(zoom, focusX, focusY)
     }
 
     fun toggleSoftKeyboard() {
@@ -65,11 +69,17 @@ class RemoteSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     }
 
     // ---- Surface
-    override fun surfaceCreated(holder: SurfaceHolder) {}
+    private var pendingReady = false
+    override fun surfaceCreated(holder: SurfaceHolder) { pendingReady = true }
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        surfaceListener?.onSurfaceReady(holder)
+        // Đổi kích thước (đổi tỉ lệ luồng, xoay) cùng một Surface thì không dựng lại decoder.
+        if (pendingReady) {
+            pendingReady = false
+            surfaceListener?.onSurfaceReady(holder)
+        }
     }
     override fun surfaceDestroyed(holder: SurfaceHolder) {
+        pendingReady = false
         surfaceListener?.onSurfaceDestroyed()
     }
 

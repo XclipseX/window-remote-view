@@ -30,6 +30,12 @@ object NativeBridge {
 
         /** Gói âm thanh từ host. codec: 0 = PCM s16le 48 kHz stereo, 1 = Opus. Mặc định bỏ qua. */
         fun onAudioPacket(data: ByteArray, ptsUs: Long, codec: Int) {}
+
+        /** Hình con trỏ của host (RGBA 8888 không nhân alpha, w*h*4 byte); hotX/hotY là điểm nóng trong ảnh. */
+        fun onCursorShape(w: Int, h: Int, hotX: Int, hotY: Int, rgba: ByteArray) {}
+
+        /** Vị trí con trỏ host, x,y chuẩn hóa 0..65535 trên khung hình video. */
+        fun onCursorPos(x: Int, y: Int, visible: Boolean) {}
     }
 
     const val FLAG_KEYFRAME = 1
@@ -101,6 +107,9 @@ object NativeBridge {
      */
     external fun nativeSendTouch(handle: Long, id: Int, x: Int, y: Int, phase: Int, pressure: Int)
 
+    /** Gửi file log (UTF-8) lên máy tính qua phiên đang mở; [name] là tên file đề xuất. Trả true nếu đã gửi. */
+    external fun nativeUploadLog(handle: Long, name: String, data: ByteArray): Boolean
+
     /** Rust yêu cầu gửi một datagram ra liên kết USB; [datagramSender] do SessionController đặt. */
     @Volatile var datagramSender: ((ByteArray) -> Unit)? = null
 
@@ -128,6 +137,16 @@ object NativeBridge {
     @JvmStatic @Keep
     fun onAudioFromNative(data: ByteArray, ptsUs: Long, codec: Int) {
         callbacks?.onAudioPacket(data, ptsUs, codec)
+    }
+
+    @JvmStatic @Keep
+    fun onCursorShapeFromNative(w: Int, h: Int, hotX: Int, hotY: Int, rgba: ByteArray) {
+        callbacks?.onCursorShape(w, h, hotX, hotY, rgba)
+    }
+
+    @JvmStatic @Keep
+    fun onCursorPosFromNative(x: Int, y: Int, visible: Boolean) {
+        callbacks?.onCursorPos(x, y, visible)
     }
 
     @JvmStatic @Keep

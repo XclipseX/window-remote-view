@@ -2,6 +2,7 @@ package com.remoteview.client.session
 
 import android.app.Activity
 import android.content.Context
+import android.graphics.Bitmap
 import android.os.Process
 import android.os.SystemClock
 import android.util.DisplayMetrics
@@ -52,6 +53,7 @@ class SessionController(
     private val stylus = StylusMapper(sink)
     private val touch = TouchGestureMapper(
         activity, sink, if (usbDisplay) com.remoteview.client.input.TouchMode.DIRECT else settings.touchMode,
+        onLocalMove = { dx, dy -> onLocalCursorDelta(dx, dy) },
     ) { s, fx, fy -> view?.applyZoom(s, fx, fy) }
     private val directTouch = if (usbDisplay) DirectTouchMapper(sink) else null
     private val baseFps = if (usbDisplay) DisplayCaps.nativeDisplay(activity).refreshHz else settings.fps
@@ -64,6 +66,49 @@ class SessionController(
     var onLinkClosed: ((String?) -> Unit)? = null
     /** Lõi Rust báo phiên lỗi (sai PIN, host không trả lời...). Gọi từ thread nền. */
     var onNativeFailed: ((String?) -> Unit)? = null
+
+    /** true khi đã bắt tay xong (có handle + state ESTABLISHED): dùng cho nút "Gửi log lên máy tính". */
+    val isConnected: Boolean get() = nativeHandle != 0L && dbgState == NativeBridge.STATE_ESTABLISHED
+
+    /** Kích thước khung hình luồng (WxH) để UI đặt SurfaceView đúng tỉ lệ; ban đầu = kích thước màn hình. */
+    private val _streamSize = MutableStateFlow(decodeSize())
+    val streamSize: StateFlow<Pair<Int, Int>> = _streamSize
+
+    private val _cursor = MutableStateFlow(CursorState())
+    /** Con trỏ chuột của host (hình + vị trí 0..65535 trên khung hình) để vẽ lớp phủ. */
+    val cursor: StateFlow<CursorState> = _cursor
+
+    fun onCursorShape(w: Int, h: Int, hotX: Int, hotY: Int, rgba: ByteArray) {
+        if (w <= 0 || h <= 0 || w > 512 || h > 512 || rgba.size < w * h * 4) return
+        try {
+            val px = IntArray(w * h)
+            for (i in px.indices) {
+                val o = i * 4
+                px[i] = ((rgba[o + 3].toInt() and 0xFF) shl 24) or ((rgba[o].toInt() and 0xFF) shl 16) or
+                    ((rgba[o + 1].toInt() and 0xFF) shl 8) or (rgba[o + 2].toInt() and 0xFF)
+            }
+            val bmp = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
+            _cursor.value = _cursor.value.copy(bitmap = bmp, hotX = hotX, hotY = hotY)
+        } catch (t: Throwable) {
+            RvLog.w("onCursorShape lỗi", t)
+        }
+    }
+
+    fun onCursorPos(x: Int, y: Int, visible: Boolean) {
+        _cursor.value = _cursor.value.copy(x = x.coerceIn(0, 65535), y = y.coerceIn(0, 65535), visible = visible)
+    }
+
+    /** Chế độ trackpad: dịch con trỏ cục bộ ngay (dx,dy là pixel của khung hình host) để không có độ trễ cảm nhận. */
+    private fun onLocalCursorDelta(dx: Int, dy: Int) {
+        val (w, h) = _streamSize.value
+        if (w <= 0 || h <= 0) return
+        val c = _cursor.value
+        _cursor.value = c.copy(
+            x = (c.x + dx * 65535f / w).toInt().coerceIn(0, 65535),
+            y = (c.y + dy * 65535f / h).toInt().coerceIn(0, 65535),
+            visible = true,
+        )
+    }
 
     private val _reconnecting = MutableStateFlow(false)
     /** true khi host im lặng (state 4): UI hiện lớp phủ "đang kết nối lại", không thoát phiên. */
@@ -123,7 +168,7 @@ class SessionController(
     fun bindView(v: RemoteSurfaceView) {
         view = v
         v.bind(touch, stylus, keyboard, directTouch)
-        capture = PointerCaptureController(v, sink).also { it.enable() }
+        capture = PointerCaptureController(v, sink) { dx, dy -> onLocalCursorDelta(dx, dy) }.also { it.enable() }
     }
 
     /**
@@ -304,10 +349,20 @@ class SessionController(
                     decoder?.flush()
                 }
             }
+            NativeBridge.STATE_DISPLAY_CONFIG -> {
+                // Chỉ dùng làm tỉ lệ tạm khi chưa có StreamConfig.
+                if (streamConfig == null) {
+                    val m = Regex("""(\d+)\s*x\s*(\d+)""").find(message ?: "")
+                    val w = m?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                    val h = m?.groupValues?.get(2)?.toIntOrNull() ?: 0
+                    if (w > 0 && h > 0) _streamSize.value = w to h
+                }
+            }
             NativeBridge.STATE_STREAM_CONFIG -> {
                 val cfg = parseStreamConfig(message) ?: return
                 val old = streamConfig
                 streamConfig = cfg
+                _streamSize.value = cfg.width to cfg.height
                 val s = surface ?: return
                 val cur = decoder
                 val same = old != null && cur != null && old.mime == cfg.mime &&

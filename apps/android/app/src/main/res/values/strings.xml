@@ -336,6 +336,14 @@
     <string name="log_clear">Xóa</string>
     <string name="log_copied">Đã sao chép nhật ký</string>
     <string name="log_empty">Chưa có dòng nhật ký nào.</string>
+    <string name="log_share">Chia sẻ file log</string>
+    <string name="log_upload">Gửi log lên máy tính</string>
+    <string name="log_upload_ok">Đã gửi log lên máy tính</string>
+    <string name="log_upload_fail">Gửi log thất bại</string>
+    <string name="log_upload_need_session">Cần đang kết nối với máy tính để gửi log</string>
+    <string name="log_share_fail">Không chia sẻ được file log</string>
+    <string name="settings_log_autosend">Tự gửi log khi phiên lỗi</string>
+    <string name="settings_log_autosend_hint">Khi phiên kết thúc vì lỗi, gửi log hiện tại lên máy tính</string>
     <string name="log_back">Quay lại</string>
 
     <!-- Điều hướng -->

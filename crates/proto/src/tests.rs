@@ -240,6 +240,11 @@ fn all_controls() -> Vec<ControlMessage> {
         },
         ControlMessage::DeviceInfo { name: "Galaxy Tab S10+ (SM-X826B)".into() },
         ControlMessage::DeviceInfo { name: String::new() },
+        ControlMessage::CursorPos { x: 0, y: 65535, visible: true },
+        ControlMessage::CursorPos { x: 32768, y: 1, visible: false },
+        ControlMessage::LogChunk { name: "tab-s10.log".into(), seq: 7, last: false, data: vec![1; 1000] },
+        ControlMessage::LogChunk { name: String::new(), seq: u32::MAX, last: true, data: vec![] },
+        ControlMessage::LogChunk { name: "n".repeat(64), seq: 0, last: true, data: vec![9; 16 * 1024] },
     ]
 }
 
@@ -256,6 +261,9 @@ fn control_rejections() {
     let enc = |m: ControlMessage| ControlPacket { ctrl_seq: 0, message: m }.encode(&mut Vec::new());
     assert!(enc(ControlMessage::QualitySliderUpdate { quality: 0, width: 1, height: 1, fps: 1 }).is_err());
     assert!(enc(ControlMessage::QualitySliderUpdate { quality: 101, width: 1, height: 1, fps: 1 }).is_err());
+    assert!(enc(ControlMessage::LogChunk { name: "n".repeat(65), seq: 0, last: true, data: vec![] }).is_err());
+    assert!(enc(ControlMessage::LogChunk { name: "a".into(), seq: 0, last: true, data: vec![0; 16 * 1024 + 1] }).is_err());
+    assert!(ControlMessage::decode_payload(op_code::CURSOR_POS, &[0, 0, 0, 0, 2]).is_err());
     // rgba size mismatch
     assert!(enc(ControlMessage::CursorShape { w: 2, h: 2, hot_x: 0, hot_y: 0, rgba: vec![0; 15] }).is_err());
     // cursor too big for u16 payload (128*128*4 = 65536)

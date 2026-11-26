@@ -2,6 +2,20 @@ package com.remoteview.client.ui
 
 import android.app.Activity
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.clickable
+import android.widget.Toast
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.Canvas
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
+import kotlin.math.roundToInt
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -81,24 +95,33 @@ fun SessionScreen(controller: SessionController, showModifierBar: Boolean = true
             }
         }
     }
-    Box(Modifier.fillMaxSize()) {
-        AndroidView(
-            modifier = Modifier.fillMaxSize(),
-            factory = { ctx ->
-                RemoteSurfaceView(ctx).also { v ->
-                    controller.bindView(v)
-                    v.surfaceListener = object : RemoteSurfaceView.SurfaceListener {
-                        override fun onSurfaceReady(holder: SurfaceHolder) {
-                            controller.onSurfaceDestroyed() // tránh tạo trùng khi surfaceChanged lặp lại
-                            controller.onSurfaceReady(holder.surface)
+    val streamSize by controller.streamSize.collectAsState()
+    val aspect = if (streamSize.second > 0) streamSize.first.toFloat() / streamSize.second.toFloat() else 16f / 9f
+    var zoomState by remember { mutableStateOf(Triple(1f, 0f, 0f)) }
+    Box(Modifier.fillMaxSize().background(Color.Black)) {
+        // Khung video đúng tỉ lệ luồng, căn giữa; phần còn lại đen (letterbox/pillarbox) và không nhận chạm.
+        // Toàn bộ ánh xạ chạm/bút dùng kích thước của View này = content rect.
+        Box(Modifier.align(Alignment.Center).aspectRatio(aspect)) {
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { ctx ->
+                    RemoteSurfaceView(ctx).also { v ->
+                        controller.bindView(v)
+                        v.onZoomChanged = { z, px, py -> zoomState = Triple(z, px, py) }
+                        v.surfaceListener = object : RemoteSurfaceView.SurfaceListener {
+                            override fun onSurfaceReady(holder: SurfaceHolder) {
+                                controller.onSurfaceDestroyed() // tránh tạo trùng khi surfaceChanged lặp lại
+                                controller.onSurfaceReady(holder.surface)
+                            }
+                            override fun onSurfaceDestroyed() = controller.onSurfaceDestroyed()
                         }
-                        override fun onSurfaceDestroyed() = controller.onSurfaceDestroyed()
+                        v.requestFocus()
                     }
-                    v.requestFocus()
-                }
-            },
-            onRelease = { controller.release() },
-        )
+                },
+                onRelease = { controller.release() },
+            )
+            CursorOverlay(controller, zoomState, Modifier.fillMaxSize())
+        }
         val reconnecting by controller.reconnecting.collectAsState()
         if (reconnecting) {
             // Không chặn cảm ứng: chỉ là nhãn nổi, phiên vẫn giữ.
@@ -142,19 +165,47 @@ fun SessionScreen(controller: SessionController, showModifierBar: Boolean = true
             )
         }
         if (overlayVisible) {
-            Text(
-                debugText(snap, now),
-                color = Color(0xFF9CFF9C),
-                fontFamily = FontFamily.Monospace,
-                fontSize = 11.sp,
-                lineHeight = 13.sp,
+            val ctx = LocalContext.current
+            val okMsg = stringResource(R.string.log_upload_ok)
+            val failMsg = stringResource(R.string.log_upload_fail)
+            val needMsg = stringResource(R.string.log_upload_need_session)
+            Column(
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .padding(top = 8.dp, start = 8.dp)
                     .background(Color(0xB31C1B1F), RoundedCornerShape(16.dp))
                     .border(1.dp, Color(0x33FFFFFF), RoundedCornerShape(16.dp))
                     .padding(12.dp),
-            )
+            ) {
+                Text(
+                    debugText(snap, now),
+                    color = Color(0xFF9CFF9C),
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    lineHeight = 13.sp,
+                )
+                Text(
+                    stringResource(R.string.log_upload),
+                    color = Color(0xFFFFB74D),
+                    fontSize = 13.sp,
+                    modifier = Modifier
+                        .padding(top = 8.dp)
+                        .clickable {
+                            val h = if (controller.isConnected) controller.nativeHandle else 0L
+                            if (h == 0L) {
+                                Toast.makeText(ctx, needMsg, Toast.LENGTH_SHORT).show()
+                            } else {
+                                Thread({
+                                    val ok = com.remoteview.client.LogShare.upload(h)
+                                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                                        Toast.makeText(ctx, if (ok) okMsg else failMsg, Toast.LENGTH_SHORT).show()
+                                    }
+                                }, "rv-log-upload").start()
+                            }
+                        }
+                        .padding(vertical = 6.dp),
+                )
+            }
         }
         // Nhấn giữ góc trên-phải để bật/tắt lớp phủ (góc này không chuyển cảm ứng cho host).
         Box(
@@ -194,5 +245,52 @@ private fun debugText(d: com.remoteview.client.session.DebugSnapshot, now: Long)
         appendLine("decoder: ${d.decoderName}")
         appendLine("frame nhận/giải mã: ${d.framesSubmitted} / ${d.framesDecoded}")
         append("lỗi cuối: ${d.lastError.ifEmpty { "-" }}")
+    }
+}
+
+/** Con trỏ chuột của host vẽ phủ lên video: vị trí 0..65535 trên khung hình, trừ điểm nóng, nhân tỉ lệ content rect. */
+@Composable
+private fun CursorOverlay(controller: SessionController, zoom: Triple<Float, Float, Float>, modifier: Modifier) {
+    val c by controller.cursor.collectAsState()
+    val streamSize by controller.streamSize.collectAsState()
+    val img = remember(c.bitmap) { c.bitmap?.asImageBitmap() }
+    Canvas(
+        modifier.graphicsLayer {
+            scaleX = zoom.first
+            scaleY = zoom.first
+            transformOrigin = if (size.width > 0f && size.height > 0f) {
+                TransformOrigin(zoom.second / size.width, zoom.third / size.height)
+            } else TransformOrigin.Center
+        },
+    ) {
+        if (!c.visible || size.width <= 0f || size.height <= 0f) return@Canvas
+        val sw = streamSize.first.coerceAtLeast(1)
+        val scale = size.width / sw
+        val px = c.x / 65535f * size.width
+        val py = c.y / 65535f * size.height
+        if (img != null) {
+            drawImage(
+                img,
+                srcOffset = IntOffset.Zero,
+                srcSize = IntSize(img.width, img.height),
+                dstOffset = IntOffset((px - c.hotX * scale).roundToInt(), (py - c.hotY * scale).roundToInt()),
+                dstSize = IntSize((img.width * scale).roundToInt().coerceAtLeast(1), (img.height * scale).roundToInt().coerceAtLeast(1)),
+            )
+        } else {
+            // Mũi tên mặc định (điểm nóng ở đỉnh), cao ~20 pixel host.
+            val k = scale
+            val path = Path().apply {
+                moveTo(px, py)
+                lineTo(px, py + 17f * k)
+                lineTo(px + 4f * k, py + 13f * k)
+                lineTo(px + 7f * k, py + 19f * k)
+                lineTo(px + 9.5f * k, py + 18f * k)
+                lineTo(px + 6.5f * k, py + 12f * k)
+                lineTo(px + 12f * k, py + 12f * k)
+                close()
+            }
+            drawPath(path, Color.White)
+            drawPath(path, Color.Black, style = Stroke(width = (1.2f * k).coerceAtLeast(1f)))
+        }
     }
 }

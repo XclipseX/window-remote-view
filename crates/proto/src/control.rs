@@ -20,6 +20,8 @@ pub mod op_code {
     pub const STREAM_CONFIG: u8 = 0x0A;
     pub const KEEPALIVE: u8 = 0x0B;
     pub const DEVICE_INFO: u8 = 0x0C;
+    pub const CURSOR_POS: u8 = 0x0D;
+    pub const LOG_CHUNK: u8 = 0x0E;
 }
 
 /// Codec capability bits for `Hello::codecs`.
@@ -80,10 +82,27 @@ pub enum ControlMessage {
     /// Client -> host, sent right after the handshake: the friendly device
     /// name (UTF-8, at most [`MAX_DEVICE_NAME`] bytes), e.g. "Galaxy Tab S10+ (SM-X826B)".
     DeviceInfo { name: String },
+    /// Host -> client: pointer position, `x`/`y` normalised 0..=65535 over the
+    /// captured frame; `visible` is false when the cursor is hidden or off the
+    /// captured display.
+    CursorPos { x: u16, y: u16, visible: bool },
+    /// Client -> host: one piece of a log file. `name` (UTF-8, at most
+    /// [`MAX_LOG_NAME`] bytes) identifies the file, `seq` counts chunks from 0,
+    /// `last` marks the final chunk, `data` holds at most [`MAX_LOG_CHUNK`] bytes.
+    LogChunk {
+        name: String,
+        seq: u32,
+        last: bool,
+        data: Vec<u8>,
+    },
 }
 
 /// Longest accepted `DeviceInfo` name in bytes.
 pub const MAX_DEVICE_NAME: usize = 255;
+/// Longest accepted `LogChunk` name in bytes.
+pub const MAX_LOG_NAME: usize = 64;
+/// Largest `LogChunk` data in bytes.
+pub const MAX_LOG_CHUNK: usize = 16 * 1024;
 
 fn check_quality(q: u8) -> Result<()> {
     if (1..=100).contains(&q) {
@@ -109,6 +128,8 @@ impl ControlMessage {
             Self::StreamConfig { .. } => STREAM_CONFIG,
             Self::Keepalive => KEEPALIVE,
             Self::DeviceInfo { .. } => DEVICE_INFO,
+            Self::CursorPos { .. } => CURSOR_POS,
+            Self::LogChunk { .. } => LOG_CHUNK,
         }
     }
 
@@ -202,6 +223,20 @@ impl ControlMessage {
                     check_max("device name", name.len(), MAX_DEVICE_NAME)?;
                     buf.extend_from_slice(name.as_bytes());
                 }
+                Self::CursorPos { x, y, visible } => {
+                    put_u16(buf, *x);
+                    put_u16(buf, *y);
+                    buf.push(u8::from(*visible));
+                }
+                Self::LogChunk { name, seq, last, data } => {
+                    check_max("log name", name.len(), MAX_LOG_NAME)?;
+                    check_max("log chunk", data.len(), MAX_LOG_CHUNK)?;
+                    buf.push(name.len() as u8);
+                    buf.extend_from_slice(name.as_bytes());
+                    put_u32(buf, *seq);
+                    buf.push(u8::from(*last));
+                    buf.extend_from_slice(data);
+                }
             }
             check_max("control payload", buf.len() - start, MAX_CONTROL_PAYLOAD)
         })
@@ -281,6 +316,21 @@ impl ControlMessage {
                 let b = r.take(payload.len())?;
                 let s = core::str::from_utf8(b).map_err(|_| ProtoError::InvalidUtf8)?;
                 Self::DeviceInfo { name: s.to_owned() }
+            }
+            CURSOR_POS => Self::CursorPos {
+                x: r.u16()?,
+                y: r.u16()?,
+                visible: r.bool()?,
+            },
+            LOG_CHUNK => {
+                let n = usize::from(r.u8()?);
+                check_max("log name", n, MAX_LOG_NAME)?;
+                let name = core::str::from_utf8(r.take(n)?).map_err(|_| ProtoError::InvalidUtf8)?.to_owned();
+                let seq = r.u32()?;
+                let last = r.bool()?;
+                check_max("log chunk", r.remaining(), MAX_LOG_CHUNK)?;
+                let rem = r.remaining();
+                Self::LogChunk { name, seq, last, data: r.take(rem)?.to_vec() }
             }
             other => return Err(ProtoError::UnknownOpCode(other)),
         };

@@ -235,6 +235,10 @@ private fun CategoryContent(
             SwitchRow(R.string.settings_debug_overlay, R.string.settings_debug_overlay_hint, settings.debugOverlay) {
                 onChange(settings.copy(debugOverlay = it))
             }
+            RowDivider()
+            SwitchRow(R.string.settings_log_autosend, R.string.settings_log_autosend_hint, settings.autoSendLogOnError) {
+                onChange(settings.copy(autoSendLogOnError = it))
+            }
         }
         Category.ABOUT -> AboutContent(settings, onChange, update)
     }
