@@ -12,7 +12,7 @@ import kotlin.coroutines.coroutineContext
 // UNBUILT: chưa biên dịch.
 
 /**
- * Theo dõi việc bật USB tethering: ghi mọi broadcast USB_STATE và thay đổi giao diện rndis*/ncm*/usb*
+ * Theo dõi việc bật USB tethering: ghi mọi broadcast USB_STATE và thay đổi giao diện rndis, ncm, usb
  * (thăm dò 300 ms), rồi đưa ra kết luận vì sao công tắc tự tắt.
  */
 object TetherMonitor {
