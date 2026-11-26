@@ -1,4 +1,7 @@
-//! Child-process management for `rv-host --json-status`.
+//! Host engine supervision. The engine is the same executable re-launched as
+//! `RemoteView.exe --host-worker <rv-host args>` (see `main.rs`), speaking the
+//! JSON-lines contract of `crates/host-win/CONTROL_PROTOCOL.md`; a crash or
+//! stuck capture therefore cannot take the GUI down.
 
 use crate::control::{parse_event, HostCmd, HostEvent, LogLevel};
 use std::io::{BufRead, BufReader, Write};
@@ -20,20 +23,17 @@ pub enum UiMsg {
     Stopped,
 }
 
-pub fn find_host_exe(custom: Option<&str>) -> PathBuf {
+/// The `--host-worker` marker: everything after it is `rv-host` arguments.
+pub const WORKER_FLAG: &str = "--host-worker";
+
+/// Executable + leading arguments that start the host engine: this very exe in
+/// worker mode, or a custom `rv-host` (debug) when `custom` is set.
+pub fn host_command(custom: Option<&str>) -> (PathBuf, Vec<String>) {
     if let Some(p) = custom.filter(|s| !s.trim().is_empty()) {
-        return PathBuf::from(p);
+        return (PathBuf::from(p), Vec::new());
     }
-    let name = if cfg!(windows) { "rv-host.exe" } else { "rv-host" };
-    if let Ok(me) = std::env::current_exe() {
-        if let Some(dir) = me.parent() {
-            let p = dir.join(name);
-            if p.exists() {
-                return p;
-            }
-        }
-    }
-    PathBuf::from(name)
+    let me = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("RemoteView.exe"));
+    (me, vec![WORKER_FLAG.to_string()])
 }
 
 pub struct HostProcess {
@@ -223,6 +223,16 @@ mod tests {
         }
         assert!(got);
         drop(p);
+    }
+
+    #[test]
+    fn host_command_is_self_worker() {
+        let (exe, pre) = host_command(None);
+        assert_eq!(pre, vec![WORKER_FLAG.to_string()]);
+        assert!(exe.is_absolute() || exe.as_os_str().len() > 0);
+        let (exe, pre) = host_command(Some("C:/x/rv-host.exe"));
+        assert_eq!(exe, PathBuf::from("C:/x/rv-host.exe"));
+        assert!(pre.is_empty());
     }
 
     #[test]

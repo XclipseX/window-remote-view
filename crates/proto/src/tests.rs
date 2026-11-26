@@ -238,6 +238,8 @@ fn all_controls() -> Vec<ControlMessage> {
             fps: 120,
             bitrate_kbps: 80_000,
         },
+        ControlMessage::DeviceInfo { name: "Galaxy Tab S10+ (SM-X826B)".into() },
+        ControlMessage::DeviceInfo { name: String::new() },
     ]
 }
 

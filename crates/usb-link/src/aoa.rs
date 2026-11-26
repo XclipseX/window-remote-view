@@ -9,10 +9,9 @@
 //!
 //! UNVERIFIED against real hardware. Windows caveat: libusb needs the WinUSB
 //! driver bound to the device. The phone in normal (MTP) mode usually is not,
-//! so step 1 fails with `NotSupported`/`Access` until the user installs WinUSB
-//! (e.g. Zadig) for the normal-mode device and again for the 18D1:2D00/2D01
-//! accessory device. A signed INF shipped with the host installer would
-//! automate that. On Linux/macOS no driver work is needed (udev rule on Linux).
+//! so step 1 fails with `NotSupported`/`Access` until WinUSB is bound to the
+//! device. RemoteView.exe installs it automatically (libwdi, see
+//! `apps/win-ui/src/driver.rs`) for the 18D1:2D00/2D01 accessory device. On Linux/macOS no driver work is needed (udev rule on Linux).
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -58,16 +57,30 @@ pub struct AccessoryInfo {
     pub serial: String,
 }
 
+/// Shared contract with the Android app (accessory_filter.xml + pairing).
+pub const AOA_MANUFACTURER: &str = "RemoteView";
+pub const AOA_MODEL: &str = "RemoteViewHost";
+pub const AOA_VERSION: &str = "2";
+pub const AOA_URI: &str = "https://github.com/XclipseX/window-remote-view/releases/tag/latest-build";
+
+impl AccessoryInfo {
+    /// `computer_name` becomes the description; `token` (8 digits) is sent as
+    /// the AOA serial and doubles as the session OTP for the USB link.
+    pub fn new(computer_name: &str, token: &str) -> Self {
+        Self {
+            manufacturer: AOA_MANUFACTURER.into(),
+            model: AOA_MODEL.into(),
+            description: computer_name.chars().take(100).collect(),
+            version: AOA_VERSION.into(),
+            uri: AOA_URI.into(),
+            serial: token.into(),
+        }
+    }
+}
+
 impl Default for AccessoryInfo {
     fn default() -> Self {
-        Self {
-            manufacturer: "RemoteView".into(),
-            model: "RemoteViewHost".into(),
-            description: "RemoteView second display host".into(),
-            version: "1.0".into(),
-            uri: "https://example.invalid/remoteview".into(),
-            serial: "0001".into(),
-        }
+        Self::new("RemoteView second display host", "00000000")
     }
 }
 
@@ -77,6 +90,17 @@ pub struct Candidate {
     pub pid: u16,
     pub bus: u8,
     pub address: u8,
+    /// USB string descriptors (only readable when libusb can open the device).
+    pub manufacturer: Option<String>,
+    pub product: Option<String>,
+    /// libusb could open the device (WinUSB/udev permissions OK).
+    pub can_open: bool,
+}
+
+impl Candidate {
+    pub fn is_accessory(&self) -> bool {
+        is_accessory(self.vid, self.pid)
+    }
 }
 
 fn is_accessory(vid: u16, pid: u16) -> bool {
@@ -85,6 +109,13 @@ fn is_accessory(vid: u16, pid: u16) -> bool {
 
 /// Lists attached USB devices that look like Android (or all, if `scan_all`).
 pub fn list_candidates(scan_all: bool) -> Result<Vec<Candidate>> {
+    list_candidates_opts(scan_all, true)
+}
+
+/// Like [`list_candidates`]. With `probe_accessory = false` devices already in
+/// accessory mode are not opened (they may be in use by a live link; a second
+/// open could fail or disturb it) and are reported with `can_open = true`.
+pub fn list_candidates_opts(scan_all: bool, probe_accessory: bool) -> Result<Vec<Candidate>> {
     let ctx = Context::new()?;
     let mut out = Vec::new();
     for d in ctx.devices()?.iter() {
@@ -94,11 +125,22 @@ pub fn list_candidates(scan_all: bool) -> Result<Vec<Candidate>> {
             continue;
         }
         if scan_all || ANDROID_VIDS.contains(&desc.vendor_id()) {
+            let (mut manufacturer, mut product, mut can_open) = (None, None, false);
+            if !probe_accessory && is_accessory(desc.vendor_id(), desc.product_id()) {
+                can_open = true;
+            } else if let Ok(h) = d.open() {
+                can_open = true;
+                manufacturer = h.read_manufacturer_string_ascii(&desc).ok();
+                product = h.read_product_string_ascii(&desc).ok();
+            }
             out.push(Candidate {
                 vid: desc.vendor_id(),
                 pid: desc.product_id(),
                 bus: d.bus_number(),
                 address: d.address(),
+                manufacturer,
+                product,
+                can_open,
             });
         }
     }
@@ -145,12 +187,41 @@ pub struct AoaDevice {
 impl AoaDevice {
     /// Finds an Android device, switches it to accessory mode if needed and
     /// opens it. Returns `NoDevice` when nothing suitable is attached.
-    pub fn connect(info: &AccessoryInfo, scan_all: bool, timeout: Duration) -> Result<Self> {
+    ///
+    /// `reuse_existing`: a device already in accessory mode was switched by
+    /// this very process (same identification strings / token), so keep it.
+    /// Otherwise it is a leftover from an earlier run whose serial (= pairing
+    /// token) we cannot know: reset it back to normal mode and switch again
+    /// with the current strings; if that is impossible, fall back to using it.
+    pub fn connect(info: &AccessoryInfo, scan_all: bool, timeout: Duration, reuse_existing: bool) -> Result<Self> {
         let ctx = Context::new()?;
-        // Already in accessory mode (e.g. app restarted)?
         if let Some(dev) = find_accessory(&ctx)? {
-            return Self::open(dev);
+            if reuse_existing {
+                return Self::open(dev);
+            }
+            let reset_ok = dev.open().and_then(|h| h.reset()).is_ok();
+            if reset_ok {
+                // Wait for the stale accessory to drop off the bus.
+                let gone = Instant::now() + Duration::from_secs(3);
+                while Instant::now() < gone && find_accessory(&ctx)?.is_some() {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            if find_accessory(&ctx)?.is_some() || !reset_ok {
+                return match Self::switch_normal_device(&ctx, info, scan_all, timeout) {
+                    Ok(d) => Ok(d),
+                    Err(_) => match find_accessory(&ctx)? {
+                        Some(dev) => Self::open(dev),
+                        None => Err(LinkError::NoDevice),
+                    },
+                };
+            }
         }
+        Self::switch_normal_device(&ctx, info, scan_all, timeout)
+    }
+
+    fn switch_normal_device(ctx: &Context, info: &AccessoryInfo, scan_all: bool, timeout: Duration) -> Result<Self> {
         let mut last_err = LinkError::NoDevice;
         for d in ctx.devices()?.iter() {
             let Ok(desc) = d.device_descriptor() else { continue };
@@ -182,7 +253,7 @@ impl AoaDevice {
                 continue;
             }
             drop(h);
-            return Self::wait_reenumerate(&ctx, timeout);
+            return Self::wait_reenumerate(ctx, timeout);
         }
         Err(last_err)
     }

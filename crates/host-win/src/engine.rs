@@ -1,4 +1,5 @@
-//! `rv-host`: Windows host for the USB second display.
+//! Host engine: Windows host for the USB second display (`rv-host`, and
+//! `RemoteView.exe --host-worker`).
 //!
 //! Threads: video (capture+encode), audio (loopback+Opus), devices (USB/adb
 //! polling), stdin (GUI commands, `--json-status` only), main (session, link
@@ -7,18 +8,18 @@
 //! The control contract for a GUI front-end is in `CONTROL_PROTOCOL.md`.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rv_crypto::Keypair;
-use rv_host_win::audio::{LoopbackCapture, OpusFrameEncoder, CHANNELS_RATE, FRAME_MS};
-use rv_host_win::capture::{list_outputs, CapturedFrame, DesktopDuplicator};
-use rv_host_win::control::{self, Command, DeviceItem, Level, State, Stats};
-use rv_host_win::encode::{create_encoder, CodecPref, EncoderConfig, EncoderKind, EncoderPref, VideoEncoder};
-use rv_host_win::input::{InputInjector, WinInjector};
-use rv_host_win::vdisplay::{DisplayMode, ExistingOutput, IddCxDisplay, VirtualDisplay};
+use crate::audio::{LoopbackCapture, OpusFrameEncoder, CHANNELS_RATE, FRAME_MS};
+use crate::capture::{list_outputs, CapturedFrame, DesktopDuplicator};
+use crate::control::{self, Command, DeviceItem, Level, State, Stats};
+use crate::encode::{create_encoder, CodecPref, EncoderConfig, EncoderKind, EncoderPref, VideoEncoder};
+use crate::input::{InputInjector, WinInjector};
+use crate::vdisplay::{DisplayMode, ExistingOutput, IddCxDisplay, VirtualDisplay};
 use rv_proto::ControlMessage;
 use rv_session::udp::{SharedPeer, UdpIo};
 use rv_session::{slider_to_bitrate, DatagramIo, HostSession, HostSessionEvent};
@@ -72,7 +73,7 @@ struct Args {
     list: bool,
 }
 
-fn parse_args() -> Result<Args, String> {
+fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     let mut a = Args {
         mode: Mode::Auto,
         mirror: false,
@@ -92,7 +93,7 @@ fn parse_args() -> Result<Args, String> {
         list: false,
     };
     let mut explicit_mode = false;
-    let mut it = std::env::args().skip(1);
+    let mut it = argv.into_iter();
     while let Some(k) = it.next() {
         let mut val = |name: &str| it.next().ok_or(format!("{name} needs a value"));
         match k.as_str() {
@@ -177,39 +178,72 @@ struct LanHandle {
     peer: SharedPeer,
 }
 
-/// Link abstraction so one session loop serves USB, adb and LAN.
-enum Transport {
+/// Datagram / byte counters of one link (black-screen debugging).
+#[derive(Default)]
+struct IoStats {
+    dg_in: AtomicU64,
+    dg_out: AtomicU64,
+    bytes_in: AtomicU64,
+    bytes_out: AtomicU64,
+}
+
+enum TransportKind {
     Stream(UsbDatagramLink),
     Lan(LanHandle),
 }
 
+/// Link abstraction so one session loop serves USB, adb and LAN.
+struct Transport {
+    kind: TransportKind,
+    io: Arc<IoStats>,
+}
+
 impl DatagramIo for Transport {
     fn send(&mut self, buf: &[u8]) {
-        match self {
-            Transport::Stream(l) => l.send(buf),
-            Transport::Lan(h) => h.io.lock().unwrap().send(buf),
+        self.io.dg_out.fetch_add(1, Ordering::Relaxed);
+        self.io.bytes_out.fetch_add(buf.len() as u64, Ordering::Relaxed);
+        match &mut self.kind {
+            TransportKind::Stream(l) => l.send(buf),
+            TransportKind::Lan(h) => h.io.lock().unwrap().send(buf),
         }
     }
 }
 
 impl Transport {
+    fn stream(l: UsbDatagramLink) -> Self {
+        Self { kind: TransportKind::Stream(l), io: Arc::default() }
+    }
+    fn lan(h: LanHandle) -> Self {
+        Self { kind: TransportKind::Lan(h), io: Arc::default() }
+    }
     fn recv(&mut self, t: Duration) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            Transport::Stream(l) => {
+        let r = match &mut self.kind {
+            TransportKind::Stream(l) => {
                 if l.is_broken() {
-                    return Err("link write failed".into());
+                    return Err(format!("link write failed ({})", l.stats().last_error().unwrap_or_default()));
                 }
-                l.recv_timeout(t).map_err(|e| e.to_string())
+                l.recv_timeout(t).map_err(|e| format!("{e} ({})", l.stats().last_error().unwrap_or_default()))
             }
-            Transport::Lan(h) => match h.rx.lock().unwrap().recv_timeout(t) {
+            TransportKind::Lan(h) => match h.rx.lock().unwrap().recv_timeout(t) {
                 Ok(v) => Ok(Some(v)),
                 Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
                 Err(_) => Err("udp receiver stopped".into()),
             },
+        };
+        if let Ok(Some(v)) = &r {
+            self.io.dg_in.fetch_add(1, Ordering::Relaxed);
+            self.io.bytes_in.fetch_add(v.len() as u64, Ordering::Relaxed);
         }
+        r
     }
     fn reliable(&self) -> bool {
-        matches!(self, Transport::Stream(_))
+        matches!(self.kind, TransportKind::Stream(_))
+    }
+    fn usb_stats(&self) -> Option<Arc<rv_usb_link::LinkStats>> {
+        match &self.kind {
+            TransportKind::Stream(l) => Some(l.stats()),
+            TransportKind::Lan(_) => None,
+        }
     }
 }
 
@@ -243,13 +277,13 @@ fn open_lan(bind: SocketAddr) -> Result<LanHandle, String> {
     Ok(LanHandle { io: Arc::new(Mutex::new(io)), rx: Arc::new(Mutex::new(rx)), peer })
 }
 
-fn open_usb(a: &Args) -> Result<(Transport, &'static str), String> {
+fn open_usb(a: &Args, token: &str, reuse_existing: bool) -> Result<(Transport, &'static str), String> {
     if a.mode != Mode::Adb {
-        let info = aoa::AccessoryInfo::default();
-        match aoa::AoaDevice::connect(&info, a.scan_all, Duration::from_secs(8)) {
+        let info = aoa::AccessoryInfo::new(&control::computer_name(), token);
+        match aoa::AoaDevice::connect(&info, a.scan_all, Duration::from_secs(8), reuse_existing) {
             Ok(dev) => {
-                info!("USB: AOA accessory open");
-                return Ok((Transport::Stream(UsbDatagramLink::from_aoa(dev)), "usb"));
+                info!("USB: AOA accessory open (identity {}/{} v{}, description \"{}\")", info.manufacturer, info.model, info.version, info.description);
+                return Ok((Transport::stream(UsbDatagramLink::from_aoa(dev)), "usb"));
             }
             Err(e) => warn!("USB: AOA failed: {e}"),
         }
@@ -257,7 +291,7 @@ fn open_usb(a: &Args) -> Result<(Transport, &'static str), String> {
     if adb::device_present() {
         info!("USB: trying adb reverse tcp:{}", rv_usb_link::ADB_PORT);
         let l = adb::connect(Duration::from_secs(30)).map_err(|e| e.to_string())?;
-        return Ok((Transport::Stream(l), "adb"));
+        return Ok((Transport::stream(l), "adb"));
     }
     Err("no USB link: AOA failed and no adb device".into())
 }
@@ -285,6 +319,12 @@ struct Shared {
     codec_flag: AtomicU32,
     /// Client advertised HEVC decode in Hello (assumed until a Hello says otherwise).
     client_hevc: AtomicBool,
+    /// A USB/adb link is open right now (do not probe accessory devices).
+    usb_link_open: AtomicBool,
+    /// Friendly name from the client's `DeviceInfo`.
+    peer_name: Mutex<Option<String>>,
+    /// Ask the device poller to publish a fresh list now.
+    dev_refresh: AtomicBool,
 }
 
 impl Shared {
@@ -558,34 +598,95 @@ fn adb_serials() -> Vec<String> {
         .collect()
 }
 
-fn list_devices(scan_all: bool) -> Vec<DeviceItem> {
+fn vendor_name(vid: u16) -> &'static str {
+    match vid {
+        0x04E8 => "Samsung",
+        0x18D1 => "Google",
+        0x2717 => "Xiaomi",
+        0x12D1 => "Huawei",
+        0x22B8 => "Motorola",
+        0x2A70 => "OnePlus",
+        0x1004 => "LG",
+        0x0FCE => "Sony",
+        0x0BB4 => "HTC",
+        0x0B05 => "ASUS",
+        0x22D9 => "OPPO",
+        0x17EF => "Lenovo",
+        _ => "USB",
+    }
+}
+
+/// Best available display name for a normal-mode candidate.
+fn candidate_name(c: &aoa::Candidate) -> String {
+    match (&c.manufacturer, &c.product) {
+        (Some(m), Some(p)) if !p.starts_with(m.as_str()) => format!("{m} {p}"),
+        (_, Some(p)) => p.clone(),
+        (Some(m), None) => m.clone(),
+        _ => format!("{} {:04x}:{:04x}", vendor_name(c.vid), c.vid, c.pid),
+    }
+}
+
+/// `last_name` remembers the last normal-mode device name so the same device
+/// keeps it after it re-enumerates as an accessory (18D1:2D00).
+fn list_devices_with(scan_all: bool, link_open: bool, peer_name: Option<&str>, last_name: &mut Option<String>) -> Vec<DeviceItem> {
     let mut v = Vec::new();
-    for c in aoa::list_candidates(scan_all).unwrap_or_default() {
+    for c in aoa::list_candidates_opts(scan_all, !link_open).unwrap_or_default() {
+        let acc = c.is_accessory();
+        let name = if acc {
+            peer_name.map(str::to_string).or_else(|| last_name.clone()).unwrap_or_else(|| "Thiết bị Android".to_string())
+        } else {
+            let n = candidate_name(&c);
+            if c.can_open && c.product.is_some() {
+                *last_name = Some(n.clone());
+            }
+            n
+        };
         v.push(DeviceItem {
             kind: "usb".into(),
-            name: format!("USB {:04x}:{:04x}", c.vid, c.pid),
+            name,
             serial: format!("{}-{}", c.bus, c.address),
+            vid: c.vid,
+            pid: c.pid,
+            accessory: acc,
+            driver_ok: c.can_open,
+            connected: acc && link_open,
         });
     }
     for s in adb_serials() {
-        v.push(DeviceItem { kind: "adb".into(), name: format!("adb {s}"), serial: s });
+        v.push(DeviceItem { kind: "adb".into(), name: format!("adb {s}"), serial: s, vid: 0, pid: 0, accessory: false, driver_ok: true, connected: false });
     }
     v
 }
 
+/// One-shot device scan for the GUI while no host engine is running.
+pub fn scan_devices(last_name: &mut Option<String>) -> Vec<DeviceItem> {
+    list_devices_with(false, false, None, last_name)
+}
+
+fn list_devices(scan_all: bool, sh: &Shared, last_name: &mut Option<String>) -> Vec<DeviceItem> {
+    let peer_name = sh.peer_name.lock().unwrap().clone();
+    list_devices_with(scan_all, sh.usb_link_open.load(Ordering::Relaxed), peer_name.as_deref(), last_name)
+}
+
 fn devices_thread(scan_all: bool, sh: Arc<Shared>) {
     let mut last: Option<Vec<DeviceItem>> = None;
+    let mut last_name: Option<String> = None;
     while !sh.stop.load(Ordering::Relaxed) {
-        let items = list_devices(scan_all);
+        let items = list_devices(scan_all, &sh, &mut last_name);
         sh.usb_present.store(!items.is_empty(), Ordering::Relaxed);
         if last.as_ref() != Some(&items) {
             if control::json_mode() {
                 control::emit(&control::devices_json(&items));
             }
-            info!("devices: {}", if items.is_empty() { "none".to_string() } else { items.iter().map(|d| d.name.clone()).collect::<Vec<_>>().join(", ") });
+            info!("devices: {}", if items.is_empty() { "none".to_string() } else { items.iter().map(|d| format!("{} [{:04x}:{:04x} driver_ok={}]", d.name, d.vid, d.pid, d.driver_ok)).collect::<Vec<_>>().join(", ") });
             last = Some(items);
         }
-        std::thread::sleep(Duration::from_secs(2));
+        for _ in 0..40 {
+            if sh.stop.load(Ordering::Relaxed) || sh.dev_refresh.swap(false, Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -628,7 +729,12 @@ struct Ctx {
     args: Args,
     sh: Arc<Shared>,
     kp: Keypair,
+    /// LAN PIN (shown to the user).
     otp: String,
+    /// Random 8-digit pairing token for USB: AOA serial and session OTP. New on every host start.
+    usb_token: String,
+    /// This process already switched the tablet to accessory mode with `usb_token`.
+    usb_switched: bool,
     lan: Option<LanHandle>,
     injector: Option<WinInjector>,
     vrx: Receiver<VideoOut>,
@@ -644,6 +750,17 @@ struct Ctx {
     peer: Option<String>,
     message: String,
     usb_backoff_until: Instant,
+}
+
+impl Ctx {
+    /// Session OTP for a link: the pairing token over USB, the PIN otherwise.
+    fn otp_for(&self, link: &str) -> String {
+        if link == "usb" {
+            self.usb_token.clone()
+        } else {
+            self.otp.clone()
+        }
+    }
 }
 
 /// What a command asks the session loop to do.
@@ -694,6 +811,11 @@ impl Ctx {
                 self.otp = control::random_otp();
                 self.emit_status();
                 return Action::NewOtp;
+            }
+            Command::Connect { serial } => {
+                info!("connect requested (device {serial:?}): retrying USB now");
+                self.usb_backoff_until = Instant::now();
+                sh.dev_refresh.store(true, Ordering::Relaxed);
             }
             Command::Stop => {
                 sh.stop.store(true, Ordering::SeqCst);
@@ -754,8 +876,11 @@ impl Ctx {
             }
         };
         if want_usb {
-            match open_usb(&self.args) {
-                Ok(t) => return Ok(t),
+            match open_usb(&self.args, &self.usb_token, self.usb_switched) {
+                Ok(t) => {
+                    self.usb_switched = t.1 == "usb";
+                    return Ok(t);
+                }
                 Err(e) if self.args.mode == Mode::Auto => {
                     warn!("{e}; falling back to LAN for a while");
                     self.usb_backoff_until = Instant::now() + Duration::from_secs(30);
@@ -766,7 +891,16 @@ impl Ctx {
         if self.lan.is_none() {
             self.lan = Some(open_lan(self.args.bind)?);
         }
-        Ok((Transport::Lan(self.lan.clone().unwrap()), "lan"))
+        Ok((Transport::lan(self.lan.clone().unwrap()), "lan"))
+    }
+}
+
+/// Clears the "USB link open" flag however `run_session` returns.
+struct LinkGuard(Arc<Shared>);
+impl Drop for LinkGuard {
+    fn drop(&mut self) {
+        self.0.usb_link_open.store(false, Ordering::Relaxed);
+        self.0.dev_refresh.store(true, Ordering::Relaxed);
     }
 }
 
@@ -780,8 +914,10 @@ fn waiting_message(link: &str) -> &'static str {
 
 fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Result<End, String> {
     let reliable = transport.reliable();
-    let lan_peer = match &transport {
-        Transport::Lan(h) => {
+    let io_stats = transport.io.clone();
+    let usb_stats = transport.usb_stats();
+    let lan_peer = match &transport.kind {
+        TransportKind::Lan(h) => {
             // Forget the previous client and any stale datagrams.
             *h.peer.lock().unwrap() = None;
             while h.rx.lock().unwrap().try_recv().is_ok() {}
@@ -789,10 +925,15 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
         }
         _ => None,
     };
+    let session_otp = ctx.otp_for(link);
     let mut session =
-        HostSession::new(transport, ctx.kp.clone(), &ctx.otp, rv_session::USB_HOST_ID).map_err(|e| e.to_string())?;
+        HostSession::new(transport, ctx.kp.clone(), &session_otp, rv_session::USB_HOST_ID).map_err(|e| e.to_string())?;
     session.set_codec(rv_proto::codec_flags::CODEC_H264);
-    let session_otp = ctx.otp.clone();
+    ctx.sh.usb_link_open.store(link != "lan", Ordering::Relaxed);
+    ctx.sh.dev_refresh.store(true, Ordering::Relaxed);
+    let _guard = LinkGuard(ctx.sh.clone());
+    let mut last_dbg = Instant::now();
+    let mut last_session_err = String::new();
     ctx.set_status(State::Waiting, link, None, waiting_message(link));
 
     let (mut established, mut streaming, mut connecting) = (false, false, false);
@@ -807,7 +948,7 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
             ctx.sh.ready.store(false, Ordering::Relaxed);
             return Ok(End::Stop);
         }
-        if otp_changed && !established {
+        if otp_changed && !established && link != "usb" {
             // The PSK is bound at session creation: restart with the new OTP.
             return Ok(End::Reopen);
         }
@@ -846,7 +987,10 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                                 ctx.set_status(State::Waiting, l, p, &msg);
                             }
                         }
-                        e => warn!("session: {e}"),
+                        e => {
+                            last_session_err = e.to_string();
+                            warn!("session: {e}");
+                        }
                     }
                 }
             }
@@ -860,6 +1004,40 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
         if last_tick.elapsed() >= Duration::from_millis(100) {
             session.tick(Instant::now());
             last_tick = Instant::now();
+        }
+        if last_dbg.elapsed() >= Duration::from_secs(2) {
+            last_dbg = Instant::now();
+            let stage = if streaming {
+                "streaming"
+            } else if established {
+                "established (waiting for first video frame)"
+            } else if connecting {
+                "handshake in progress (client msg1 seen, not yet established)"
+            } else if io_stats.dg_in.load(Ordering::Relaxed) == 0 {
+                "idle (no datagram received from client yet)"
+            } else {
+                "handshake (datagrams seen, not established)"
+            };
+            let raw = usb_stats
+                .as_ref()
+                .map(|u| {
+                    format!(
+                        " usb_raw_in={}B usb_raw_out={}B write_errors={} pipe_err={:?}",
+                        u.raw_in_bytes.load(Ordering::Relaxed),
+                        u.raw_out_bytes.load(Ordering::Relaxed),
+                        u.write_errors.load(Ordering::Relaxed),
+                        u.last_error().unwrap_or_default()
+                    )
+                })
+                .unwrap_or_default();
+            info!(
+                "link-stats link={link} stage={stage} in={}dg/{}B out={}dg/{}B{raw} last_session_err={:?}",
+                io_stats.dg_in.load(Ordering::Relaxed),
+                io_stats.bytes_in.load(Ordering::Relaxed),
+                io_stats.dg_out.load(Ordering::Relaxed),
+                io_stats.bytes_out.load(Ordering::Relaxed),
+                last_session_err,
+            );
         }
 
         while let Some(ev) = session.poll_session_event() {
@@ -886,7 +1064,9 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                     ctx.sh.paused.store(false, Ordering::Relaxed);
                     ctx.rtt_us = None;
                     ctx.set_status(State::Waiting, link, None, "Thiết bị đã ngắt kết nối, đang chờ kết nối lại...");
-                    if session_otp != ctx.otp {
+                    *ctx.sh.peer_name.lock().unwrap() = None;
+                    ctx.sh.dev_refresh.store(true, Ordering::Relaxed);
+                    if session_otp != ctx.otp_for(link) {
                         return Ok(End::Reopen);
                     }
                 }
@@ -924,6 +1104,13 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                         ctx.sh.bump();
                     }
                     info!("client Hello: codecs mask {codecs:#x} (hevc={hevc})");
+                }
+                HostSessionEvent::Control(ControlMessage::DeviceInfo { name }) => {
+                    info!("client DeviceInfo: {name:?}");
+                    *ctx.sh.peer_name.lock().unwrap() = Some(name.clone());
+                    ctx.sh.dev_refresh.store(true, Ordering::Relaxed);
+                    let (st, msg) = (ctx.state, ctx.message.clone());
+                    ctx.set_status(st, link, Some(name), &msg);
                 }
                 HostSessionEvent::Control(ControlMessage::FeedbackStats { rtt_us, .. }) => ctx.rtt_us = Some(rtt_us),
                 HostSessionEvent::Control(_) => {}
@@ -999,8 +1186,8 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
     }
 }
 
-fn run() -> Result<(), String> {
-    let a = match parse_args() {
+fn run(argv: Vec<String>) -> Result<(), String> {
+    let a = match parse_args(argv) {
         Ok(a) => a,
         Err(m) => {
             if !m.is_empty() {
@@ -1027,6 +1214,9 @@ fn run() -> Result<(), String> {
         cfg_gen: AtomicU32::new(0),
         codec_flag: AtomicU32::new(0),
         client_hevc: AtomicBool::new(true),
+        usb_link_open: AtomicBool::new(false),
+        peer_name: Mutex::new(None),
+        dev_refresh: AtomicBool::new(false),
     });
     let link0 = match a.mode {
         Mode::Usb => "usb",
@@ -1111,6 +1301,8 @@ fn run() -> Result<(), String> {
         sh,
         kp,
         otp,
+        usb_token: control::random_token(),
+        usb_switched: false,
         lan: None,
         injector,
         vrx,
@@ -1152,14 +1344,20 @@ fn run() -> Result<(), String> {
     }
 }
 
-fn main() {
-    if let Err(m) = run() {
-        if !m.is_empty() {
-            error!("{m}");
-            if control::json_mode() {
-                control::emit(&control::status_json(State::Error, "none", None, "", &m));
+/// Runs the host with CLI-style arguments (without the program name). Returns
+/// the process exit code; with `--json-status` it speaks the JSON contract of
+/// `CONTROL_PROTOCOL.md` on stdout/stdin.
+pub fn run_cli(argv: Vec<String>) -> i32 {
+    match run(argv) {
+        Ok(()) => 0,
+        Err(m) => {
+            if !m.is_empty() {
+                error!("{m}");
+                if control::json_mode() {
+                    control::emit(&control::status_json(State::Error, "none", None, "", &m));
+                }
             }
+            1
         }
-        std::process::exit(1);
     }
 }

@@ -121,6 +121,11 @@ fn run<I: DatagramIo, S: EventSink>(
                 if let Err(e) = client.send_control(cfg.hello_message()) {
                     log::warn!("hello failed: {e}");
                 }
+                if let Some(info) = cfg.device_info_message() {
+                    if let Err(e) = client.send_control(info) {
+                        log::warn!("device info failed: {e}");
+                    }
+                }
             }
             if matches!(ev, rv_session::ClientEvent::Disconnected) {
                 // Host vanished/restarted: go back to handshaking (retried by the tick below).
@@ -184,7 +189,7 @@ mod tests {
     }
 
     fn cfg(otp: &str) -> HelloConfig {
-        HelloConfig { otp: otp.into(), width: 1280, height: 800, refresh_hz: 60, codecs: rv_proto::codec_mask::H264 }
+        HelloConfig { otp: otp.into(), width: 1280, height: 800, refresh_hz: 60, codecs: rv_proto::codec_mask::H264, device_name: String::new() }
     }
 
     #[test]

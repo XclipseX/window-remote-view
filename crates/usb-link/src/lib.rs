@@ -15,7 +15,7 @@ pub mod aoa;
 pub mod framing;
 mod link;
 
-pub use link::UsbDatagramLink;
+pub use link::{LinkStats, UsbDatagramLink};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LinkError {

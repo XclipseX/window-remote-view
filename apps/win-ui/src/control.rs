@@ -61,6 +61,37 @@ pub struct DeviceItem {
     pub name: String,
     #[serde(default)]
     pub serial: String,
+    #[serde(default)]
+    pub vid: u16,
+    #[serde(default)]
+    pub pid: u16,
+    /// Already in Android Open Accessory mode (18D1:2D00/2D01).
+    #[serde(default)]
+    pub accessory: bool,
+    /// libusb can open it; false on Windows means the WinUSB driver is missing.
+    #[serde(default = "yes")]
+    pub driver_ok: bool,
+    #[serde(default)]
+    pub connected: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl From<rv_host_win::control::DeviceItem> for DeviceItem {
+    fn from(d: rv_host_win::control::DeviceItem) -> Self {
+        Self {
+            kind: d.kind,
+            name: d.name,
+            serial: d.serial,
+            vid: d.vid,
+            pid: d.pid,
+            accessory: d.accessory,
+            driver_ok: d.driver_ok,
+            connected: d.connected,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -90,6 +121,8 @@ pub enum HostCmd {
     SetResolution { width: u32, height: u32 },
     RequestIdr,
     NewOtp,
+    /// Retry the USB link now for this device card.
+    Connect { serial: String },
     Stop,
 }
 
@@ -139,7 +172,15 @@ mod tests {
     #[test]
     fn parse_devices_and_log() {
         let l = r#"{"event":"devices","items":[{"kind":"usb","name":"SM-X920","serial":"R1"}]}"#;
-        assert!(matches!(parse_event(l), Some(HostEvent::Devices { items }) if items.len() == 1));
+        assert!(matches!(parse_event(l), Some(HostEvent::Devices { items }) if items.len() == 1 && items[0].driver_ok));
+        let l = r#"{"event":"devices","items":[{"kind":"usb","name":"Galaxy Tab S10+ (SM-X826B)","serial":"1-5","vid":6353,"pid":11520,"accessory":true,"driver_ok":false,"connected":false}]}"#;
+        match parse_event(l) {
+            Some(HostEvent::Devices { items }) => {
+                assert!(items[0].accessory && !items[0].driver_ok);
+                assert_eq!(items[0].pid, 0x2d00);
+            }
+            o => panic!("{o:?}"),
+        }
         let l = r#"{"event":"log","level":"warn","msg":"x"}"#;
         assert!(matches!(parse_event(l), Some(HostEvent::Log { level: LogLevel::Warn, .. })));
         assert!(parse_event("garbage").is_none());
@@ -151,6 +192,7 @@ mod tests {
         assert_eq!(HostCmd::SetQuality { quality: 80 }.to_line(), "{\"cmd\":\"set_quality\",\"quality\":80}\n");
         assert_eq!(HostCmd::RequestIdr.to_line(), "{\"cmd\":\"request_idr\"}\n");
         assert_eq!(HostCmd::NewOtp.to_line(), "{\"cmd\":\"new_otp\"}\n");
+        assert_eq!(HostCmd::Connect { serial: "1-5".into() }.to_line(), "{\"cmd\":\"connect\",\"serial\":\"1-5\"}\n");
         assert_eq!(
             HostCmd::SetResolution { width: 1920, height: 1080 }.to_line(),
             "{\"cmd\":\"set_resolution\",\"width\":1920,\"height\":1080}\n"

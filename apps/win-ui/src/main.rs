@@ -4,10 +4,18 @@
 mod app;
 mod config;
 mod control;
+mod driver;
 mod host;
 mod util;
 
 fn main() -> eframe::Result {
+    // Single-executable layout: the host engine runs as this same exe in worker
+    // mode (JSON lines on stdin/stdout), so no separate rv-host.exe is shipped.
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some(host::WORKER_FLAG) {
+        let code = rv_host_win::engine::run_cli(args.collect());
+        std::process::exit(code);
+    }
     let demo = std::env::args().any(|a| a == "--demo");
     let viewport = eframe::egui::ViewportBuilder::default()
         .with_title("RemoteView")

@@ -42,6 +42,9 @@ pub struct HelloConfig {
     /// `codec_mask` bits from the optional `"codecs": ["hevc","h264","av1"]`
     /// field; defaults to H.264 only.
     pub codecs: u16,
+    /// Optional `"device_name"`, sent to the host as `DeviceInfo` right after
+    /// the handshake (empty = not sent).
+    pub device_name: String,
 }
 
 /// Parse codec names ("h264"/"avc", "hevc"/"h265", "av1") into a `codec_mask`.
@@ -72,6 +75,14 @@ fn codec_name(id: u8) -> &'static str {
     }
 }
 
+fn truncate_utf8(s: &str, max: usize) -> &str {
+    let mut n = s.len().min(max);
+    while !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    &s[..n]
+}
+
 impl HelloConfig {
     pub fn parse(json: &str) -> Result<Self, String> {
         let v: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("hello json: {e}"))?;
@@ -82,7 +93,17 @@ impl HelloConfig {
             height: num("display_height"),
             refresh_hz: num("display_refresh_hz"),
             codecs: parse_codec_mask(v.get("codecs")),
+            device_name: v
+                .get("device_name")
+                .and_then(|x| x.as_str())
+                .map(|s| truncate_utf8(s.trim(), rv_proto::MAX_DEVICE_NAME).to_string())
+                .unwrap_or_default(),
         })
+    }
+
+    /// The `DeviceInfo` sent right after the Hello, if a name was provided.
+    pub fn device_info_message(&self) -> Option<ControlMessage> {
+        (!self.device_name.is_empty()).then(|| ControlMessage::DeviceInfo { name: self.device_name.clone() })
     }
 
     /// The control Hello sent right after the handshake.
@@ -293,7 +314,7 @@ mod tests {
         let c = HelloConfig::parse(j).unwrap();
         assert_eq!(
             c,
-            HelloConfig { otp: "123456".into(), width: 2800, height: 1752, refresh_hz: 120, codecs: codec_mask::H264 }
+            HelloConfig { otp: "123456".into(), width: 2800, height: 1752, refresh_hz: 120, codecs: codec_mask::H264, device_name: String::new() }
         );
         assert_eq!(
             c.hello_message(),
@@ -311,6 +332,13 @@ mod tests {
         assert_eq!(c.codecs, codec_mask::AV1);
         assert_eq!(HelloConfig::parse(r#"{"codecs":[]}"#).unwrap().codecs, codec_mask::H264);
         assert!(HelloConfig::parse("nope").is_err());
+        let c = HelloConfig::parse(r#"{"otp":"1","device_name":" Galaxy Tab S10+ (SM-X826B) "}"#).unwrap();
+        assert_eq!(c.device_name, "Galaxy Tab S10+ (SM-X826B)");
+        assert_eq!(
+            c.device_info_message(),
+            Some(ControlMessage::DeviceInfo { name: "Galaxy Tab S10+ (SM-X826B)".into() })
+        );
+        assert!(HelloConfig::parse(r#"{"otp":"1"}"#).unwrap().device_info_message().is_none());
     }
 
     #[test]

@@ -80,6 +80,9 @@ pub enum Command {
     SetResolution { width: u32, height: u32 },
     RequestIdr,
     NewOtp,
+    /// Retry the USB link now (clears the LAN fallback backoff), for the
+    /// device card the user clicked. `serial` is the item's `serial` (may be empty).
+    Connect { serial: String },
     Stop,
 }
 
@@ -119,6 +122,9 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
         }
         "request_idr" => Ok(Command::RequestIdr),
         "new_otp" => Ok(Command::NewOtp),
+        "connect" => Ok(Command::Connect {
+            serial: v.get("serial").and_then(Value::as_str).unwrap_or("").to_string(),
+        }),
         "stop" => Ok(Command::Stop),
         other => Err(format!("unknown cmd `{other}`")),
     }
@@ -162,15 +168,48 @@ pub fn stats_json(s: &Stats) -> Value {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceItem {
     pub kind: String,
+    /// Friendly name when known (DeviceInfo / USB string), else "USB vvvv:pppp".
     pub name: String,
     pub serial: String,
+    pub vid: u16,
+    pub pid: u16,
+    /// Already in Android Open Accessory mode (18D1:2D00/2D01).
+    pub accessory: bool,
+    /// libusb can open the device (false on Windows = WinUSB driver missing).
+    pub driver_ok: bool,
+    /// This device is the one currently linked to the session.
+    pub connected: bool,
 }
 
 pub fn devices_json(items: &[DeviceItem]) -> Value {
     json!({
         "event": "devices",
-        "items": items.iter().map(|d| json!({"kind": d.kind, "name": d.name, "serial": d.serial})).collect::<Vec<_>>(),
+        "items": items.iter().map(|d| json!({
+            "kind": d.kind, "name": d.name, "serial": d.serial,
+            "vid": d.vid, "pid": d.pid, "accessory": d.accessory,
+            "driver_ok": d.driver_ok, "connected": d.connected,
+        })).collect::<Vec<_>>(),
     })
+}
+
+/// Random 8-digit numeric pairing token for the USB link (AOA serial = session OTP).
+pub fn random_token() -> String {
+    let mut b = [0u8; 8];
+    getrandom::getrandom(&mut b).expect("rng");
+    format!("{:08}", u64::from_le_bytes(b) % 100_000_000)
+}
+
+/// Windows computer name (shown to the tablet as the accessory description).
+pub fn computer_name() -> String {
+    for k in ["COMPUTERNAME", "HOSTNAME"] {
+        if let Ok(v) = std::env::var(k) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+    }
+    "Windows PC".into()
 }
 
 pub fn log_json(level: Level, msg: &str) -> Value {
@@ -206,6 +245,11 @@ mod tests {
         assert_eq!(parse_command(r#"{"cmd":"request_idr"}"#), Ok(Command::RequestIdr));
         assert_eq!(parse_command(r#"{"cmd":"new_otp"}"#), Ok(Command::NewOtp));
         assert_eq!(parse_command(r#"{"cmd":"stop"}"#), Ok(Command::Stop));
+        assert_eq!(
+            parse_command(r#"{"cmd":"connect","serial":"1-5"}"#),
+            Ok(Command::Connect { serial: "1-5".into() })
+        );
+        assert_eq!(parse_command(r#"{"cmd":"connect"}"#), Ok(Command::Connect { serial: String::new() }));
     }
 
     #[test]
@@ -263,13 +307,34 @@ mod tests {
 
     #[test]
     fn devices_and_log_shape() {
-        let v = devices_json(&[DeviceItem { kind: "usb".into(), name: "Samsung".into(), serial: "R5".into() }]);
+        let v = devices_json(&[DeviceItem {
+            kind: "usb".into(),
+            name: "Samsung".into(),
+            serial: "R5".into(),
+            vid: 0x18d1,
+            pid: 0x2d00,
+            accessory: true,
+            driver_ok: false,
+            connected: false,
+        }]);
         assert_eq!(v["items"][0]["kind"], "usb");
+        assert_eq!(v["items"][0]["pid"], 0x2d00);
+        assert_eq!(v["items"][0]["driver_ok"], false);
         assert_eq!(v["items"][0]["serial"], "R5");
         assert_eq!(devices_json(&[])["items"].as_array().unwrap().len(), 0);
         let v = log_json(Level::Warn, "hi \"there\"\n");
         assert_eq!(v["level"], "warn");
         assert!(!v.to_string().contains('\n'));
+    }
+
+    #[test]
+    fn token_is_eight_digits() {
+        for _ in 0..50 {
+            let t = random_token();
+            assert_eq!(t.len(), 8);
+            assert!(t.bytes().all(|b| b.is_ascii_digit()));
+        }
+        assert!(!computer_name().is_empty());
     }
 
     #[test]

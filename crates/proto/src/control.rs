@@ -19,6 +19,7 @@ pub mod op_code {
     pub const ACK: u8 = 0x09;
     pub const STREAM_CONFIG: u8 = 0x0A;
     pub const KEEPALIVE: u8 = 0x0B;
+    pub const DEVICE_INFO: u8 = 0x0C;
 }
 
 /// Codec capability bits for `Hello::codecs`.
@@ -76,7 +77,13 @@ pub enum ControlMessage {
         fps: u16,
         bitrate_kbps: u32,
     },
+    /// Client -> host, sent right after the handshake: the friendly device
+    /// name (UTF-8, at most [`MAX_DEVICE_NAME`] bytes), e.g. "Galaxy Tab S10+ (SM-X826B)".
+    DeviceInfo { name: String },
 }
+
+/// Longest accepted `DeviceInfo` name in bytes.
+pub const MAX_DEVICE_NAME: usize = 255;
 
 fn check_quality(q: u8) -> Result<()> {
     if (1..=100).contains(&q) {
@@ -101,6 +108,7 @@ impl ControlMessage {
             Self::Ack { .. } => ACK,
             Self::StreamConfig { .. } => STREAM_CONFIG,
             Self::Keepalive => KEEPALIVE,
+            Self::DeviceInfo { .. } => DEVICE_INFO,
         }
     }
 
@@ -190,6 +198,10 @@ impl ControlMessage {
                     put_u16(buf, *fps);
                     put_u32(buf, *bitrate_kbps);
                 }
+                Self::DeviceInfo { name } => {
+                    check_max("device name", name.len(), MAX_DEVICE_NAME)?;
+                    buf.extend_from_slice(name.as_bytes());
+                }
             }
             check_max("control payload", buf.len() - start, MAX_CONTROL_PAYLOAD)
         })
@@ -264,6 +276,12 @@ impl ControlMessage {
                 fps: r.u16()?,
                 bitrate_kbps: r.u32()?,
             },
+            DEVICE_INFO => {
+                check_max("device name", payload.len(), MAX_DEVICE_NAME)?;
+                let b = r.take(payload.len())?;
+                let s = core::str::from_utf8(b).map_err(|_| ProtoError::InvalidUtf8)?;
+                Self::DeviceInfo { name: s.to_owned() }
+            }
             other => return Err(ProtoError::UnknownOpCode(other)),
         };
         r.finish()?;
