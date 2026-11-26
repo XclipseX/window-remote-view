@@ -257,8 +257,8 @@ mod tests {
         assert_eq!(v["encode_ms"], 2.35);
         assert!(v["rtt_ms"].is_null());
         assert_eq!(v["encoder"], "mf-hevc-hw");
-        let v = stats_json(&Stats { rtt_ms: Some(3.14), ..s });
-        assert_eq!(v["rtt_ms"], 3.1);
+        let v = stats_json(&Stats { rtt_ms: Some(2.54), ..s });
+        assert_eq!(v["rtt_ms"], 2.5);
     }
 
     #[test]
