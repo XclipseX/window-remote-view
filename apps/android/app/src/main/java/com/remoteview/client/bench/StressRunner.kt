@@ -133,8 +133,8 @@ class StressRunner(
                 samples.add(s)
                 val copy = ArrayList(samples)
                 main.post { listener.onSample(copy) }
-                if (p.thermalStatus >= limit) {
-                    stopReason = "Dừng an toàn: trạng thái nhiệt ${thermalName(p.thermalStatus)} (>= ${thermalName(limit)})"
+                if (p.thermal >= limit) {
+                    stopReason = "Dừng an toàn: trạng thái nhiệt ${thermalName(p.thermal)} (>= ${thermalName(limit)})"
                     break
                 }
                 val bad = workers.firstOrNull { it.error != null }
