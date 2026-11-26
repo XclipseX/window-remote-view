@@ -8,6 +8,7 @@ import android.util.DisplayMetrics
 import android.view.Surface
 import com.remoteview.client.NativeBridge
 import com.remoteview.client.NativeInputSink
+import com.remoteview.client.RvLog
 import com.remoteview.client.StreamSettings
 import com.remoteview.client.audio.AudioPlayer
 import com.remoteview.client.decoder.AnnexB
@@ -26,7 +27,9 @@ import com.remoteview.client.perf.ThermalGovernor
 import com.remoteview.client.render.DisplayLock
 import com.remoteview.client.render.FramePresenter
 import com.remoteview.client.ui.RemoteSurfaceView
+import com.remoteview.client.usb.AccessoryLink
 import com.remoteview.client.usb.DatagramLink
+import com.remoteview.client.usb.DeviceName
 import com.remoteview.client.usb.DisplayCaps
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -39,6 +42,8 @@ class SessionController(
     private val settings: StreamSettings,
     /** Chế độ "Màn hình phụ (USB)": toàn màn hình, cảm ứng trực tiếp 1:1, host tạo màn hình ảo khớp. */
     val usbDisplay: Boolean = false,
+    /** OTP tự động (accessory.serial); null = dùng PIN đã lưu trong cài đặt. */
+    private val otp: String? = null,
 ) {
     @Volatile var nativeHandle: Long = 0L
 
@@ -50,7 +55,8 @@ class SessionController(
     ) { s, fx, fy -> view?.applyZoom(s, fx, fy) }
     private val directTouch = if (usbDisplay) DirectTouchMapper(sink) else null
     private val baseFps = if (usbDisplay) DisplayCaps.nativeDisplay(activity).refreshHz else settings.fps
-    val helloJson: String get() = DisplayCaps.helloJson(activity, settings, usbDisplay)
+    val helloJson: String get() = DisplayCaps.helloJson(activity, settings, usbDisplay, otp, deviceName)
+    private val deviceName: String = DeviceName.friendly(activity)
 
     private var audio: AudioPlayer? = null
     private var link: DatagramLink? = null
@@ -79,6 +85,41 @@ class SessionController(
     private var effectiveFps = baseFps
     private var lastFrameSubmitMs = 0L
 
+    // --- Số liệu gỡ lỗi ---
+    @Volatile private var dbgState = -1
+    @Volatile private var dbgMessage = ""
+    @Volatile private var dbgLastError = ""
+    @Volatile private var dbgEstablishedAt = 0L
+    @Volatile private var dbgHandshake = "chưa mở liên kết"
+    private val dbgFramesSubmitted = java.util.concurrent.atomic.AtomicLong()
+
+    fun debugSnapshot(): DebugSnapshot {
+        val l = link
+        val aoa = l as? AccessoryLink
+        return DebugSnapshot(
+            linkType = l?.name ?: "-",
+            linkOpen = l?.isOpen == true,
+            aoaOpened = if (aoa == null) "-" else if (aoa.fdOpened) "có" else if (aoa.permissionGranted) "đang mở" else "chờ quyền",
+            bytesIn = l?.bytesIn ?: 0,
+            bytesOut = l?.bytesOut ?: 0,
+            datagramsIn = l?.datagramsIn ?: 0,
+            datagramsOut = l?.datagramsOut ?: 0,
+            handshake = dbgHandshake,
+            nativeState = dbgState,
+            nativeMessage = dbgMessage,
+            nativeHandle = nativeHandle,
+            decoderName = decoder?.info?.codecName ?: "-",
+            framesSubmitted = dbgFramesSubmitted.get(),
+            framesDecoded = decoder?.framesOut?.get() ?: 0,
+            lastError = dbgLastError,
+            establishedAtMs = dbgEstablishedAt,
+        )
+    }
+
+    fun recordError(msg: String) { dbgLastError = msg; RvLog.e("phiên: $msg") }
+
+    fun onAudio(data: ByteArray, codec: Int) { audio?.submit(data, codec) }
+
     fun bindView(v: RemoteSurfaceView) {
         view = v
         v.bind(touch, stylus, keyboard, directTouch)
@@ -91,16 +132,53 @@ class SessionController(
      */
     fun attachLink(l: DatagramLink) {
         link = l
-        NativeBridge.datagramSender = { bytes -> l.send(bytes) }
+        RvLog.i("attachLink: ${l.name}, native=${NativeBridge.available}, otp=${if (otp != null) "tự động" else "PIN lưu"}")
+        // Gói Rust gửi ra phải được ghi vào liên kết NGAY từ khi phiên native tạo xong: đặt sender trước.
+        NativeBridge.datagramSender = { bytes ->
+            val ok = l.send(bytes)
+            if (!ok) RvLog.w("datagramSender: liên kết từ chối ${bytes.size}B")
+        }
         l.listener = object : DatagramLink.Listener {
             override fun onOpen() {
-                if (NativeBridge.available) nativeHandle = NativeBridge.nativeConnectLink(helloJson)
+                RvLog.i("liên kết ${l.name} đã mở -> tạo phiên native")
+                if (!NativeBridge.available) {
+                    recordError("librv_core.so chưa nạp, không thể bắt tay")
+                    dbgHandshake = "không có lõi native"
+                    return
+                }
+                try {
+                    nativeHandle = NativeBridge.nativeConnectLink(helloJson)
+                } catch (t: Throwable) {
+                    recordError("nativeConnectLink ném lỗi: ${t.javaClass.simpleName}: ${t.message}")
+                    dbgHandshake = "lỗi native"
+                    onNativeFailed?.invoke(t.message)
+                    return
+                }
+                RvLog.i("nativeConnectLink -> handle=$nativeHandle")
+                if (nativeHandle == 0L) {
+                    recordError("nativeConnectLink trả 0 (hello/OTP không hợp lệ?)")
+                    dbgHandshake = "native từ chối tạo phiên"
+                    onNativeFailed?.invoke("lõi từ chối tạo phiên (OTP?)")
+                } else {
+                    dbgHandshake = "đã tạo phiên, chờ host trả lời Hello"
+                }
             }
             override fun onDatagram(data: ByteArray) {
                 val h = nativeHandle
-                if (NativeBridge.available && h != 0L) NativeBridge.nativePushDatagram(h, data)
+                if (NativeBridge.available && h != 0L) {
+                    try { NativeBridge.nativePushDatagram(h, data) } catch (t: Throwable) {
+                        recordError("nativePushDatagram: ${t.message}")
+                    }
+                } else {
+                    RvLog.w("datagram ${data.size}B tới khi chưa có phiên native (handle=$h) -> bỏ")
+                }
             }
-            override fun onClosed(reason: String?) { onLinkClosed?.invoke(reason) }
+            override fun onClosed(reason: String?) {
+                RvLog.w("liên kết ${l.name} đóng: ${reason ?: "-"}")
+                if (reason != null) dbgLastError = reason
+                dbgHandshake = "liên kết đã đóng"
+                onLinkClosed?.invoke(reason)
+            }
         }
         l.start()
     }
@@ -133,14 +211,6 @@ class SessionController(
         }).also { it.start() }
 
         if (settings.audioEnabled && audio == null) audio = AudioPlayer().also { it.start() }
-
-        NativeBridge.callbacks = object : NativeBridge.Callbacks {
-            override fun onVideoFrame(data: ByteArray, ptsUs: Long, flags: Int) = submitFrame(data, ptsUs, flags)
-            override fun onAudioPacket(data: ByteArray, ptsUs: Long, codec: Int) { audio?.submit(data, codec) }
-            override fun onConnectionState(state: Int, message: String?) = onNativeState(state, message)
-            override fun onHostDiscovered(name: String, address: String) {}
-            override fun onStats(rttMs: Float, bitrateKbps: Int, lossPercent: Float) {}
-        }
     }
 
     /** Dựng decoder + presenter + watchdog theo [streamConfig] (nếu có) hoặc kích thước màn hình. */
@@ -170,7 +240,12 @@ class SessionController(
         dec.onOutput = pres::onOutput
         decoder = dec
         presenter = pres
-        if (dec.start(s)) {
+        val started = dec.start(s)
+        RvLog.i("decoder start=$started name=${dec.info?.codecName} ${w}x$h@$fps")
+        if (!started) dbgLastError = "decoder không khởi động được"
+        if (started) {
+            // Frame tới trước khi decoder sẵn sàng đã bị bỏ: xin keyframe để không bị đen.
+            keyFrame()
             watchdog = StallWatchdog(object : StallWatchdog.Host {
                 override val lastInputMs get() = dec.lastInputMs
                 override val lastOutputMs get() = dec.lastOutputMs
@@ -205,11 +280,22 @@ class SessionController(
         return StreamConfig(mime, w, h, fps)
     }
 
-        fun onNativeState(state: Int, message: String?) {
+    fun onNativeState(state: Int, message: String?) {
+        RvLog.i("native state=$state msg=${message ?: ""}")
+        dbgState = state
+        dbgMessage = message ?: ""
+        when (state) {
+            NativeBridge.STATE_CONNECTING -> dbgHandshake = "đang bắt tay"
+            NativeBridge.STATE_CLOSED -> dbgHandshake = "đã đóng"
+            NativeBridge.STATE_FAILED -> { dbgHandshake = "thất bại"; dbgLastError = message ?: "native FAILED" }
+            NativeBridge.STATE_DISCONNECTED -> dbgHandshake = "host im lặng"
+            NativeBridge.STATE_ESTABLISHED -> { dbgHandshake = "đã bắt tay"; if (dbgEstablishedAt == 0L) dbgEstablishedAt = SystemClock.elapsedRealtime() }
+        }
         when (state) {
             NativeBridge.STATE_FAILED -> onNativeFailed?.invoke(message)
             NativeBridge.STATE_DISCONNECTED -> _reconnecting.value = true
             NativeBridge.STATE_ESTABLISHED -> {
+                if (NativeBridge.available && nativeHandle != 0L) NativeBridge.nativeRequestKeyFrame(nativeHandle)
                 val was = _reconnecting.value
                 _reconnecting.value = false
                 if (was) {
@@ -232,6 +318,7 @@ class SessionController(
     }
 
     fun submitFrame(data: ByteArray, ptsUs: Long, flags: Int) {
+        dbgFramesSubmitted.incrementAndGet()
         val dec = decoder ?: return
         val mime = dec.info?.mime ?: "video/hevc"
         val key = (flags and NativeBridge.FLAG_KEYFRAME) != 0 || AnnexB.containsKeyFrame(data, mime)
@@ -241,7 +328,6 @@ class SessionController(
     }
 
     fun onSurfaceDestroyed() {
-        NativeBridge.callbacks = null
         thermal?.stop(); thermal = null
         stopVideo()
         adpf?.close(); adpf = null

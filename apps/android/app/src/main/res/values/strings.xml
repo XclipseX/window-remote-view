@@ -321,4 +321,20 @@
     <string name="bench_min">%1$d phút</string>
     <string name="bench_sec">%1$d giây</string>
     <string name="session_reconnecting">Mất kết nối — đang kết nối lại…</string>
+    <string name="settings_usb_auto">Tự kết nối khi cắm USB</string>
+    <string name="settings_usb_auto_hint">Cắm cáp là vào luôn, không cần bấm Kết nối</string>
+    <string name="settings_debug_overlay">Lớp phủ gỡ lỗi trong phiên</string>
+    <string name="settings_debug_overlay_hint">Hiện khi chưa có hình; nhấn giữ góc trên phải để bật/tắt</string>
+    <string name="usb_card_title">Máy tính: %1$s — đã cắm USB</string>
+    <string name="usb_card_connect">Kết nối</string>
+    <string name="usb_card_connecting">Đang kết nối…</string>
+    <string name="usb_card_error">Lỗi: %1$s</string>
+    <string name="session_waiting_frame">Đã kết nối, đang chờ hình…</string>
+    <string name="home_log">Nhật ký kết nối</string>
+    <string name="log_title">Nhật ký kết nối</string>
+    <string name="log_copy">Sao chép</string>
+    <string name="log_clear">Xóa</string>
+    <string name="log_copied">Đã sao chép nhật ký</string>
+    <string name="log_empty">Chưa có dòng nhật ký nào.</string>
+    <string name="log_back">Quay lại</string>
 </resources>

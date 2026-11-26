@@ -23,10 +23,24 @@ Máy đích: Galaxy S26+ (Exynos 2600, `c2.exynos.*`) và Galaxy Tab S10+ (Dimen
 - `NativeBridge.nativeConnectLink(helloJson)` tạo phiên `rv-session` `ClientSession` chạy ở thread riêng của Rust; datagram từ
   AOA/ADB đi vào bằng `nativePushDatagram`, gói gửi đi quay về Kotlin qua `onSendDatagramFromNative`. Video (Annex-B, H.264),
   gói Opus thô, trạng thái, thống kê trả lên qua các hàm `on*FromNative`. `nativeConnect` (LAN/server) **chưa cài** (trả 0).
-- **Ghép đôi:** host in `OTP: dddddd` khi khởi động (hoặc cố định bằng `rv-host --otp 123456`). Người dùng nhập mã này (PIN 6–9 số)
-  ở hộp thoại khi bấm "Màn hình phụ (USB)"; được lưu trong SharedPreferences (`usb_otp`) và gửi cho Rust trong trường `"otp"` của
-  helloJson. Cả hai phía dẫn khóa PSK bằng Argon2id(OTP, `host_id`), `host_id` là hằng cố định `rv_session::USB_HOST_ID`
-  (`rv-host-win-0001`) vì chưa có hello trước bắt tay. Sai PIN: host im lặng, sau ~4 s app báo lỗi và hỏi lại PIN.
+- **Ghép đôi (USB accessory, không cần gõ PIN):** host đặt chuỗi AOA `manufacturer="RemoteView"`, `model="RemoteViewHost"`,
+  `description=<tên máy Windows>`, `version="2"`, `serial=<token 8 chữ số>`. App dùng `accessory.serial` (khớp `^\d{6,9}$`) làm OTP
+  tự động, gửi cho Rust trong trường `"otp"` của helloJson, kèm `"device_name"` (ví dụ `Galaxy Tab S10+ (SM-X826B)`; SM-X82x → Galaxy Tab S10+,
+  SM-S947 → Galaxy S26+, còn lại `Settings.Global.device_name` / `Build.MODEL`). Cả hai phía dẫn khóa PSK bằng Argon2id(OTP, `host_id`),
+  `host_id` là hằng cố định `rv_session::USB_HOST_ID`. Hộp thoại PIN chỉ còn cho đường ADB reverse / host cũ không có serial hợp lệ
+  (PIN lưu trong `usb_otp`).
+- **Màn hình chính:** khi accessory đang cắm hiện thẻ "Máy tính: <tên máy> — đã cắm USB" với nút "Kết nối" lớn. Mặc định tự kết nối
+  một lần mỗi lần cắm (cài đặt "Tự kết nối khi cắm USB" để tắt). App cũng đọc `UsbManager.accessoryList` ở `onResume`, nên mở từ
+  launcher khi đã cắm sẵn vẫn nhận.
+- **Gỡ lỗi:** trong phiên có lớp phủ (link, AOA fd, byte/datagram vào-ra, bắt tay, state native, decoder, số frame, lỗi cuối); mặc định hiện
+  khi chưa có hình, nhấn giữ góc trên phải để bật/tắt (góc này không chuyển cảm ứng cho host). "Nhật ký kết nối" ở màn hình chính
+  hiển thị vòng đệm 500 dòng log của app (`RvLog`, tag logcat `RemoteView`), sao chép được. Nếu đã bắt tay nhưng 3 s chưa có frame:
+  "Đã kết nối, đang chờ hình…".
+- **Lỗi đã sửa (thiết bị thật: host mở AOA nhưng không nhận handshake):** (1) bắt buộc có PIN đã lưu mới kết nối, nếu không chỉ hiện hộp thoại ->
+  Hello không bao giờ gửi; (2) thread đọc AOA đọc header 4 byte một lần: driver accessory của kernel bỏ phần dư của gói bulk nếu buffer đọc nhỏ hơn
+  gói -> nay đọc khối 16 KiB rồi tự tách record; (3) chỉ kiểm tra accessory khi nhận intent, không kiểm tra ở `onResume`; (4) thread ghi khởi động
+  sau `onOpen` (nay trước); (5) `NativeBridge.callbacks` bị đặt null khi surface hủy -> mất state/video; (6) frame tới trước khi decoder sẵn sàng bị bỏ và
+  không xin keyframe -> màn hình đen; (7) `nativeConnectLink` trả 0 / ném lỗi bị nuốt im lặng.
 - Hello (độ phân giải gốc + tần số quét) gửi ngay sau bắt tay; host hiện chưa dùng nó (đọc `--mode` từ dòng lệnh).
 - Opus giải mã trong Kotlin bằng `MediaCodec` "audio/opus" (`AudioPlayer`); không build libopus cho Android.
 - Host chỉ nhận một lần bắt tay mỗi lần chạy: nối lại sau khi rút cáp cần khởi động lại `rv-host`.

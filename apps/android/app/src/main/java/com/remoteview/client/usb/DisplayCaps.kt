@@ -59,7 +59,13 @@ object DisplayCaps {
      * màn hình ảo khớp (IDD) thay vì chụp màn hình có sẵn.
      * Lõi Rust đọc display_width/height/refresh_hz (-> ControlMessage::Hello) và "otp" (PIN ghép đôi với host).
      */
-    fun helloJson(activity: Activity, settings: StreamSettings, usbDisplay: Boolean): String {
+    fun helloJson(
+        activity: Activity,
+        settings: StreamSettings,
+        usbDisplay: Boolean,
+        otp: String? = null,
+        deviceName: String = DeviceName.friendly(activity),
+    ): String {
         val nd = nativeDisplay(activity)
         val k = if (usbDisplay) 1f else settings.resolutionPercent / 100f
         fun even(v: Float) = (v.toInt() / 2) * 2
@@ -70,7 +76,8 @@ object DisplayCaps {
             put("display_refresh_hz", if (usbDisplay) nd.refreshHz else settings.fps)
             put("create_virtual_display", usbDisplay)
             put("touch", JSONObject().put("max_points", 10).put("absolute_max", 65535))
-            put("otp", settings.usbOtp)
+            put("otp", otp ?: settings.usbOtp)
+            put("device_name", deviceName)
             put("pen", true)
             put("codecs", JSONArray().also { a -> advertisedCodecs(settings).forEach { a.put(it) } })
             put("audio", JSONObject().apply {

@@ -8,6 +8,16 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.text.style.TextAlign
+import android.os.SystemClock
+import kotlinx.coroutines.delay
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
@@ -37,7 +47,7 @@ import com.remoteview.client.session.SessionController
 
 /** Màn hình điều khiển: SurfaceView toàn màn + thanh phím nổi. */
 @Composable
-fun SessionScreen(controller: SessionController, showModifierBar: Boolean = true) {
+fun SessionScreen(controller: SessionController, showModifierBar: Boolean = true, debugEnabled: Boolean = true) {
     val usb = controller.usbDisplay
     val view = LocalView.current
     if (usb) {
@@ -106,6 +116,49 @@ fun SessionScreen(controller: SessionController, showModifierBar: Boolean = true
                 )
             }
         }
+        // --- Gỡ lỗi + chờ hình ---
+        var tick by remember { mutableStateOf(0) }
+        LaunchedEffect(Unit) { while (true) { tick++; delay(500) } }
+        val snap = remember(tick) { controller.debugSnapshot() }
+        val now = SystemClock.elapsedRealtime()
+        val streaming = snap.framesDecoded > 0
+        val waitingFrame = snap.establishedAtMs > 0 && !streaming && now - snap.establishedAtMs > 3000
+        var manual by remember { mutableStateOf<Boolean?>(null) }
+        val overlayVisible = manual ?: (debugEnabled && !streaming)
+        if (waitingFrame) {
+            Text(
+                stringResource(R.string.session_waiting_frame),
+                color = Color.White,
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .background(Color(0xCC000000), RoundedCornerShape(16.dp))
+                    .padding(horizontal = 20.dp, vertical = 12.dp),
+            )
+        }
+        if (overlayVisible) {
+            Text(
+                debugText(snap, now),
+                color = Color(0xFF9CFF9C),
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+                lineHeight = 13.sp,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(top = 8.dp, start = 8.dp)
+                    .background(Color(0xB3000000), RoundedCornerShape(8.dp))
+                    .padding(8.dp),
+            )
+        }
+        // Nhấn giữ góc trên-phải để bật/tắt lớp phủ (góc này không chuyển cảm ứng cho host).
+        Box(
+            Modifier
+                .align(Alignment.TopEnd)
+                .size(64.dp)
+                .pointerInput(overlayVisible) {
+                    detectTapGestures(onLongPress = { manual = !overlayVisible })
+                },
+        )
         if (showModifierBar) {
             ModifierBar(
                 keyboard = controller.keyboard,
@@ -122,4 +175,18 @@ fun SessionScreen(controller: SessionController, showModifierBar: Boolean = true
 fun rememberSessionController(settings: StreamSettings): SessionController {
     val activity = LocalContext.current as Activity
     return remember(settings) { SessionController(activity, settings) }
+}
+
+private fun debugText(d: com.remoteview.client.session.DebugSnapshot, now: Long): String {
+    val est = if (d.establishedAtMs > 0) "${(now - d.establishedAtMs) / 1000}s" else "chưa"
+    return buildString {
+        appendLine("link: ${d.linkType} mở=${if (d.linkOpen) "có" else "không"}  AOA fd: ${d.aoaOpened}")
+        appendLine("byte vào/ra: ${d.bytesIn} / ${d.bytesOut}")
+        appendLine("datagram vào/ra: ${d.datagramsIn} / ${d.datagramsOut}")
+        appendLine("bắt tay: ${d.handshake} (handle=${d.nativeHandle}, established: $est)")
+        appendLine("native: state=${d.nativeState} \"${d.nativeMessage}\"")
+        appendLine("decoder: ${d.decoderName}")
+        appendLine("frame nhận/giải mã: ${d.framesSubmitted} / ${d.framesDecoded}")
+        append("lỗi cuối: ${d.lastError.ifEmpty { "-" }}")
+    }
 }

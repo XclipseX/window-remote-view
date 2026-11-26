@@ -13,6 +13,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.foundation.layout.height
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ListItem
@@ -42,6 +44,9 @@ data class LanHost(val name: String, val address: String)
 /** Hộp thoại PIN ghép đôi USB; [error] != null: lần trước lỗi (sai PIN / host không trả lời). */
 data class PinPrompt(val error: String?)
 
+/** Máy tính (host AOA) đang cắm cáp USB. [description] = tên máy Windows do host đặt. */
+data class UsbHostInfo(val description: String, val serial: String?)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(
@@ -55,6 +60,11 @@ fun HomeScreen(
     onPinDismiss: () -> Unit = {},
     onDiagnostics: () -> Unit = {},
     onBench: () -> Unit = {},
+    usbHost: UsbHostInfo? = null,
+    usbBusy: Boolean = false,
+    usbError: String? = null,
+    onUsbConnect: () -> Unit = {},
+    onLog: () -> Unit = {},
 ) {
     var id by rememberSaveable { mutableStateOf("") }
     val context = LocalContext.current
@@ -99,6 +109,33 @@ fun HomeScreen(
             modifier = Modifier.fillMaxSize().padding(padding).padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            if (usbHost != null) {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text(
+                            stringResource(R.string.usb_card_title, usbHost.description.ifBlank { "?" }),
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+                        if (usbError != null) {
+                            Text(
+                                stringResource(R.string.usb_card_error, usbError),
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        Button(
+                            onClick = onUsbConnect,
+                            enabled = !usbBusy,
+                            modifier = Modifier.fillMaxWidth().height(64.dp),
+                        ) {
+                            Text(
+                                stringResource(if (usbBusy) R.string.usb_card_connecting else R.string.usb_card_connect),
+                                style = MaterialTheme.typography.titleLarge,
+                            )
+                        }
+                    }
+                }
+            }
             Text(stringResource(R.string.home_connect_to), style = MaterialTheme.typography.titleMedium)
             OutlinedTextField(
                 value = id,
@@ -120,6 +157,10 @@ fun HomeScreen(
                 Text(stringResource(R.string.home_usb_display))
             }
             Text(stringResource(R.string.home_usb_display_hint), style = MaterialTheme.typography.bodySmall)
+
+            OutlinedButton(onClick = onLog, modifier = Modifier.fillMaxWidth()) {
+                Text(stringResource(R.string.home_log))
+            }
 
             OutlinedButton(onClick = onDiagnostics, modifier = Modifier.fillMaxWidth()) {
                 Text(stringResource(R.string.home_diag))

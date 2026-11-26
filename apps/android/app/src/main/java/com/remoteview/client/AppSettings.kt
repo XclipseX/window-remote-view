@@ -25,6 +25,10 @@ data class StreamSettings(
     val usbShowModifierBar: Boolean = false,
     /** PIN/OTP 6-9 chữ số của rv-host (in ra khi host khởi động, hoặc cố định bằng `--otp`). */
     val usbOtp: String = "",
+    /** Tự kết nối ngay khi cắm cáp (host AOA). */
+    val autoConnectUsb: Boolean = true,
+    /** Cho phép lớp phủ gỡ lỗi (hiện khi chưa có hình). */
+    val debugOverlay: Boolean = true,
 ) {
     /** Placeholder: 5..120 Mbps tuyến tính theo chất lượng (mặc định LAN 60–120 Mbps). */
     fun targetBitrateKbps(): Int = 5_000 + ((qualityPercent.coerceIn(1, 100) - 1) / 99f * 115_000).toInt()
@@ -55,6 +59,8 @@ class SettingsRepository(context: Context) {
             audioEnabled = prefs.getBoolean("audio", d.audioEnabled),
             usbShowModifierBar = prefs.getBoolean("usb_mod_bar", d.usbShowModifierBar),
             usbOtp = prefs.getString("usb_otp", d.usbOtp) ?: d.usbOtp,
+            autoConnectUsb = prefs.getBoolean("usb_auto", d.autoConnectUsb),
+            debugOverlay = prefs.getBoolean("dbg_overlay", d.debugOverlay),
         )
     }
 
@@ -72,6 +78,8 @@ class SettingsRepository(context: Context) {
             .putBoolean("audio", s.audioEnabled)
             .putBoolean("usb_mod_bar", s.usbShowModifierBar)
             .putString("usb_otp", s.usbOtp)
+            .putBoolean("usb_auto", s.autoConnectUsb)
+            .putBoolean("dbg_overlay", s.debugOverlay)
             .apply()
     }
 }

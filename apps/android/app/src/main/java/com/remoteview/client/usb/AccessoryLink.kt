@@ -9,8 +9,8 @@ import android.hardware.usb.UsbAccessory
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.ParcelFileDescriptor
-import android.util.Log
 import androidx.core.content.ContextCompat
+import com.remoteview.client.RvLog
 import java.io.FileInputStream
 import java.io.FileOutputStream
 
@@ -38,30 +38,57 @@ class AccessoryLink(context: Context) : FramedStreamLink("aoa") {
                 ACTION_PERMISSION -> {
                     val acc = accessoryFrom(intent) ?: accessory
                     val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-                    if (acc != null && granted) openAccessory(acc) else fail("chưa được cấp quyền USB accessory")
+                    RvLog.i("AOA: kết quả xin quyền granted=$granted acc=${acc != null}")
+                    if (acc != null && granted) { permissionGranted = true; openAccessory(acc) }
+                    else fail("chưa được cấp quyền USB accessory")
                 }
                 UsbManager.ACTION_USB_ACCESSORY_DETACHED -> {
                     val acc = accessoryFrom(intent)
                     val cur = accessory
-                    if (cur == null || acc == null || acc == cur) fail("đã rút cáp USB")
+                    if (cur == null || acc == null || acc == cur) {
+                        RvLog.w("AOA: accessory bị rút")
+                        fail("đã rút cáp USB")
+                    }
                 }
             }
         }
     }
 
+    /** Số serial (token ghép đôi 8 chữ số do host đặt) của accessory đang dùng; null nếu chưa biết. */
+    val serial: String? get() = accessory?.serial
+
+    @Volatile var permissionGranted = false
+        private set
+    @Volatile var fdOpened = false
+        private set
+
     override fun start() {
-        val acc = findAccessory(ctx) ?: run { fail("không có accessory"); return }
+        val acc = findAccessory(ctx) ?: run {
+            RvLog.e("AOA: không thấy accessory RemoteView trong accessoryList")
+            fail("không có accessory"); return
+        }
         accessory = acc
+        RvLog.i("AOA: tìm thấy accessory '${acc.manufacturer}/${acc.model}' desc='${acc.description}' ver='${acc.version}'")
         registerReceiver()
         if (usb.hasPermission(acc)) {
+            permissionGranted = true
+            RvLog.i("AOA: đã có quyền, mở accessory")
             openAccessory(acc)
         } else {
+            // Android 12+ bắt buộc FLAG_MUTABLE cho PendingIntent của requestPermission (hệ thống điền extras).
+            // Intent phải có package (explicit) để hợp lệ với targetSdk 34+.
             val flags = PendingIntent.FLAG_UPDATE_CURRENT or
                 (if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0)
             val pi = PendingIntent.getBroadcast(
                 ctx, 0, Intent(ACTION_PERMISSION).setPackage(ctx.packageName), flags,
             )
-            usb.requestPermission(acc, pi)
+            RvLog.i("AOA: xin quyền USB accessory")
+            try {
+                usb.requestPermission(acc, pi)
+            } catch (e: Exception) {
+                RvLog.e("AOA: requestPermission lỗi", e)
+                fail(e.message)
+            }
         }
     }
 
@@ -70,10 +97,12 @@ class AccessoryLink(context: Context) : FramedStreamLink("aoa") {
             try {
                 val fd = usb.openAccessory(acc) ?: throw IllegalStateException("openAccessory trả về null")
                 pfd = fd
+                fdOpened = true
+                RvLog.i("AOA: openAccessory OK (fd=${fd.fd})")
                 val fileDesc = fd.fileDescriptor
                 runStreams(FileInputStream(fileDesc), FileOutputStream(fileDesc))
             } catch (e: Exception) {
-                Log.w(TAG, "mở accessory lỗi: ${e.message}")
+                RvLog.e("AOA: mở accessory lỗi", e)
                 fail(e.message)
             }
         }, "rv-aoa-open").also { it.isDaemon = true; it.start() }
@@ -85,8 +114,11 @@ class AccessoryLink(context: Context) : FramedStreamLink("aoa") {
             addAction(ACTION_PERMISSION)
             addAction(UsbManager.ACTION_USB_ACCESSORY_DETACHED)
         }
-        ContextCompat.registerReceiver(ctx, receiver, f, ContextCompat.RECEIVER_NOT_EXPORTED)
+        // Android 13+: phải khai báo cờ. Hệ thống gửi kết quả quyền từ tiến trình system_server nên dùng EXPORTED
+        // (intent đã giới hạn theo package của app; kết quả giả cũng không mở được accessory nếu chưa có quyền thật).
+        ContextCompat.registerReceiver(ctx, receiver, f, ContextCompat.RECEIVER_EXPORTED)
         receiverRegistered = true
+        RvLog.i("AOA: đã đăng ký receiver (API ${Build.VERSION.SDK_INT})")
     }
 
     override fun closeResources() {
@@ -104,17 +136,25 @@ class AccessoryLink(context: Context) : FramedStreamLink("aoa") {
         else intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY)
 
     companion object {
-        private const val TAG = "RvAoa"
         const val ACTION_PERMISSION = "com.remoteview.client.USB_ACCESSORY_PERMISSION"
         const val MANUFACTURER = "RemoteView"
         const val MODEL = "RemoteViewHost"
+        private val SERIAL_RE = Regex("^\\d{6,9}$")
 
         /** Accessory của Remote View đang cắm (nếu có). */
         fun findAccessory(context: Context): UsbAccessory? {
             val m = context.getSystemService(Context.USB_SERVICE) as? UsbManager ?: return null
-            return m.accessoryList?.firstOrNull { it.manufacturer == MANUFACTURER && it.model == MODEL }
+            return try {
+                m.accessoryList?.firstOrNull { it.manufacturer == MANUFACTURER && it.model == MODEL }
+            } catch (e: Exception) {
+                RvLog.e("AOA: đọc accessoryList lỗi", e)
+                null
+            }
         }
 
         fun isAttached(context: Context): Boolean = findAccessory(context) != null
+
+        /** Token ghép đôi hợp lệ (6-9 chữ số) trong accessory.serial, dùng làm OTP cho USB. */
+        fun otpOf(acc: UsbAccessory?): String? = acc?.serial?.trim()?.takeIf { SERIAL_RE.matches(it) }
     }
 }
