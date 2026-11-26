@@ -43,6 +43,7 @@ fun HomeScreen(
     onConnect: (target: String) -> Unit,
     onOpenSettings: () -> Unit,
     onUsbDisplay: () -> Unit = {},
+    onDiagnostics: () -> Unit = {},
 ) {
     var id by rememberSaveable { mutableStateOf("") }
     val context = LocalContext.current
@@ -81,6 +82,11 @@ fun HomeScreen(
                 Text(stringResource(R.string.home_usb_display))
             }
             Text(stringResource(R.string.home_usb_display_hint), style = MaterialTheme.typography.bodySmall)
+
+            OutlinedButton(onClick = onDiagnostics, modifier = Modifier.fillMaxWidth()) {
+                Text(stringResource(R.string.home_diag))
+            }
+            Text(stringResource(R.string.home_diag_hint), style = MaterialTheme.typography.bodySmall)
 
             Text(stringResource(R.string.home_lan_hosts), style = MaterialTheme.typography.titleMedium)
             if (lanHosts.isEmpty()) {

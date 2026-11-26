@@ -19,6 +19,13 @@
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
     <uses-feature android:name="android.hardware.wifi" android:required="false" />
     <uses-feature android:name="android.hardware.usb.accessory" android:required="false" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+
+    <!-- Chẩn đoán: kiểm tra spacedesk có được cài hay không (Android 11+ cần khai báo visibility). -->
+    <queries>
+        <package android:name="ph.spacedesk.beta" />
+        <package android:name="ph.spacedesk.httpwww.spacedesk" />
+    </queries>
 
     <application
         android:allowBackup="false"

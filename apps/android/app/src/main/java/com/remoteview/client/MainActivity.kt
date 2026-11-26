@@ -22,6 +22,7 @@ import com.remoteview.client.net.UsbTetherDetector
 import com.remoteview.client.session.SessionController
 import com.remoteview.client.usb.LinkSelector
 import com.remoteview.client.usb.Route
+import com.remoteview.client.ui.DiagnosticsScreen
 import com.remoteview.client.ui.HomeScreen
 import com.remoteview.client.ui.LanHost
 import com.remoteview.client.ui.RemoteViewTheme
@@ -30,7 +31,7 @@ import com.remoteview.client.ui.SettingsScreen
 
 // UNBUILT: chưa biên dịch.
 
-internal enum class Screen { HOME, SETTINGS, SESSION }
+internal enum class Screen { HOME, SETTINGS, SESSION, DIAG }
 
 class MainActivity : ComponentActivity() {
 
@@ -129,7 +130,12 @@ class MainActivity : ComponentActivity() {
                 onConnect = { target -> connectTo(target) },
                 onOpenSettings = { screen = Screen.SETTINGS },
                 onUsbDisplay = { startUsbDisplay() },
+                onDiagnostics = { screen = Screen.DIAG },
             )
+            Screen.DIAG -> {
+                BackHandler { screen = Screen.HOME }
+                DiagnosticsScreen(onBack = { screen = Screen.HOME })
+            }
             Screen.SETTINGS -> {
                 BackHandler { screen = Screen.HOME }
                 SettingsScreen(
