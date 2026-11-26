@@ -181,7 +181,7 @@ fun BenchScreen(onBack: () -> Unit) {
                 Text(stringResource(R.string.bench_fps_fixed, effFps), style = MaterialTheme.typography.bodySmall)
             }
             Picker(stringResource(R.string.bench_duration), durLabel(durationSec), durations, durLabel, !running) { durationSec = it }
-            Picker(stringResource(R.string.bench_instances), "$instances", listOf(1, 2, 3, 4), { "$it" }, !running) { instances = it }
+            Picker(stringResource(R.string.bench_instances), if (instances == 0) "Tối đa" else "$instances", listOf(1, 2, 3, 4, 6, 8, 12, 16, 0), { if (it == 0) "Tối đa" else "$it" }, !running) { instances = it }
             Picker(stringResource(R.string.bench_bitrate), "$bitrate", listOf(20, 40, 80, 120), { "$it" }, !running) { bitrate = it }
             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                 Text(stringResource(R.string.bench_adpf), Modifier.weight(1f))

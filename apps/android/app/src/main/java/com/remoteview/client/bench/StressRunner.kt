@@ -58,6 +58,8 @@ class StressRunner(
 
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var stopRequested = false
+    @Volatile private var openedCount = 0
+    @Volatile private var openNote = ""
     private var thread: Thread? = null
 
     fun start() {
@@ -84,13 +86,21 @@ class StressRunner(
                 finish(failure(e.message ?: "Lỗi tạo clip")); return
             }
             phase("Đang khởi động ${cfg.instances} bộ giải mã...")
-            for (i in 0 until cfg.instances) {
+            // instances = 0 nghĩa là "Tối đa": mở tới khi máy từ chối (tối đa 32).
+            val target = if (cfg.instances <= 0) 32 else cfg.instances
+            for (i in 0 until target) {
                 val w = DecodeWorker(i, ctx, cfg, clip)
-                workers.add(w)
                 if (!w.start()) {
-                    finish(failure(w.error ?: "Không khởi động được bộ giải mã")); return
+                    runCatching { w.stop() }
+                    if (workers.isEmpty()) {
+                        finish(failure(w.error ?: "Không khởi động được bộ giải mã")); return
+                    }
+                    openNote = "Máy chỉ cho mở ${workers.size}/$target bộ giải mã (bộ thứ ${i + 1} lỗi: ${w.error ?: "không rõ"})"
+                    break
                 }
+                workers.add(w)
             }
+            openedCount = workers.size
             phase("Đang chạy: ${cfg.decoderName} (${workers[0].tierLabel})")
             val probe = SystemProbe(ctx)
             val startMs = SystemClock.elapsedRealtime()
@@ -148,7 +158,7 @@ class StressRunner(
             workers.forEach { runCatching { it.stop() } }
         }
         val c = clip
-        finish(buildSummary(cfg, c, workers.firstOrNull()?.tierLabel ?: "", samples, all.copyOf(allN).also { it.sort() }, stopReason))
+        finish(buildSummary(cfg, c, workers.firstOrNull()?.tierLabel ?: "", samples, all.copyOf(allN).also { it.sort() }, stopReason, openedCount, openNote))
     }
 
     private fun failure(msg: String) = BenchSummary("Không chạy được: $msg", "", null)
@@ -175,14 +185,14 @@ class StressRunner(
         private fun f(v: Float, d: Int = 1) = if (v.isNaN()) "n/a" else String.format(Locale.US, "%.${d}f", v)
 
         fun buildSummary(
-            cfg: BenchConfig, clip: Clip?, tier: String, s: List<BenchSample>, allLat: LongArray, reason: String,
+            cfg: BenchConfig, clip: Clip?, tier: String, s: List<BenchSample>, allLat: LongArray, reason: String, openedCount: Int = cfg.instances, openNote: String = "",
         ): BenchSummary {
             val sb = StringBuilder()
             sb.appendLine("=== Kiểm tra giới hạn giải mã ===")
             sb.appendLine("Máy: ${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE}, API ${Build.VERSION.SDK_INT})")
             if (Build.VERSION.SDK_INT >= 31) sb.appendLine("SoC: ${Build.SOC_MANUFACTURER} ${Build.SOC_MODEL}")
             sb.appendLine("Chế độ: ${cfg.mode}  Codec: ${cfg.codec.label}  Decoder: ${cfg.decoderName} [$tier]")
-            sb.appendLine("Độ phân giải: ${cfg.width}x${cfg.height}  FPS đích: ${cfg.fps}  Số decoder song song: ${cfg.instances}  ADPF: ${if (cfg.adpf) "bật" else "tắt"}")
+            sb.appendLine("Độ phân giải: ${cfg.width}x${cfg.height}  FPS đích: ${cfg.fps}  Số decoder song song: ${openedCount} (yêu cầu ${if (cfg.instances <= 0) "tối đa" else cfg.instances})${if (openNote.isNotEmpty()) "\n" + openNote else ""}  ADPF: ${if (cfg.adpf) "bật" else "tắt"}")
             if (clip != null) sb.appendLine("Clip: encoder ${clip.encoderName}, bitrate thực ${f(clip.actualMbps.toFloat())} Mbps (yêu cầu ${cfg.bitrateMbps}), ${clip.frames.size} khung, ${clip.keys.count { it }} khung IDR")
             sb.appendLine("Kết thúc: $reason  (${s.size} s đo)")
             var throttled: Boolean? = null
