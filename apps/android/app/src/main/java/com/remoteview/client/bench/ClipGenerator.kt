@@ -53,9 +53,21 @@ object ClipGenerator {
         for (info in encoders) {
             if (cancelled()) throw ClipException("Đã hủy.")
             try {
-                val clip = encode(info, mime, w, h, fps, bitrateMbps, progress, cancelled)
-                cache[key] = clip
-                return clip
+                // Một số encoder (MTK) bỏ qua bitrate yêu cầu. Thử lại: hạ bitrate yêu cầu theo tỉ lệ,
+                // rồi đổi sang VBR, giữ clip gần mức mong muốn nhất (để so sánh công bằng giữa các máy).
+                var req = bitrateMbps
+                var best = encode(info, mime, w, h, fps, req, progress, cancelled, forceVbr = false)
+                val attempts = listOf(false, false, true)
+                for (vbr in attempts) {
+                    val ratio = best.actualMbps / bitrateMbps
+                    if (ratio in 0.67..1.5 || cancelled()) break
+                    req = (req / ratio).toInt().coerceAtLeast(1)
+                    Log.i(TAG, "${info.name}: bitrate thực ${best.actualMbps} Mbps, thử lại với $req Mbps vbr=$vbr")
+                    val c = encode(info, mime, w, h, fps, req, progress, cancelled, forceVbr = vbr)
+                    if (kotlin.math.abs(c.actualMbps - bitrateMbps) < kotlin.math.abs(best.actualMbps - bitrateMbps)) best = c
+                }
+                cache[key] = best
+                return best
             } catch (e: ClipException) {
                 throw e
             } catch (e: Exception) {
@@ -68,7 +80,7 @@ object ClipGenerator {
 
     private fun encode(
         info: MediaCodecInfo, mime: String, w: Int, h: Int, fps: Int, bitrateMbps: Int,
-        progress: (Int, Int) -> Unit, cancelled: () -> Boolean,
+        progress: (Int, Int) -> Unit, cancelled: () -> Boolean, forceVbr: Boolean = false,
     ): Clip {
         val caps = info.getCapabilitiesForType(mime)
         val vc = caps.videoCapabilities
@@ -84,7 +96,7 @@ object ClipGenerator {
         fmt.setInteger("max-bframes", 0) // = MediaFormat.KEY_MAX_B_FRAMES (API 29); khóa lạ bị bỏ qua
         val ec = caps.encoderCapabilities
         if (ec != null) {
-            val mode = if (ec.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR))
+            val mode = if (!forceVbr && ec.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR))
                 MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
             else MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
             fmt.setInteger(MediaFormat.KEY_BITRATE_MODE, mode)
