@@ -14,15 +14,43 @@ android {
         applicationId = "com.remoteview.client"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        // CI đặt RV_VERSION_CODE = số lần chạy, để bản mới cài đè được bản cũ.
+        versionCode = (System.getenv("RV_VERSION_CODE") ?: "1").toInt()
+        versionName = "0.1." + (System.getenv("RV_VERSION_CODE") ?: "0")
 
         // Chỉ arm64: S26+ và Tab S10+ đều là arm64-v8a.
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 
+    signingConfigs {
+        // Khóa cố định nằm trong repo: mọi bản build (máy nào, CI lần nào) cùng một chữ ký,
+        // nên APK mới cài đè được APK cũ mà không phải gỡ. Không dùng cho phát hành Play Store.
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+        // Khóa phát hành riêng: chỉ dùng khi CI có secrets RV_KEYSTORE_* (không lưu trong repo).
+        create("release") {
+            val ks = System.getenv("RV_KEYSTORE_PATH")
+            if (ks != null) {
+                storeFile = file(ks)
+                storePassword = System.getenv("RV_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("RV_KEY_ALIAS")
+                keyPassword = System.getenv("RV_KEY_PASSWORD")
+            } else {
+                initWith(getByName("debug"))
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("debug")
+        }
         release {
+            signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),

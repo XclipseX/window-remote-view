@@ -64,6 +64,12 @@ jobs:
         with:
           gradle-version: "8.14"
       - run: gradle assembleDebug --stacktrace
+        env:
+          RV_VERSION_CODE: ${{ github.run_number }}
+      - name: Verify APK signature
+        run: |
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          "$APKSIGNER" verify --print-certs app/build/outputs/apk/debug/*.apk
       - name: Verify native lib is packaged in the APK
         run: unzip -l app/build/outputs/apk/debug/*.apk | grep lib/arm64-v8a/librv_core.so
       - uses: actions/upload-artifact@v4
@@ -82,7 +88,7 @@ jobs:
       - name: Collect files
         run: |
           mkdir out
-          cp dl/android-debug-apk/*.apk out/RemoteView-debug.apk
+          cp dl/android-debug-apk/*.apk out/RemoteView.apk
           cp dl/binaries-windows-latest/rv-host.exe out/ || true
           cp dl/binaries-windows-latest/rv-signal-relay.exe out/ || true
           ls -la out
@@ -94,6 +100,6 @@ jobs:
           make_latest: false
           body: |
             Bản build tự động từ commit ${{ github.sha }}.
-            - RemoteView-debug.apk: cài lên Android (Tab S10+ / S26+)
+            - RemoteView.apk (đã ký, cài đè được bản trước): cài lên Android (Tab S10+ / S26+)
             - rv-host.exe: chạy trên Windows
           files: out/*
