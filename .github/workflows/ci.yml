@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +47,13 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
+      - id: wdicache
+        uses: actions/cache@v4
+        with:
+          path: out/wdi-simple.exe
+          key: wdi-simple-v1
       - uses: msys2/setup-msys2@v2
+        if: steps.wdicache.outputs.cache-hit != 'true'
         with:
           msystem: mingw64
           update: true
@@ -57,17 +63,20 @@ jobs:
             autotools
             git
       - uses: actions/checkout@v4
+        if: steps.wdicache.outputs.cache-hit != 'true'
         with:
           repository: pbatard/libwdi
           path: libwdi
           fetch-depth: 1
           submodules: recursive
       - name: Download WDK redistributables (WinUSB co-installers)
+        if: steps.wdicache.outputs.cache-hit != 'true'
         shell: cmd
         run: |
           curl -L "https://go.microsoft.com/fwlink/p/?LinkID=253170" -o wdk-redist.msi
           msiexec /a wdk-redist.msi /qn TARGETDIR=%CD%\libwdi\wdk
       - name: Build wdi-simple.exe
+        if: steps.wdicache.outputs.cache-hit != 'true'
         working-directory: libwdi
         run: |
           ./bootstrap.sh

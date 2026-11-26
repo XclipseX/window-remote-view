@@ -611,8 +611,32 @@ impl VideoEncoder for MfEncoder {
                         None => return Err(HostError::Encoder("timeout waiting for METransformNeedInput".into())),
                     }
                 }
-                self.transform.ProcessInput(0, &sample, 0).map_err(|e| err("ProcessInput", e))?;
-                self.need_input -= 1;
+                // AMD's async MFT can emit more METransformNeedInput events than it will
+                // actually accept; MF_E_NOTACCEPTING then just means "drain output first".
+                let mut tries = 0;
+                loop {
+                    match self.transform.ProcessInput(0, &sample, 0) {
+                        Ok(()) => break,
+                        Err(e) if e.code() == MF_E_NOTACCEPTING && tries < 3 => {
+                            tries += 1;
+                            self.need_input = 0;
+                            let dl = Instant::now() + Duration::from_millis(50);
+                            while self.need_input == 0 {
+                                match self.next_event(dl)? {
+                                    Some(ev) => self.on_event(ev)?,
+                                    None => break,
+                                }
+                            }
+                        }
+                        Err(e) if e.code() == MF_E_NOTACCEPTING => {
+                            // Still busy: drop this frame instead of failing the encoder.
+                            self.need_input = 0;
+                            return Ok(self.pending.pop_front().unwrap_or_default());
+                        }
+                        Err(e) => return Err(err("ProcessInput", e)),
+                    }
+                }
+                self.need_input = self.need_input.saturating_sub(1);
                 self.frame_no += 1;
                 // Low-latency encoders answer within a frame or two.
                 let deadline = Instant::now() + Duration::from_millis(if self.frame_no < 3 { 1000 } else { 100 });

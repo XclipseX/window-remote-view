@@ -486,7 +486,6 @@ fn video_thread(
                         active = Some(a);
                         enc = Some(e);
                         empty_since = None;
-                        fail_streak = 0;
                         sh.idr.store(true, Ordering::Relaxed);
                         let _ = ev.send(VideoEvent::Active(a));
                     }
