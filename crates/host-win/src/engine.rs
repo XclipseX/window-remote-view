@@ -378,6 +378,8 @@ fn video_thread(
     let mut enc: Option<Box<dyn VideoEncoder>> = None;
     let mut active: Option<ActiveEnc> = None;
     let mut seen_gen = u32::MAX;
+    let mut fail_streak: u32 = 0;
+    let mut empty_since: Option<Instant> = None;
     let mut frame_id = 0u32;
     let mut last_sent = Instant::now();
     let mut last_encode = Instant::now() - Duration::from_secs(1);
@@ -481,6 +483,8 @@ fn video_thread(
                         sh.codec_flag.store(e.codec() as u32, Ordering::SeqCst);
                         active = Some(a);
                         enc = Some(e);
+                        empty_since = None;
+                        fail_streak = 0;
                         sh.idr.store(true, Ordering::Relaxed);
                         let _ = ev.send(VideoEvent::Active(a));
                     }
@@ -501,6 +505,8 @@ fn video_thread(
         last_encode = Instant::now();
         match r {
             Ok(data) if !data.is_empty() => {
+                fail_streak = 0;
+                empty_since = None;
                 w_frames += 1;
                 w_bytes += data.len() as u64;
                 w_enc += dt;
@@ -515,9 +521,26 @@ fn video_thread(
                 if force {
                     sh.idr.store(true, Ordering::Relaxed);
                 }
+                // An encoder that accepts input but never produces output for 2 s is broken.
+                let since = *empty_since.get_or_insert_with(Instant::now);
+                if since.elapsed() > Duration::from_secs(2) {
+                    let k = e.kind();
+                    warn!("video: encoder {} produced no output for 2 s; falling back", k.name());
+                    crate::encode::block_encoder(k);
+                    empty_since = None;
+                    enc = None;
+                    active = None;
+                }
             }
             Err(err) => {
                 warn!("video: encode error: {err}");
+                fail_streak += 1;
+                if fail_streak >= 3 {
+                    let k = e.kind();
+                    warn!("video: encoder {} failed {fail_streak} times in a row; falling back", k.name());
+                    crate::encode::block_encoder(k);
+                    fail_streak = 0;
+                }
                 if force {
                     sh.idr.store(true, Ordering::Relaxed);
                 }

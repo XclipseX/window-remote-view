@@ -85,6 +85,22 @@ pub trait VideoEncoder {
 /// D3D11 device is reused by the MF path). `bitrate_for` maps the chosen
 /// codec to a bitrate (slider formula depends on the codec). `log` receives
 /// human-readable progress/warnings.
+/// Encoders that failed at runtime in this process (e.g. MFT that errors on every frame).
+/// `create_encoder` skips them so a broken hardware path falls back instead of looping.
+static BLOCKED: std::sync::Mutex<Vec<EncoderKind>> = std::sync::Mutex::new(Vec::new());
+
+pub fn block_encoder(kind: EncoderKind) {
+    if let Ok(mut b) = BLOCKED.lock() {
+        if !b.contains(&kind) {
+            b.push(kind);
+        }
+    }
+}
+
+pub fn is_blocked(kind: EncoderKind) -> bool {
+    BLOCKED.lock().map(|b| b.contains(&kind)).unwrap_or(false)
+}
+
 pub fn create_encoder(
     codec: CodecPref,
     enc: EncoderPref,
@@ -106,6 +122,10 @@ pub fn create_encoder(
                 kinds.push(EncoderKind::MfH264Hw);
             }
             for k in kinds {
+                if is_blocked(k) {
+                    log(&format!("encoder {} skipped (failed earlier)", k.name()));
+                    continue;
+                }
                 let c = EncoderConfig { bitrate_bps: bitrate_for(k.slider_codec()), ..cfg };
                 match mf::MfEncoder::new(k, c, sample) {
                     Ok(e) => {
