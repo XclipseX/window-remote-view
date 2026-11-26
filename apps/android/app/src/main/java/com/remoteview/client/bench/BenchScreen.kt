@@ -182,7 +182,7 @@ fun BenchScreen(onBack: () -> Unit) {
             }
             Picker(stringResource(R.string.bench_duration), durLabel(durationSec), durations, durLabel, !running) { durationSec = it }
             Picker(stringResource(R.string.bench_instances), if (instances == 0) "Tối đa" else "$instances", listOf(1, 2, 3, 4, 6, 8, 12, 16, 0), { if (it == 0) "Tối đa" else "$it" }, !running) { instances = it }
-            Picker(stringResource(R.string.bench_bitrate), "$bitrate", listOf(20, 40, 80, 120), { "$it" }, !running) { bitrate = it }
+            Picker(stringResource(R.string.bench_bitrate), if (bitrate == 0) "Tối đa" else "$bitrate", listOf(20, 40, 80, 120, 0), { if (it == 0) "Tối đa" else "$it" }, !running) { bitrate = it }
             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                 Text(stringResource(R.string.bench_adpf), Modifier.weight(1f))
                 Switch(checked = adpf, onCheckedChange = { adpf = it }, enabled = !running)
@@ -193,6 +193,13 @@ fun BenchScreen(onBack: () -> Unit) {
             }
 
             if (!running) {
+                // Bài test chuẩn: cùng cấu hình trên mọi máy để so sánh (HEVC, 2800x1752, Throughput,
+                // bitrate tối đa của encoder, mở tối đa bộ giải mã, 30 s).
+                OutlinedButton(onClick = {
+                    mode = BenchMode.THROUGHPUT; codec = BenchCodec.HEVC
+                    res = resolutions.firstOrNull { it.width == 2800 && it.height == 1752 && !it.native } ?: BenchResolution(2800, 1752)
+                    fps = 120; durationSec = 30; instances = 0; bitrate = 0; adpf = true
+                }, modifier = Modifier.fillMaxWidth()) { Text("Áp dụng bài test chuẩn (so sánh 2 máy)") }
                 Button(onClick = { start() }, enabled = decoder.isNotEmpty(), modifier = Modifier.fillMaxWidth()) {
                     Text(stringResource(R.string.bench_start))
                 }

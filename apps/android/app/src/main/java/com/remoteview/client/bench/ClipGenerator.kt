@@ -60,7 +60,7 @@ object ClipGenerator {
                 val attempts = listOf(false, false, true)
                 for (vbr in attempts) {
                     val ratio = best.actualMbps / bitrateMbps
-                    if (ratio in 0.67..1.5 || cancelled()) break
+                    if (bitrateMbps <= 0 || ratio in 0.67..1.5 || cancelled()) break
                     req = (req / ratio).toInt().coerceAtLeast(1)
                     Log.i(TAG, "${info.name}: bitrate thực ${best.actualMbps} Mbps, thử lại với $req Mbps vbr=$vbr")
                     val c = encode(info, mime, w, h, fps, req, progress, cancelled, forceVbr = vbr)
@@ -85,7 +85,8 @@ object ClipGenerator {
         val caps = info.getCapabilitiesForType(mime)
         val vc = caps.videoCapabilities
         if (vc != null && !vc.isSizeSupported(w, h)) throw IllegalStateException("không hỗ trợ ${w}x$h")
-        var bitrate = bitrateMbps.toLong() * 1_000_000L
+        // bitrateMbps <= 0 nghia la Toi da: tran bitrate encoder khai bao.
+        var bitrate = if (bitrateMbps <= 0) (vc?.bitrateRange?.upper?.toLong() ?: 400_000_000L) else bitrateMbps.toLong() * 1_000_000L
         if (vc != null) bitrate = bitrate.coerceIn(vc.bitrateRange.lower.toLong(), vc.bitrateRange.upper.toLong())
         val fmt = MediaFormat.createVideoFormat(mime, w, h)
         fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)

@@ -193,7 +193,7 @@ class StressRunner(
             if (Build.VERSION.SDK_INT >= 31) sb.appendLine("SoC: ${Build.SOC_MANUFACTURER} ${Build.SOC_MODEL}")
             sb.appendLine("Chế độ: ${cfg.mode}  Codec: ${cfg.codec.label}  Decoder: ${cfg.decoderName} [$tier]")
             sb.appendLine("Độ phân giải: ${cfg.width}x${cfg.height}  FPS đích: ${cfg.fps}  Số decoder song song: ${openedCount} (yêu cầu ${if (cfg.instances <= 0) "tối đa" else cfg.instances})${if (openNote.isNotEmpty()) "\n" + openNote else ""}  ADPF: ${if (cfg.adpf) "bật" else "tắt"}")
-            if (clip != null) sb.appendLine("Clip: encoder ${clip.encoderName}, bitrate thực ${f(clip.actualMbps.toFloat())} Mbps (yêu cầu ${cfg.bitrateMbps}), ${clip.frames.size} khung, ${clip.keys.count { it }} khung IDR")
+            if (clip != null) sb.appendLine("Clip: encoder ${clip.encoderName}, bitrate thực ${f(clip.actualMbps.toFloat())} Mbps (yêu cầu ${if (cfg.bitrateMbps <= 0) "tối đa" else cfg.bitrateMbps}), ${clip.frames.size} khung, ${clip.keys.count { it }} khung IDR")
             sb.appendLine("Kết thúc: $reason  (${s.size} s đo)")
             var throttled: Boolean? = null
             if (s.size >= 3) {
