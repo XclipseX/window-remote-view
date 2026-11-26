@@ -19,6 +19,8 @@ import androidx.compose.ui.text.style.TextAlign
 import android.os.SystemClock
 import kotlinx.coroutines.delay
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -103,15 +105,17 @@ fun SessionScreen(controller: SessionController, showModifierBar: Boolean = true
             Row(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
-                    .padding(bottom = 24.dp)
-                    .background(Color(0xCC000000), RoundedCornerShape(24.dp))
-                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                    .padding(bottom = 32.dp)
+                    .background(Color(0xE61C1B1F), RoundedCornerShape(28.dp))
+                    .border(1.dp, Color(0x33FFFFFF), RoundedCornerShape(28.dp))
+                    .padding(horizontal = 20.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                CircularProgressIndicator(Modifier.size(18.dp), color = Color.White, strokeWidth = 2.dp)
+                CircularProgressIndicator(Modifier.size(20.dp), color = Color(0xFFFFB74D), strokeWidth = 2.dp)
                 Text(
                     stringResource(R.string.session_reconnecting),
                     color = Color.White,
+                    style = MaterialTheme.typography.bodyLarge,
                     modifier = Modifier.padding(start = 12.dp),
                 )
             }
@@ -132,8 +136,9 @@ fun SessionScreen(controller: SessionController, showModifierBar: Boolean = true
                 textAlign = TextAlign.Center,
                 modifier = Modifier
                     .align(Alignment.Center)
-                    .background(Color(0xCC000000), RoundedCornerShape(16.dp))
-                    .padding(horizontal = 20.dp, vertical = 12.dp),
+                    .background(Color(0xCC1C1B1F), RoundedCornerShape(24.dp))
+                    .border(1.dp, Color(0x33FFFFFF), RoundedCornerShape(24.dp))
+                    .padding(horizontal = 24.dp, vertical = 16.dp),
             )
         }
         if (overlayVisible) {
@@ -146,8 +151,9 @@ fun SessionScreen(controller: SessionController, showModifierBar: Boolean = true
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .padding(top = 8.dp, start = 8.dp)
-                    .background(Color(0xB3000000), RoundedCornerShape(8.dp))
-                    .padding(8.dp),
+                    .background(Color(0xB31C1B1F), RoundedCornerShape(16.dp))
+                    .border(1.dp, Color(0x33FFFFFF), RoundedCornerShape(16.dp))
+                    .padding(12.dp),
             )
         }
         // Nhấn giữ góc trên-phải để bật/tắt lớp phủ (góc này không chuyển cảm ứng cho host).

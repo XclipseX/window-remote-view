@@ -337,4 +337,80 @@
     <string name="log_copied">Đã sao chép nhật ký</string>
     <string name="log_empty">Chưa có dòng nhật ký nào.</string>
     <string name="log_back">Quay lại</string>
+
+    <!-- Điều hướng -->
+    <string name="nav_home">Trang chủ</string>
+    <string name="nav_settings">Cài đặt</string>
+
+    <!-- Trang chủ: thẻ trạng thái -->
+    <string name="hero_nocable">Cắm cáp USB vào máy tính</string>
+    <string name="hero_nocable_sub">Mở Remote View trên PC rồi cắm cáp. Máy sẽ tự hiện khi nhận ra.</string>
+    <string name="hero_detected">Đã thấy %1$s</string>
+    <string name="hero_detected_sub">Chạm Kết nối để dùng máy này làm màn hình phụ.</string>
+    <string name="hero_connecting">Đang kết nối…</string>
+    <string name="hero_connecting_sub">Đang ghép đôi và chờ hình từ máy tính.</string>
+    <string name="hero_displaying">Đang hiển thị</string>
+    <string name="hero_displaying_sub">Máy này đang là màn hình phụ của PC.</string>
+    <string name="hero_button">Kết nối</string>
+    <string name="home_tools">Công cụ</string>
+    <string name="tool_lan">Wi-Fi / LAN</string>
+    <string name="tool_lan_sub">Kết nối bằng ID hoặc chọn máy trong mạng</string>
+    <string name="tool_diag">Chẩn đoán</string>
+    <string name="tool_diag_sub">Vì sao USB chưa hiện màn hình?</string>
+    <string name="tool_bench">Kiểm tra giới hạn</string>
+    <string name="tool_bench_sub">Stress test giải mã video</string>
+    <string name="tool_log">Nhật ký</string>
+    <string name="tool_log_sub">Xem và sao chép log kết nối</string>
+    <string name="home_manual_title">Kết nối thủ công</string>
+    <string name="home_recent">Đã kết nối gần đây</string>
+    <string name="home_recent_empty">Chưa có máy nào. Các máy bạn đã kết nối sẽ hiện ở đây.</string>
+    <string name="home_devices">Máy tính</string>
+
+    <!-- Cài đặt (nhóm) -->
+    <string name="settings_header">Cài đặt</string>
+    <string name="settings_cat_video">Hình ảnh</string>
+    <string name="settings_cat_video_sub">Độ phân giải, FPS, chất lượng, codec</string>
+    <string name="settings_cat_decode">Giải mã và hiển thị</string>
+    <string name="settings_cat_decode_sub">Phần cứng, AV1, hiển thị trực tiếp</string>
+    <string name="settings_cat_input">Nhập liệu và âm thanh</string>
+    <string name="settings_cat_input_sub">Bàn phím, cảm ứng, âm thanh</string>
+    <string name="settings_cat_usb">Kết nối USB</string>
+    <string name="settings_cat_usb_sub">Tự kết nối, thanh phím</string>
+    <string name="settings_cat_debug">Gỡ lỗi</string>
+    <string name="settings_cat_debug_sub">Lớp phủ thông tin trong phiên</string>
+    <string name="settings_cat_about">Cập nhật và giới thiệu</string>
+    <string name="settings_cat_about_sub">Phiên bản, kiểm tra cập nhật</string>
+    <string name="settings_res_title">Độ phân giải</string>
+    <string name="settings_res_hint">Thấp hơn giúp mượt hơn khi máy hoặc đường truyền yếu.</string>
+    <string name="settings_fps_title">Tốc độ khung hình</string>
+    <string name="settings_fps_hint">120 FPS cần màn hình, cáp và bộ giải mã đủ nhanh.</string>
+    <string name="settings_quality_title">Chất lượng hình</string>
+    <string name="settings_quality_hint">Cao hơn: hình nét hơn nhưng dùng nhiều băng thông.</string>
+    <string name="settings_codec_hint">Tự động chọn bộ mã hóa phù hợp nhất với máy.</string>
+    <string name="chip_percent">%1$d%%</string>
+    <string name="chip_fps">%1$d FPS</string>
+
+    <!-- Cập nhật -->
+    <string name="about_version">Phiên bản</string>
+    <string name="about_build">Bản dựng (commit)</string>
+    <string name="update_check">Kiểm tra cập nhật</string>
+    <string name="update_auto">Tự kiểm tra khi mở app</string>
+    <string name="update_auto_hint">Tối đa một lần mỗi 6 giờ</string>
+    <string name="update_available_title">Có bản cập nhật</string>
+    <string name="update_available_body">Bản mới (commit %1$s) đã sẵn sàng. Bạn đang dùng bản %2$s.</string>
+    <string name="update_now">Cập nhật</string>
+    <string name="update_later">Để sau</string>
+    <string name="update_checking">Đang kiểm tra…</string>
+    <string name="update_uptodate">Bạn đang dùng bản mới nhất.</string>
+    <string name="update_downloading">Đang tải bản cập nhật… %1$d%%</string>
+    <string name="update_downloading_unknown">Đang tải bản cập nhật…</string>
+    <string name="update_installing">Đang cài đặt…</string>
+    <string name="update_need_permission">Cần cho phép cài ứng dụng từ nguồn này. Bật quyền trong màn hình cài đặt vừa mở, rồi quay lại app.</string>
+    <string name="update_open_settings">Mở cài đặt quyền</string>
+    <string name="update_failed">Không cập nhật được: %1$s</string>
+    <string name="update_private">Không đọc được bản phát hành (có thể kho mã riêng tư). Hãy mở trang phát hành để tải thủ công.</string>
+    <string name="update_open_page">Mở trang phát hành</string>
+    <string name="update_cancel">Hủy</string>
+    <string name="update_banner_title">Có bản cập nhật mới</string>
+    <string name="update_banner_sub">Chạm để tải và cài đặt</string>
 </resources>

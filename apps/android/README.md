@@ -60,7 +60,7 @@ Máy đích: Galaxy S26+ (Exynos 2600, `c2.exynos.*`) và Galaxy Tab S10+ (Dimen
 | `input/` | `TouchGestureMapper` (chạm=nhấp trái, giữ 400 ms/2 ngón chạm=nhấp phải, 2 ngón cuộn, chụm=zoom cục bộ, Trackpad/Direct), `StylusMapper` (áp lực 0..1024, nghiêng, hover, nút bên, tẩy), `PointerCaptureController` (chuột BT/OTG), `KeyboardBridge` (phím vật lý → scancode Set 1 từ `getScanCode()`; IME ảo → `BaseInputConnection` gửi Unicode theo diff, kể cả Telex đang composing; chế độ Raw typing), `ScanCodeMap`, `RemoteInput`. |
 | `net/` | `NetworkWatcher` (NetworkCallback; Wi-Fi RSSI < -75 dBm → `requestNetwork` pre-warm di động), `LanLocks` (MulticastLock + WifiLock `FULL_LOW_LATENCY`), `UsbTetherDetector` (`rndis*/usb*/ncm*` qua `NetworkInterface`; USB tether = đường ưu tiên cao nhất). |
 | `session/SessionController.kt` | Nối decoder, presenter, watchdog, ADPF, thermal, input cho một phiên. |
-| `ui/` | `HomeScreen` (ID + danh sách LAN + nút QR giả), `SettingsScreen` (độ phân giải, FPS 30/60/90/120, chất lượng 1–100, codec, HW/SW…), `ModifierBar` (Win, Alt+Tab, Ctrl+Alt+Del, Esc, PrtSc), `RemoteSurfaceView`, `SessionScreen`. |
+| `ui/` | `Theme` (Material 3, màu động Android 12+ và bảng màu dự phòng sáng/tối), `Adaptive` (WindowSizeClass + `AppShell`), `HomeScreen`, `SettingsScreen`, `UpdateUi`, `ModifierBar` (Win, Alt+Tab, Ctrl+Alt+Del, Esc, PrtSc), `RemoteSurfaceView`, `SessionScreen`. |
 
 ## Chế độ "Màn hình phụ (USB)" (kiểu spacedesk qua cáp) + âm thanh
 
@@ -140,3 +140,29 @@ ImageReader PRIVATE làm đích của decoder; đơn vị CURRENT_NOW khác nhau
 - Hello quảng bá `"codecs"` (theo thứ tự ưu tiên): `hevc` khi có decoder HEVC phần cứng, `av1` chỉ khi bật AV1 trong cài đặt, `h264` luôn có; lựa chọn Auto/H.264/HEVC/AV1 lọc và sắp xếp danh sách (`DisplayCaps.advertisedCodecs`). Không còn ép H.264 ở chế độ USB.
 - Lõi Rust báo `STATE_STREAM_CONFIG` (11, `"hevc 2800x1752@120 80000kbps"`): `SessionController` dựng lại `LowLatencyDecoder` với đúng mime/kích thước/fps khi có thay đổi.
 - `STATE_DISCONNECTED` (4): hiện nhãn "Mất kết nối — đang kết nối lại…" (không thoát phiên); khi `STATE_ESTABLISHED` quay lại thì flush decoder và đợi keyframe. `STATE_FAILED` vẫn đưa về hộp thoại PIN.
+
+## Giao diện thích ứng (điện thoại + máy tính bảng)
+
+- `ui/Theme.kt`: Material 3, màu động (Android 12+) và bảng màu dự phòng sáng/tối; lưới 8dp (`Spacing`), màu ngữ nghĩa thành công/cảnh báo (`StatusColors`).
+- `ui/Adaptive.kt`: `rememberWidthClass()` dùng `material3-window-size-class` (`calculateWindowSizeClass`). Compact (điện thoại dọc) -> `NavigationBar` dưới đáy, một cột;
+  Medium/Expanded (Galaxy Tab S10+ dọc/ngang) -> `NavigationRail` bên trái + hai khung.
+- Trang chủ: thẻ trạng thái lớn ("Cắm cáp USB vào máy tính" / "Đã thấy <tên máy>" / "Đang kết nối…" / "Đang hiển thị") + nút "Kết nối" lớn; bốn thẻ công cụ
+  (Wi-Fi/LAN, Chẩn đoán, Kiểm tra giới hạn, Nhật ký); kết nối thủ công bằng ID, máy trong LAN, máy đã kết nối gần đây (`RecentHostsRepository`, tối đa 8).
+  Màn hình rộng: trái = thẻ kết nối + công cụ, phải = danh sách máy.
+- Cài đặt chia nhóm (Hình ảnh, Giải mã và hiển thị, Nhập liệu và âm thanh, Kết nối USB, Gỡ lỗi, Cập nhật và giới thiệu); thanh trượt có chip giá trị.
+  Màn hình rộng: danh sách nhóm bên trái, nội dung nhóm bên phải. Màn hình Phiên giữ nguyên chức năng; lớp phủ gỡ lỗi / nhãn "đang kết nối lại" là bảng mờ bo góc.
+- Chẩn đoán, Kiểm tra giới hạn, Nhật ký vẫn là màn hình đầy đủ có nút Quay lại (chỉ đổi theo theme mới).
+- Phụ thuộc mới: `material3-window-size-class`, `material-icons-extended` (version theo Compose BOM).
+
+## Cập nhật ứng dụng (`update/`, `ui/UpdateUi.kt`)
+
+- Cài đặt > "Cập nhật và giới thiệu" hiện `versionName` và mã commit của bản dựng (`BuildConfig.GIT_SHA`).
+  `GIT_SHA` lấy từ biến môi trường `RV_BUILD_SHA`, nếu không có thì `GITHUB_SHA` (GitHub Actions tự cung cấp), build cục bộ = `dev`.
+- "Kiểm tra cập nhật" + tự kiểm tra khi mở app (cài đặt "Tự kiểm tra khi mở app", mặc định bật, tối đa một lần mỗi 6 giờ).
+  Gọi `https://api.github.com/repos/XclipseX/window-remote-view/releases/tags/latest-build` (luồng IO), đọc `body` dòng
+  `Bản build tự động từ commit <sha>` và asset `RemoteView.apk`; khác `GIT_SHA` (so khớp tiền tố) thì hiện hộp thoại/banner "Có bản cập nhật".
+- Bấm "Cập nhật": tải APK bằng `HttpURLConnection` vào `cacheDir/update/` (có tiến độ, hủy được), rồi cài bằng `PackageInstaller` session
+  (`InstallResultReceiver` mở hộp xác nhận của hệ thống). Cần quyền `REQUEST_INSTALL_PACKAGES`; nếu chưa được phép "cài ứng dụng không rõ nguồn"
+  thì mở `Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES` và tự cài tiếp khi quay lại app. APK mới cài đè được vì cùng khóa ký.
+- API trả 404 (repo riêng tư hoặc chưa có release): hiện nút "Mở trang phát hành" để tải thủ công bằng trình duyệt.
+- Chưa kiểm chứng trên máy thật (mã chưa biên dịch): luồng PackageInstaller, redirect tải từ GitHub, quyền cài ứng dụng trên One UI.

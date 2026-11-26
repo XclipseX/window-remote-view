@@ -37,6 +37,14 @@ import com.remoteview.client.ui.PinPrompt
 import com.remoteview.client.ui.RemoteViewTheme
 import com.remoteview.client.ui.SessionScreen
 import com.remoteview.client.ui.SettingsScreen
+import com.remoteview.client.ui.AppShell
+import com.remoteview.client.ui.UpdateDialog
+import com.remoteview.client.ui.rememberWidthClass
+import com.remoteview.client.update.UpdateController
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 
 // UNBUILT: chưa biên dịch.
 
@@ -47,6 +55,10 @@ class MainActivity : ComponentActivity() {
     private lateinit var locks: LanLocks
     private lateinit var watcher: NetworkWatcher
     private lateinit var repo: SettingsRepository
+    private lateinit var recentRepo: RecentHostsRepository
+    private lateinit var update: UpdateController
+    private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val recents = mutableStateListOf<LanHost>()
     private var session: SessionController? = null
     private val lanHosts = mutableStateListOf<LanHost>()
     private var screen by mutableStateOf(Screen.HOME)
@@ -76,6 +88,10 @@ class MainActivity : ComponentActivity() {
         watcher = NetworkWatcher(this)
         repo = SettingsRepository(this)
         settings = repo.load()
+        recentRepo = RecentHostsRepository(this)
+        recents.addAll(recentRepo.load().map { LanHost(it.first, it.second) })
+        update = UpdateController(this, uiScope)
+        if (settings.autoCheckUpdate) update.autoCheck()
         requestNetworkPermissions()
 
         NativeBridge.callbacks = object : NativeBridge.Callbacks {
@@ -137,6 +153,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        update.onResume()
         refreshAccessory()
     }
 
@@ -210,30 +227,48 @@ class MainActivity : ComponentActivity() {
         screen = Screen.SESSION
     }
 
+    private fun rememberRecent(target: String) {
+        val name = lanHosts.firstOrNull { it.address == target }?.name ?: target
+        val list = recentRepo.add(name, target)
+        recents.clear()
+        recents.addAll(list.map { LanHost(it.first, it.second) })
+    }
+
     @Composable
     private fun App() {
+        val widthClass = rememberWidthClass()
+        UpdateDialog(update)
         when (screen) {
-            Screen.HOME -> HomeScreen(
-                lanHosts = lanHosts,
-                onConnect = { target -> connectTo(target) },
-                onOpenSettings = { screen = Screen.SETTINGS },
-                usbOtp = settings.usbOtp,
-                pinPrompt = pinPrompt,
-                onUsbDisplay = { pinPrompt = PinPrompt(null) },
-                onPinSubmit = { otp ->
-                    pinPrompt = null
-                    settings = settings.copy(usbOtp = otp).also { repo.save(it) }
-                    startUsbDisplay()
-                },
-                onPinDismiss = { pinPrompt = null },
-                usbHost = usbHost,
-                usbBusy = usbStarting,
-                usbError = usbError,
-                onUsbConnect = { startUsbDisplay() },
-                onLog = { screen = Screen.LOG },
-                onDiagnostics = { screen = Screen.DIAG },
-                onBench = { screen = Screen.BENCH },
-            )
+            Screen.HOME -> AppShell(
+                selected = 0,
+                onSelect = { if (it == 1) screen = Screen.SETTINGS },
+                widthClass = widthClass,
+            ) { padding ->
+                HomeScreen(
+                    lanHosts = lanHosts,
+                    recentHosts = recents,
+                    onConnect = { target -> rememberRecent(target); connectTo(target) },
+                    widthClass = widthClass,
+                    update = update,
+                    contentPadding = padding,
+                    usbOtp = settings.usbOtp,
+                    pinPrompt = pinPrompt,
+                    onUsbDisplay = { pinPrompt = PinPrompt(null) },
+                    onPinSubmit = { otp ->
+                        pinPrompt = null
+                        settings = settings.copy(usbOtp = otp).also { repo.save(it) }
+                        startUsbDisplay()
+                    },
+                    onPinDismiss = { pinPrompt = null },
+                    usbHost = usbHost,
+                    usbBusy = usbStarting,
+                    usbError = usbError,
+                    onUsbConnect = { startUsbDisplay() },
+                    onLog = { screen = Screen.LOG },
+                    onDiagnostics = { screen = Screen.DIAG },
+                    onBench = { screen = Screen.BENCH },
+                )
+            }
             Screen.LOG -> {
                 BackHandler { screen = Screen.HOME }
                 LogScreen(onBack = { screen = Screen.HOME })
@@ -248,11 +283,19 @@ class MainActivity : ComponentActivity() {
             }
             Screen.SETTINGS -> {
                 BackHandler { screen = Screen.HOME }
-                SettingsScreen(
-                    settings = settings,
-                    onChange = { settings = it; repo.save(it) },
-                    onBack = { screen = Screen.HOME },
-                )
+                AppShell(
+                    selected = 1,
+                    onSelect = { if (it == 0) screen = Screen.HOME },
+                    widthClass = widthClass,
+                ) { padding ->
+                    SettingsScreen(
+                        settings = settings,
+                        onChange = { settings = it; repo.save(it) },
+                        update = update,
+                        widthClass = widthClass,
+                        contentPadding = padding,
+                    )
+                }
             }
             Screen.SESSION -> {
                 val s = session
@@ -313,6 +356,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        update.release()
+        uiScope.cancel()
         endSession()
         NativeBridge.callbacks = null
         super.onDestroy()

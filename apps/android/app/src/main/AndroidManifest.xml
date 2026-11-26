@@ -16,6 +16,9 @@
     <!-- Android 16+: quyền mạng cục bộ (CHƯA XÁC MINH tên/hành vi chính xác, xem README). -->
     <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
 
+    <!-- Tự cập nhật: cài APK mới bằng PackageInstaller (người dùng cần cho phép "cài ứng dụng không rõ nguồn"). -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
     <uses-feature android:name="android.hardware.wifi" android:required="false" />
     <uses-feature android:name="android.hardware.usb.accessory" android:required="false" />
@@ -56,5 +59,9 @@
                 android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED"
                 android:resource="@xml/accessory_filter" />
         </activity>
+
+        <receiver
+            android:name=".update.InstallResultReceiver"
+            android:exported="false" />
     </application>
 </manifest>

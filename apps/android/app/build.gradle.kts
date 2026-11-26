@@ -18,6 +18,11 @@ android {
         versionCode = (System.getenv("RV_VERSION_CODE") ?: "1").toInt()
         versionName = "0.1." + (System.getenv("RV_VERSION_CODE") ?: "0")
 
+        // Mã commit của bản build (CI: RV_BUILD_SHA nếu có, nếu không thì GITHUB_SHA của GitHub Actions); build cục bộ = "dev".
+        val gitSha = (System.getenv("RV_BUILD_SHA") ?: System.getenv("GITHUB_SHA") ?: "dev")
+            .trim().ifEmpty { "dev" }.replace(Regex("[^0-9A-Za-z_-]"), "")
+        buildConfigField("String", "GIT_SHA", "\"$gitSha\"")
+
         // Chỉ arm64: S26+ và Tab S10+ đều là arm64-v8a.
         ndk { abiFilters += listOf("arm64-v8a") }
     }
@@ -64,7 +69,10 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
 
     // librv_core.so (Rust, crates/android-core) do cargo-ndk đặt vào src/main/jniLibs/arm64-v8a/ (thư mục jniLibs mặc định,
     // tự được đóng gói vào APK). Thư mục này bị .gitignore.
@@ -80,6 +88,8 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material3:material3-window-size-class")
+    implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.compose.foundation:foundation")
     debugImplementation("androidx.compose.ui:ui-tooling")
 

@@ -29,6 +29,8 @@ data class StreamSettings(
     val autoConnectUsb: Boolean = true,
     /** Cho phép lớp phủ gỡ lỗi (hiện khi chưa có hình). */
     val debugOverlay: Boolean = true,
+    /** Tự kiểm tra bản cập nhật khi mở app (tối đa 6 giờ một lần). */
+    val autoCheckUpdate: Boolean = true,
 ) {
     /** Placeholder: 5..120 Mbps tuyến tính theo chất lượng (mặc định LAN 60–120 Mbps). */
     fun targetBitrateKbps(): Int = 5_000 + ((qualityPercent.coerceIn(1, 100) - 1) / 99f * 115_000).toInt()
@@ -61,6 +63,7 @@ class SettingsRepository(context: Context) {
             usbOtp = prefs.getString("usb_otp", d.usbOtp) ?: d.usbOtp,
             autoConnectUsb = prefs.getBoolean("usb_auto", d.autoConnectUsb),
             debugOverlay = prefs.getBoolean("dbg_overlay", d.debugOverlay),
+            autoCheckUpdate = prefs.getBoolean("upd_auto", d.autoCheckUpdate),
         )
     }
 
@@ -80,6 +83,26 @@ class SettingsRepository(context: Context) {
             .putString("usb_otp", s.usbOtp)
             .putBoolean("usb_auto", s.autoConnectUsb)
             .putBoolean("dbg_overlay", s.debugOverlay)
+            .putBoolean("upd_auto", s.autoCheckUpdate)
             .apply()
+    }
+}
+
+/** Danh sách máy đã kết nối gần đây (tối đa 8), lưu dạng "tên|địa chỉ" mỗi dòng. */
+class RecentHostsRepository(context: Context) {
+    private val prefs = context.applicationContext.getSharedPreferences("recent_hosts", Context.MODE_PRIVATE)
+
+    fun load(): List<Pair<String, String>> =
+        (prefs.getString("list", "") ?: "").lines().mapNotNull { line ->
+            val i = line.indexOf('|')
+            if (i <= 0 || i == line.length - 1) null else line.substring(0, i) to line.substring(i + 1)
+        }
+
+    fun add(name: String, address: String): List<Pair<String, String>> {
+        val cleanName = name.replace('|', ' ').replace('\n', ' ')
+        val cleanAddr = address.replace('|', ' ').replace('\n', ' ')
+        val list = (listOf(cleanName to cleanAddr) + load().filter { it.second != cleanAddr }).take(8)
+        prefs.edit().putString("list", list.joinToString("\n") { "${it.first}|${it.second}" }).apply()
+        return list
     }
 }
