@@ -79,7 +79,8 @@ object ClipGenerator {
         fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
         fmt.setInteger(MediaFormat.KEY_BIT_RATE, bitrate.toInt())
         fmt.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-        fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 600) // IDR chỉ ở đầu clip
+        // 600 s bị encoder MTK coi là không hợp lệ và mã toàn khung IDR (~435 Mbps). 10 s > độ dài clip.
+        fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 10)
         fmt.setInteger("max-bframes", 0) // = MediaFormat.KEY_MAX_B_FRAMES (API 29); khóa lạ bị bỏ qua
         val ec = caps.encoderCapabilities
         if (ec != null) {
