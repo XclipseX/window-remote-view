@@ -38,7 +38,7 @@ const USAGE: &str = "rv-host [--usb | --adb | --lan] [--otp N] [--width W --heig
   --usb   AOA bulk link, falls back to `adb reverse` (default when a device is attached)
   --adb   only the adb-reverse TCP fallback
   --lan   UDP on --bind (default 0.0.0.0:47800)
-  --monitor NAME  display to share, e.g. \\.\DISPLAY1 (default: the laptop's own panel)
+  --monitor NAME  display to share, e.g. \\\\.\\DISPLAY1 (default: the laptop's own panel)
   --json-status  machine-readable JSON lines on stdout / commands on stdin
                  (see CONTROL_PROTOCOL.md)";
 
@@ -1613,5 +1613,25 @@ pub fn run_cli(argv: Vec<String>) -> i32 {
             }
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_size;
+
+    #[test]
+    fn fit_keeps_the_capture_aspect_and_never_enlarges() {
+        // no limit / limit larger than the capture: the capture size as is
+        assert_eq!(fit_size(2880, 1800, 0, 0), (2880, 1800));
+        assert_eq!(fit_size(1920, 1080, 2800, 1752), (1920, 1080));
+        // 16:10 panel into a 16:9 request: scaled by the tighter side, not stretched
+        assert_eq!(fit_size(2880, 1800, 1920, 1080), (1728, 1080));
+        // tablet 2800x1752 vs panel 2880x1800: 16:10 stays ~16:10
+        let (w, h) = fit_size(2880, 1800, 2800, 1752);
+        assert!(w <= 2800 && h <= 1752);
+        assert!(((w as f64 / h as f64) - 1.6).abs() < 0.002);
+        // only one side limited
+        assert_eq!(fit_size(2000, 1000, 1000, 5000), (1000, 500));
     }
 }

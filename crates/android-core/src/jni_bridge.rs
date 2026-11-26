@@ -30,6 +30,9 @@ struct JavaCache {
     on_send: JStaticMethodID,
     on_audio: JStaticMethodID,
     on_stats: JStaticMethodID,
+    /// Optional: older `NativeBridge` builds lack the cursor callbacks.
+    on_cursor_shape: Option<JStaticMethodID>,
+    on_cursor_pos: Option<JStaticMethodID>,
 }
 
 static CACHE: OnceLock<JavaCache> = OnceLock::new();
@@ -63,7 +66,24 @@ fn init_cache(vm: JavaVM) -> jni::errors::Result<JavaCache> {
     let on_send = env.get_static_method_id(&class, "onSendDatagramFromNative", "([B)V")?;
     let on_audio = env.get_static_method_id(&class, "onAudioFromNative", "([BJI)V")?;
     let on_stats = env.get_static_method_id(&class, "onStatsFromNative", "(FIF)V")?;
-    Ok(JavaCache { vm, class: global, on_video, on_state, on_send, on_audio, on_stats })
+    let on_cursor_shape = optional_method(&mut env, &class, "onCursorShapeFromNative", "(IIII[B)V");
+    let on_cursor_pos = optional_method(&mut env, &class, "onCursorPosFromNative", "(IIZ)V");
+    Ok(JavaCache { vm, class: global, on_video, on_state, on_send, on_audio, on_stats, on_cursor_shape, on_cursor_pos })
+}
+
+/// Resolves a callback that may be missing at runtime: logs and returns `None`
+/// (clearing the pending `NoSuchMethodError`) instead of failing `JNI_OnLoad`.
+fn optional_method(env: &mut JNIEnv, class: &JClass, name: &str, sig: &str) -> Option<JStaticMethodID> {
+    match env.get_static_method_id(class, name, sig) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
+            }
+            log::warn!("NativeBridge.{name}{sig} not found ({e}); this callback is disabled");
+            None
+        }
+    }
 }
 
 impl JavaCache {
@@ -149,6 +169,39 @@ impl EventSink for JniSink {
                 None => JObject::null(),
             };
             JavaCache::void(env, cls, c.on_state, &[JValue::Int(st).as_jni(), JValue::Object(&msg).as_jni()])
+        });
+    }
+
+    fn cursor_shape(&mut self, w: i32, h: i32, hot_x: i32, hot_y: i32, rgba: &[u8]) {
+        let c = self.0;
+        let Some(id) = c.on_cursor_shape else { return };
+        c.call(|env, cls| {
+            let arr = env.byte_array_from_slice(rgba)?;
+            JavaCache::void(
+                env,
+                cls,
+                id,
+                &[
+                    JValue::Int(w).as_jni(),
+                    JValue::Int(h).as_jni(),
+                    JValue::Int(hot_x).as_jni(),
+                    JValue::Int(hot_y).as_jni(),
+                    JValue::Object(&arr).as_jni(),
+                ],
+            )
+        });
+    }
+
+    fn cursor_pos(&mut self, x: i32, y: i32, visible: bool) {
+        let c = self.0;
+        let Some(id) = c.on_cursor_pos else { return };
+        c.call(|env, cls| {
+            JavaCache::void(
+                env,
+                cls,
+                id,
+                &[JValue::Int(x).as_jni(), JValue::Int(y).as_jni(), JValue::Bool(visible as jboolean).as_jni()],
+            )
         });
     }
 
@@ -267,6 +320,25 @@ pub extern "system" fn Java_com_remoteview_client_NativeBridge_nativeRequestKeyF
     handle: jlong,
 ) {
     send_cmd(handle, Command::Control(ControlMessage::RequestIdr));
+}
+
+/// Uploads a log file to the host (`LogChunk` control messages, saved there as
+/// `android-<name>.log`). Returns false when the session handle is unknown.
+#[no_mangle]
+pub extern "system" fn Java_com_remoteview_client_NativeBridge_nativeUploadLog<'l>(
+    mut env: JNIEnv<'l>,
+    _this: JObject<'l>,
+    handle: jlong,
+    name: JString<'l>,
+    data: JByteArray<'l>,
+) -> jboolean {
+    let Some(w) = lookup(handle) else { return 0 };
+    let name: String = match env.get_string(&name) {
+        Ok(s) => s.into(),
+        Err(_) => return 0,
+    };
+    let Ok(bytes) = env.convert_byte_array(&data) else { return 0 };
+    jboolean::from(w.send(Command::UploadLog { name, data: bytes }))
 }
 
 /// Host currently ignores quality updates (fixed bitrate); not forwarded.

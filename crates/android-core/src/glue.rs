@@ -232,12 +232,37 @@ fn chunk_text(s: &str) -> Vec<String> {
     out
 }
 
+/// Data bytes per `LogChunk`: one datagram (no IP fragmentation on Wi-Fi), well under `MAX_LOG_CHUNK`.
+pub const LOG_CHUNK_BYTES: usize = 1024;
+/// Largest log uploaded; a bigger one is cut to its newest bytes.
+pub const MAX_UPLOAD_BYTES: usize = 4 * 1024 * 1024;
+
+/// Splits a log into `LogChunk` control messages (`nativeUploadLog`). Names are
+/// cut to `MAX_LOG_NAME` bytes on a char boundary; oversized logs keep their tail.
+pub fn log_chunks(name: &str, data: &[u8]) -> Vec<ControlMessage> {
+    let name = truncate_utf8(name, rv_proto::MAX_LOG_NAME).to_string();
+    let data = &data[data.len().saturating_sub(MAX_UPLOAD_BYTES)..];
+    let n = data.len().div_ceil(LOG_CHUNK_BYTES).max(1);
+    (0..n)
+        .map(|i| ControlMessage::LogChunk {
+            name: name.clone(),
+            seq: i as u32,
+            last: i + 1 == n,
+            data: data[(i * LOG_CHUNK_BYTES).min(data.len())..((i + 1) * LOG_CHUNK_BYTES).min(data.len())].to_vec(),
+        })
+        .collect()
+}
+
 /// What gets pushed up to Kotlin.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outgoing {
     Video { data: Vec<u8>, pts_us: i64, flags: i32 },
     Audio { data: Vec<u8>, pts_us: i64, codec: i32 },
     State { state: i32, message: Option<String> },
+    /// Host cursor image (`NativeBridge.onCursorShapeFromNative`), straight-alpha RGBA.
+    CursorShape { w: i32, h: i32, hot_x: i32, hot_y: i32, rgba: Vec<u8> },
+    /// Host cursor position (`NativeBridge.onCursorPosFromNative`), `x`/`y` in 0..=65535.
+    CursorPos { x: i32, y: i32, visible: bool },
 }
 
 /// Receiver of [`Outgoing`] (JNI callbacks in production, a recorder in tests).
@@ -246,6 +271,9 @@ pub trait EventSink {
     fn audio(&mut self, data: &[u8], pts_us: i64, codec: i32);
     fn state(&mut self, state: i32, message: Option<&str>);
     fn stats(&mut self, rtt_ms: f32, bitrate_kbps: i32, loss_percent: f32);
+    /// Cursor callbacks are optional (older Kotlin builds lack them).
+    fn cursor_shape(&mut self, _w: i32, _h: i32, _hot_x: i32, _hot_y: i32, _rgba: &[u8]) {}
+    fn cursor_pos(&mut self, _x: i32, _y: i32, _visible: bool) {}
 }
 
 pub fn deliver(sink: &mut dyn EventSink, o: &Outgoing) {
@@ -253,6 +281,8 @@ pub fn deliver(sink: &mut dyn EventSink, o: &Outgoing) {
         Outgoing::Video { data, pts_us, flags } => sink.video(data, *pts_us, *flags),
         Outgoing::Audio { data, pts_us, codec } => sink.audio(data, *pts_us, *codec),
         Outgoing::State { state, message } => sink.state(*state, message.as_deref()),
+        Outgoing::CursorShape { w, h, hot_x, hot_y, rgba } => sink.cursor_shape(*w, *h, *hot_x, *hot_y, rgba),
+        Outgoing::CursorPos { x, y, visible } => sink.cursor_pos(*x, *y, *visible),
     }
 }
 
@@ -292,6 +322,16 @@ pub fn translate_event(ev: ClientEvent) -> Vec<Outgoing> {
                 state: state::STREAM_CONFIG,
                 message: Some(format!("{} {width}x{height}@{fps} {bitrate_kbps}kbps", codec_name(codec))),
             }]
+        }
+        ClientEvent::Control(ControlMessage::CursorShape { w, h, hot_x, hot_y, rgba }) => vec![Outgoing::CursorShape {
+            w: i32::from(w),
+            h: i32::from(h),
+            hot_x: i32::from(hot_x),
+            hot_y: i32::from(hot_y),
+            rgba,
+        }],
+        ClientEvent::Control(ControlMessage::CursorPos { x, y, visible }) => {
+            vec![Outgoing::CursorPos { x: i32::from(x), y: i32::from(y), visible }]
         }
         ClientEvent::Control(_) => Vec::new(),
         ClientEvent::Disconnected => vec![Outgoing::State {
@@ -413,6 +453,49 @@ mod tests {
         let e = t.translate(pen(true, true, 1024));
         let InputEvent::Pen { x, y, pressure, tilt_x, tilt_y, buttons, .. } = e[0].clone() else { panic!() };
         assert_eq!((x, y, pressure, tilt_x, tilt_y, buttons), (16384, 49151, 65535, 90, -10, 1));
+    }
+
+    #[test]
+    fn log_upload_is_chunked() {
+        let data: Vec<u8> = (0..2500u32).map(|i| i as u8).collect();
+        let c = log_chunks("tab.log", &data);
+        assert_eq!(c.len(), 3);
+        let mut joined = Vec::new();
+        for (i, m) in c.iter().enumerate() {
+            let ControlMessage::LogChunk { name, seq, last, data } = m else { panic!() };
+            assert_eq!((name.as_str(), *seq as usize, *last), ("tab.log", i, i == 2));
+            assert!(data.len() <= LOG_CHUNK_BYTES && data.len() <= rv_proto::MAX_LOG_CHUNK);
+            joined.extend_from_slice(data);
+        }
+        assert_eq!(joined, data);
+        // empty log: one empty final chunk; long names are cut on a char boundary; huge logs keep the tail
+        let c = log_chunks(&"ệ".repeat(40), &[]);
+        let [ControlMessage::LogChunk { name, last: true, data, .. }] = c.as_slice() else { panic!() };
+        assert!(name.len() <= rv_proto::MAX_LOG_NAME && data.is_empty());
+        let big = vec![7u8; MAX_UPLOAD_BYTES + 5000];
+        assert_eq!(log_chunks("x", &big).len(), MAX_UPLOAD_BYTES / LOG_CHUNK_BYTES);
+        for m in log_chunks("x", data.as_ref()) {
+            let mut b = Vec::new();
+            assert!(m.encode_payload(&mut b).is_ok());
+        }
+    }
+
+    #[test]
+    fn cursor_events_translate() {
+        assert_eq!(
+            translate_event(ClientEvent::Control(ControlMessage::CursorShape {
+                w: 2,
+                h: 1,
+                hot_x: 1,
+                hot_y: 0,
+                rgba: vec![1; 8]
+            })),
+            vec![Outgoing::CursorShape { w: 2, h: 1, hot_x: 1, hot_y: 0, rgba: vec![1; 8] }]
+        );
+        assert_eq!(
+            translate_event(ClientEvent::Control(ControlMessage::CursorPos { x: 65535, y: 3, visible: true })),
+            vec![Outgoing::CursorPos { x: 65535, y: 3, visible: true }]
+        );
     }
 
     #[test]

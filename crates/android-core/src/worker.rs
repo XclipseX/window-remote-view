@@ -1,6 +1,7 @@
 //! Worker thread owning the `ClientSession`. Everything session-related runs
 //! here; other threads talk to it over a channel.
 
+use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -9,17 +10,21 @@ use rv_crypto::Keypair;
 use rv_proto::ControlMessage;
 use rv_session::{ClientSession, DatagramIo, USB_HOST_ID};
 
-use crate::glue::{deliver, state, translate_event, EventSink, HelloConfig, InputTranslator, UiInput};
+use crate::glue::{deliver, log_chunks, state, translate_event, EventSink, HelloConfig, InputTranslator, UiInput};
 
 pub enum Command {
     Datagram(Vec<u8>),
     Input(UiInput),
     Control(ControlMessage),
+    /// Upload a log file to the host as `LogChunk`s (paced by the worker loop).
+    UploadLog { name: String, data: Vec<u8> },
     Shutdown,
 }
 
 /// Re-send handshake msg1 if msg2 has not arrived.
 const HANDSHAKE_RETRY: Duration = Duration::from_secs(2);
+/// Log chunks sent per worker loop pass (~2 ms): paces an upload to a few MB/s.
+const LOG_CHUNKS_PER_PASS: usize = 8;
 /// After the handshake the host immediately sends DisplayConfigChange; silence
 /// means the host rejected msg3 (wrong PIN) or went away.
 const POST_HANDSHAKE_SILENCE: Duration = Duration::from_secs(4);
@@ -88,6 +93,7 @@ fn run<I: DatagramIo, S: EventSink>(
     let mut last_tick = Instant::now();
     let mut last_stats = Instant::now();
     let mut rx_bytes: u64 = 0;
+    let mut upload: VecDeque<ControlMessage> = VecDeque::new();
 
     loop {
         match rx.recv_timeout(Duration::from_millis(2)) {
@@ -111,8 +117,16 @@ fn run<I: DatagramIo, S: EventSink>(
                     log::debug!("control dropped: {e}");
                 }
             }
+            Ok(Command::UploadLog { name, data }) => upload.extend(log_chunks(&name, &data)),
             Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
+        }
+        for _ in 0..LOG_CHUNKS_PER_PASS {
+            let Some(c) = upload.pop_front() else { break };
+            if let Err(e) = client.send_control(c) {
+                log::warn!("log upload aborted: {e}");
+                upload.clear();
+            }
         }
 
         while let Some(ev) = client.poll_event() {
@@ -186,6 +200,12 @@ mod tests {
             self.0.lock().unwrap().push(Outgoing::State { state: s, message: m.map(str::to_string) });
         }
         fn stats(&mut self, _: f32, _: i32, _: f32) {}
+        fn cursor_shape(&mut self, w: i32, h: i32, hot_x: i32, hot_y: i32, rgba: &[u8]) {
+            self.0.lock().unwrap().push(Outgoing::CursorShape { w, h, hot_x, hot_y, rgba: rgba.to_vec() });
+        }
+        fn cursor_pos(&mut self, x: i32, y: i32, visible: bool) {
+            self.0.lock().unwrap().push(Outgoing::CursorPos { x, y, visible });
+        }
     }
 
     fn cfg(otp: &str) -> HelloConfig {
@@ -258,5 +278,57 @@ mod tests {
         assert!(g.contains(&Outgoing::Audio { data: vec![9; 40], pts_us: 2000, codec: 1 }));
         assert!(g.iter().any(|o| matches!(o, Outgoing::State { state: 10, .. })));
         assert_eq!(g.last(), Some(&Outgoing::State { state: state::CLOSED, message: None }));
+    }
+    #[test]
+    fn cursor_down_and_log_upload_up() {
+        let (to_host, to_client) = (queue(), queue());
+        let mut host = HostSession::new(
+            MemIo::new(to_client.clone(), 0.0, 1),
+            Keypair::generate().unwrap(),
+            "654321",
+            USB_HOST_ID,
+        )
+        .unwrap();
+        let rec = Rec::default();
+        let mut w = spawn(MemIo::new(to_host.clone(), 0.0, 2), rec.clone(), cfg("654321")).unwrap();
+        let log: Vec<u8> = (0..3000u32).map(|i| (i % 200) as u8).collect();
+        let mut got: Vec<u8> = Vec::new();
+        let mut got_last = false;
+        let mut sent = false;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let seen = |rec: &Rec| {
+            let g = rec.0.lock().unwrap();
+            g.contains(&Outgoing::CursorShape { w: 1, h: 1, hot_x: 0, hot_y: 0, rgba: vec![1, 2, 3, 4] })
+                && g.contains(&Outgoing::CursorPos { x: 65535, y: 0, visible: true })
+        };
+        while Instant::now() < deadline && !(seen(&rec) && got_last) {
+            for d in drain(&to_host) {
+                host.handle_datagram(&d).unwrap();
+            }
+            while let Some(ev) = host.poll_event() {
+                match ev {
+                    HostEvent::Established { .. } => {
+                        host.send_control(ControlMessage::CursorShape { w: 1, h: 1, hot_x: 0, hot_y: 0, rgba: vec![1, 2, 3, 4] }).unwrap();
+                        host.send_control(ControlMessage::CursorPos { x: 65535, y: 0, visible: true }).unwrap();
+                        w.send(Command::UploadLog { name: "tab.log".into(), data: log.clone() });
+                        sent = true;
+                    }
+                    HostEvent::Control(ControlMessage::LogChunk { name, seq, last, data }) => {
+                        assert_eq!(name, "tab.log");
+                        assert_eq!(seq as usize * crate::glue::LOG_CHUNK_BYTES, got.len());
+                        got.extend_from_slice(&data);
+                        got_last = last;
+                    }
+                    _ => {}
+                }
+            }
+            for d in drain(&to_client) {
+                w.send(Command::Datagram(d));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        w.shutdown();
+        assert!(sent && seen(&rec), "cursor events not delivered");
+        assert!(got_last && got == log, "log upload incomplete: {} of {} bytes", got.len(), log.len());
     }
 }

@@ -7,6 +7,7 @@ mod control;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod driver;
 mod host;
+mod logexport;
 mod update;
 mod util;
 
@@ -18,6 +19,7 @@ fn main() -> eframe::Result {
         let code = rv_host_win::engine::run_cli(args.collect());
         std::process::exit(code);
     }
+    init_logging();
     update::cleanup_old();
     let demo = std::env::args().any(|a| a == "--demo");
     let viewport = eframe::egui::ViewportBuilder::default()
@@ -35,4 +37,26 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, demo)))),
     )
+}
+
+/// Starts the log file (`%LOCALAPPDATA%\\RemoteView\\logs\\remoteview-<date-time>.log`) from app
+/// start and records the environment (version, commit, OS, GPUs, outputs).
+fn init_logging() {
+    use rv_host_win::logfile::{init, write_line, PREFIX};
+    let path = init(PREFIX);
+    std::panic::set_hook(Box::new(|info| write_line("error", &format!("PANIC: {info}"))));
+    for l in rv_host_win::sysinfo::header_lines("RemoteView GUI") {
+        write_line("info", &l);
+    }
+    write_line("info", &format!("build sha: {}", update::BUILD_SHA));
+    match &path {
+        Some(p) => write_line("info", &format!("log file: {}", p.display())),
+        None => eprintln!("cannot create a log file in {}", rv_host_win::logfile::logs_dir().display()),
+    }
+    // GPU / output enumeration can take a moment: do it off the UI thread.
+    std::thread::spawn(|| {
+        for l in rv_host_win::sysinfo::startup_report("RemoteView GUI").into_iter().skip(3) {
+            write_line("info", &l);
+        }
+    });
 }

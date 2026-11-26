@@ -269,7 +269,6 @@ impl Capturer {
     /// Same contract as [`DesktopDuplicator::acquire`] but never returns an
     /// error: failures are handled internally.
     pub fn acquire(&mut self, timeout_ms: u32) -> Result<Option<CapturedFrame>> {
-        use crate::control::Level;
         if let Some(d) = self.dup.as_mut() {
             match d.acquire(timeout_ms) {
                 Ok(f) => {
@@ -283,7 +282,7 @@ impl Capturer {
                 }
                 Err(e) => {
                     self.warn_once(format!("capture: DXGI error: {e}; re-enumerating outputs"));
-                    self.prefer = Some(d.device_name().to_string());
+                    self.prefer = self.dup.as_ref().map(|d| d.device_name().to_string());
                     self.dup = None;
                     self.fail_since.get_or_insert_with(Instant::now);
                     self.retry_at = Instant::now() + self.backoff;
@@ -299,7 +298,7 @@ impl Capturer {
                     {
                         self.gdi_announced = false;
                         if self.gdi.take().is_some() {
-                            Self::log(Level::Info, "capture: DXGI duplication is back; leaving GDI fallback".into());
+                            Self::log(crate::control::Level::Info, "capture: DXGI duplication is back; leaving GDI fallback".into());
                         }
                     }
                     self.dup = Some(d);

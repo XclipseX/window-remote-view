@@ -81,7 +81,7 @@ fn gdi_devices() -> Vec<(String, String, bool)> {
             if !EnumDisplayDevicesW(PCWSTR::null(), i, &mut dd, 0).as_bool() {
                 break;
             }
-            v.push((wstr(&dd.DeviceName), wstr(&dd.DeviceString), dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE.0 != 0));
+            v.push((wstr(&dd.DeviceName), wstr(&dd.DeviceString), dd.StateFlags.0 & DISPLAY_DEVICE_PRIMARY_DEVICE.0 != 0));
             i += 1;
         }
     }

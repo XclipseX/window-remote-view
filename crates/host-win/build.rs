@@ -2,9 +2,10 @@
 
 fn main() {
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
-    println!("cargo:rerun-if-env-changed=RV_GIT_SHA");
+    println!("cargo:rerun-if-env-changed=RV_BUILD_SHA");
     println!("cargo:rerun-if-changed=../../.git/HEAD");
-    let sha = std::env::var("RV_GIT_SHA")
+    // RV_BUILD_SHA is what CI hands to the GUI's updater: keep both in agreement.
+    let sha = std::env::var("RV_BUILD_SHA")
         .ok()
         .or_else(|| std::env::var("GITHUB_SHA").ok())
         .or_else(|| {

@@ -9,7 +9,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
+#[cfg(not(windows))]
+use std::time::UNIX_EPOCH;
 
 /// How many `remoteview-*.log` files (and `android-*.log` files) are kept.
 pub const KEEP: usize = 10;
@@ -138,7 +140,7 @@ fn rotate_android(dir: &Path, keep: usize) {
                 .collect()
         })
         .unwrap_or_default();
-    v.sort_by(|a, b| b.0.cmp(&a.0));
+    v.sort_by_key(|b| std::cmp::Reverse(b.0));
     for (_, p) in v.into_iter().skip(keep) {
         let _ = fs::remove_file(p);
     }
@@ -273,7 +275,7 @@ impl LogAssembler {
 
     /// Feeds one chunk; returns the log when it just became complete.
     pub fn push(&mut self, name: &str, seq: u32, last: bool, data: &[u8], now: Instant) -> Option<FinishedLog> {
-        if seq == 0 {
+        if seq == 0 && self.files.get(name).is_some_and(|p| p.chunks.contains_key(&0)) {
             // A new upload of the same file replaces a stale partial one.
             self.files.remove(name);
         }

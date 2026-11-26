@@ -207,7 +207,7 @@ mod win {
                 Ok(dib) if !bits.is_null() && !mem.is_invalid() => {
                     let old = SelectObject(mem, dib.into());
                     let n = (w * h * 4) as usize;
-                    let mut draw = |fill: u8| -> Vec<u8> {
+                    let draw = |fill: u8| -> Vec<u8> {
                         std::ptr::write_bytes(bits as *mut u8, fill, n);
                         let _ = DrawIconEx(mem, 0, 0, HICON(hcursor.0), w as i32, h as i32, 0, None, DI_NORMAL);
                         let _ = GdiFlush();
@@ -323,7 +323,7 @@ mod tests {
         let (o, w, h) = downscale_rgba(&src[..32 * 32 * 4], 32, 32, 64);
         assert_eq!((w, h, o.len()), (32, 32, 32 * 32 * 4));
         // payload of a capped cursor always fits one control packet
-        assert!(8 + 64 * 64 * 4 <= rv_proto::MAX_CONTROL_PAYLOAD);
+        const { assert!(8 + 64 * 64 * 4 <= rv_proto::MAX_CONTROL_PAYLOAD) };
     }
 
     #[test]

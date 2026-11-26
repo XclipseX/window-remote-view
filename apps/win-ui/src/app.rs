@@ -74,6 +74,10 @@ pub struct App {
     upd_tx: std::sync::mpsc::Sender<crate::update::UpdateMsg>,
     upd_rx: Receiver<crate::update::UpdateMsg>,
     upd: UpdateState,
+    /// Outputs shown in the "Màn hình cần chia sẻ" picker.
+    outputs: Vec<rv_host_win::capture::OutputInfo>,
+    /// Result of the last "Xuất log" (success?, text).
+    export_note: Option<(bool, String)>,
 }
 
 #[derive(Default)]
@@ -171,7 +175,12 @@ impl App {
             upd_tx,
             upd_rx,
             upd: UpdateState::Idle,
+            outputs: Vec::new(),
+            export_note: None,
         };
+        if !demo {
+            app.refresh_outputs();
+        }
         if !demo && app.cfg.auto_update_check {
             app.check_update(false);
         }
@@ -290,7 +299,33 @@ impl App {
         }
     }
 
+    fn refresh_outputs(&mut self) {
+        self.outputs = rv_host_win::capture::list_outputs().unwrap_or_default().into_iter().filter(|o| o.attached).collect();
+    }
+
+    fn export_logs(&mut self) {
+        match crate::logexport::export_logs() {
+            Ok(p) => {
+                self.log(LogLevel::Info, format!("Đã xuất log: {}", p.display()));
+                self.export_note = Some((true, format!("Đã lưu {}", p.display())));
+                crate::logexport::reveal(&p);
+            }
+            Err(e) => {
+                self.log(LogLevel::Error, format!("Xuất log thất bại: {e}"));
+                self.export_note = Some((false, e));
+            }
+        }
+    }
+
     fn log(&mut self, level: LogLevel, msg: String) {
+        rv_host_win::logfile::write_line(
+            match level {
+                LogLevel::Info => "info",
+                LogLevel::Warn => "warn",
+                LogLevel::Error => "error",
+            },
+            &msg,
+        );
         if self.logs.len() >= MAX_LOGS {
             self.logs.pop_front();
         }
@@ -959,6 +994,30 @@ impl App {
                     });
                     ui.end_row();
 
+                    ui.label("Màn hình cần chia sẻ");
+                    ui.horizontal(|ui| {
+                        let auto = "Tự động (màn hình laptop)";
+                        let cur = match &self.cfg.monitor {
+                            None => auto.to_string(),
+                            Some(m) => self
+                                .outputs
+                                .iter()
+                                .find(|o| o.name.eq_ignore_ascii_case(m))
+                                .map(|o| o.label())
+                                .unwrap_or_else(|| format!("{m} (không còn kết nối)")),
+                        };
+                        egui::ComboBox::from_id_salt("monitor").selected_text(cur).width(420.0).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.cfg.monitor, None, auto);
+                            for o in &self.outputs {
+                                ui.selectable_value(&mut self.cfg.monitor, Some(o.name.clone()), o.label());
+                            }
+                        });
+                        if ui.button("Làm mới").clicked() {
+                            self.refresh_outputs();
+                        }
+                    });
+                    ui.end_row();
+
                     ui.label("Chế độ màn hình");
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut self.cfg.display, Display::Mirror, "Hiển thị màn hình laptop");
@@ -969,7 +1028,7 @@ impl App {
                     });
                     ui.end_row();
                 });
-                ui.weak("Chất lượng, FPS và độ phân giải áp dụng ngay khi đang chia sẻ. Codec, bộ mã hóa, chế độ màn hình áp dụng ở lần bắt đầu kế tiếp.");
+                ui.weak("Chất lượng, FPS và độ phân giải áp dụng ngay khi đang chia sẻ. Codec, bộ mã hóa, màn hình chia sẻ, chế độ màn hình áp dụng ở lần bắt đầu kế tiếp. Ảnh luôn giữ đúng tỉ lệ của màn hình được chia sẻ (không bị kéo giãn).");
             });
             card(ui, |ui| {
                 ui.label(RichText::new("Hệ thống").strong());
@@ -1069,7 +1128,14 @@ impl App {
             if ui.button("Xóa").clicked() {
                 self.logs.clear();
             }
+            if ui.button("Xuất log").on_hover_text("Nén log hiện tại, log trước đó và log Android đã nhận ra Desktop").clicked() {
+                self.export_logs();
+            }
         });
+        if let Some((ok, note)) = &self.export_note {
+            let c = if *ok { Color32::from_rgb(60, 170, 90) } else { Color32::from_rgb(230, 70, 70) };
+            ui.colored_label(c, note);
+        }
         card(ui, |ui| {
             egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
                 if self.logs.is_empty() {

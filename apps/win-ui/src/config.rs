@@ -92,6 +92,8 @@ pub struct Config {
     pub codec: Codec,
     pub encoder: Encoder,
     pub display: Display,
+    /// GDI name of the display to share (`\\.\DISPLAY1`); None = automatic (the laptop's own panel).
+    pub monitor: Option<String>,
     pub autostart: bool,
     pub minimize_to_tray: bool,
     /// Check GitHub for a newer build on startup.
@@ -110,6 +112,7 @@ impl Default for Config {
             codec: Codec::Auto,
             encoder: Encoder::Auto,
             display: Display::Mirror,
+            monitor: None,
             autostart: false,
             minimize_to_tray: false,
             auto_update_check: true,
@@ -168,8 +171,11 @@ impl Config {
             self.encoder.arg().into(),
             "--display".into(),
             self.display.arg().into(),
-            "--json-status".into(),
         ]);
+        if let Some(m) = self.monitor.as_deref().filter(|m| !m.trim().is_empty()) {
+            a.extend(["--monitor".into(), m.to_string()]);
+        }
+        a.push("--json-status".into());
         a
     }
 }
@@ -195,6 +201,11 @@ mod tests {
         let a = c.host_args();
         assert_eq!(a[0], "--lan");
         assert!(a.windows(2).any(|w| w == ["--width", "1920"]));
+        assert_eq!(a.last().unwrap(), "--json-status");
+        assert!(!a.contains(&"--monitor".to_string()));
+        let c = Config { monitor: Some(r"\\.\DISPLAY1".into()), ..Default::default() };
+        let a = c.host_args();
+        assert!(a.windows(2).any(|w| w == ["--monitor", r"\\.\DISPLAY1"]));
         assert_eq!(a.last().unwrap(), "--json-status");
     }
 }
