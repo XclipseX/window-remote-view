@@ -99,13 +99,13 @@ class DiagChecks(context: Context, private val facts: DiagFacts) {
         )
         return if (wifiOnly) {
             CheckResult(
-                "cellular", s(R.string.diag_c_cellular), Verdict.WARN,
+                "cellular", s(R.string.diag_c_cellular), Verdict.INFO,
                 s(R.string.diag_cell_wifi_only), details,
                 s(R.string.diag_cell_wifi_only_explain), s(R.string.diag_cell_wifi_only_fix),
             )
         } else {
             CheckResult(
-                "cellular", s(R.string.diag_c_cellular), Verdict.OK,
+                "cellular", s(R.string.diag_c_cellular), Verdict.INFO,
                 s(R.string.diag_cell_has), details,
                 s(R.string.diag_cell_has_explain), s(R.string.diag_cell_has_fix),
             )

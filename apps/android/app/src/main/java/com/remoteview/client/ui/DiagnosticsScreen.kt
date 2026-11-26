@@ -39,6 +39,7 @@ import com.remoteview.client.R
 import com.remoteview.client.diag.CheckResult
 import com.remoteview.client.diag.DiagReport
 import com.remoteview.client.diag.DiagRunner
+import com.remoteview.client.diag.TetherMonitor
 import com.remoteview.client.diag.UsbStateMonitor
 import com.remoteview.client.diag.Verdict
 import kotlinx.coroutines.Dispatchers
@@ -61,6 +62,38 @@ fun DiagnosticsScreen(onBack: () -> Unit) {
     var usbNote by remember { mutableStateOf<String?>(null) }
     var job by remember { mutableStateOf<Job?>(null) }
     var reportText by remember { mutableStateOf("") }
+    var tetherRunning by remember { mutableStateOf(false) }
+    var tetherResult by remember { mutableStateOf<CheckResult?>(null) }
+    val tetherLines = remember { mutableStateListOf<String>() }
+
+    fun refreshExport() {
+        val r = report ?: return
+        val merged = tetherResult?.let { t -> r.copy(checks = r.checks.filter { it.id != "tether" } + t) } ?: r
+        val text = DiagRunner.buildText(context, merged)
+        reportText = text
+        scope.launch {
+            val path = withContext(Dispatchers.IO) { DiagRunner.save(context, merged, text) }
+            savedPath = path ?: context.getString(R.string.diag_save_failed)
+        }
+    }
+
+    fun runTether() {
+        if (tetherRunning) return
+        tetherRunning = true
+        tetherResult = null
+        tetherLines.clear()
+        scope.launch {
+            try {
+                val res = withContext(Dispatchers.IO) {
+                    TetherMonitor.run(context) { line -> tetherLines.add(line) }
+                }
+                tetherResult = res
+                refreshExport()
+            } finally {
+                tetherRunning = false
+            }
+        }
+    }
 
     fun runDiag() {
         job?.cancel()
@@ -77,6 +110,7 @@ fun DiagnosticsScreen(onBack: () -> Unit) {
                 reportText = text
                 report = r
                 savedPath = path ?: context.getString(R.string.diag_save_failed)
+                if (tetherResult != null) refreshExport()
             } finally {
                 running = false
             }
@@ -140,8 +174,31 @@ fun DiagnosticsScreen(onBack: () -> Unit) {
                     savedPath?.let { Text(stringResource(R.string.diag_saved_to, it), style = MaterialTheme.typography.bodySmall) }
                 }
             }
+            item(key = "tether-ui") {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(stringResource(R.string.diag_tm_title), style = MaterialTheme.typography.titleMedium)
+                        Text(stringResource(R.string.diag_tm_howto), style = MaterialTheme.typography.bodyMedium)
+                        Button(onClick = { runTether() }, enabled = !tetherRunning) {
+                            Text(
+                                if (tetherRunning) stringResource(R.string.diag_tm_stop_running, tetherLines.size)
+                                else stringResource(R.string.diag_tm_button),
+                            )
+                        }
+                        if (tetherRunning && tetherLines.isNotEmpty()) {
+                            Text(
+                                tetherLines.takeLast(8).joinToString("\n"),
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp,
+                            )
+                        }
+                    }
+                }
+            }
+            tetherResult?.let { tr -> item(key = "tether-result") { CheckCard(tr) } }
             report?.takeIf { !running }?.let { r -> item(key = "summary") { CheckCard(r.summary, big = true) } }
-            val shown = if (running) partial.toList() else (report?.checks ?: partial.toList())
+            val shown = if (running) partial.toList() else (report?.checks ?: partial.toList()).filter { it.id != "tether" }
             items(shown, key = { it.id }) { CheckCard(it) }
         }
     }

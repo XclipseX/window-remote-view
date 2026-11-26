@@ -58,4 +58,224 @@
     <string name="mod_esc">Esc</string>
     <string name="mod_prtsc">PrtSc</string>
     <string name="mod_keyboard">Bàn phím</string>
+
+    <!-- Chẩn đoán toàn diện -->
+    <string name="home_diag">Chẩn đoán toàn diện</string>
+    <string name="home_diag_hint">Kiểm tra vì sao cáp USB chưa hiện màn hình phụ hoặc không bật được USB tethering. Có thể sao chép/chia sẻ báo cáo.</string>
+    <string name="diag_title">Chẩn đoán toàn diện</string>
+    <string name="diag_back">Quay lại</string>
+    <string name="diag_instruction">Hãy cắm cáp USB-C vào laptop (laptop đang bật) trước khi chạy chẩn đoán. Rút/cắm cáp khi màn hình này đang mở thì kết quả tự cập nhật.</string>
+    <string name="diag_rerun">Chạy lại</string>
+    <string name="diag_running">Đang chạy…</string>
+    <string name="diag_copy">Sao chép báo cáo</string>
+    <string name="diag_share">Chia sẻ</string>
+    <string name="diag_copied">Đã sao chép báo cáo vào bộ nhớ tạm</string>
+    <string name="diag_saved_to">Đã lưu báo cáo: %1$s</string>
+    <string name="diag_save_failed">Không lưu được file báo cáo</string>
+    <string name="diag_usb_changed">USB vừa thay đổi (cắm/rút cáp), đang chạy lại…</string>
+    <string name="diag_summary_title">Kết luận</string>
+    <string name="diag_why_label">Giải thích: %1$s</string>
+    <string name="diag_fix_label">Cách xử lý: %1$s</string>
+    <string name="diag_kv">%1$s: %2$s</string>
+    <string name="diag_yes">có</string>
+    <string name="diag_no">không</string>
+    <string name="diag_unknown">không rõ</string>
+    <string name="diag_none">không có</string>
+    <string name="diag_na">n/a</string>
+    <string name="diag_unavailable">không khả dụng</string>
+    <string name="diag_unavailable_api">cần Android 12 trở lên</string>
+    <string name="diag_installed">đã cài đặt</string>
+    <string name="diag_not_installed">chưa cài đặt</string>
+    <string name="diag_error_fmt">Lỗi khi đọc (%1$s)</string>
+    <string name="diag_check_crashed">Mục này không chạy được (lỗi bất ngờ). Xem chi tiết bên dưới.</string>
+    <string name="diag_report_header">Báo cáo chẩn đoán Remote View</string>
+    <string name="diag_report_time">Thời điểm: %1$s</string>
+    <string name="diag_c_device">1. Thiết bị</string>
+    <string name="diag_c_cellular">2. Khả năng mạng di động (tham khảo)</string>
+    <string name="diag_c_usb">3. Trạng thái USB</string>
+    <string name="diag_c_aoa">4. USB accessory (AOA)</string>
+    <string name="diag_c_dev">5. Tùy chọn nhà phát triển / ADB</string>
+    <string name="diag_c_net">6. Giao diện mạng</string>
+    <string name="diag_c_reach">7. Thử kết nối cục bộ</string>
+    <string name="diag_c_apps">8. Ứng dụng liên quan</string>
+    <string name="diag_c_codec">9. Bộ giải mã video</string>
+    <string name="diag_c_display">10. Màn hình</string>
+    <string name="diag_c_thermal">11. Nhiệt độ, pin, nguồn</string>
+    <string name="diag_c_audio">12. Âm thanh</string>
+    <string name="diag_l_manufacturer">Hãng</string>
+    <string name="diag_l_model">Model</string>
+    <string name="diag_l_android">Android</string>
+    <string name="diag_l_patch">Bản vá bảo mật</string>
+    <string name="diag_l_build">Bản dựng</string>
+    <string name="diag_l_soc">SoC</string>
+    <string name="diag_l_oneui">One UI</string>
+    <string name="diag_oneui_skipped">bỏ qua (không đọc được bằng API công khai)</string>
+    <string name="diag_dev_x820">SM-X820 = Galaxy Tab S10+ bản Wi-Fi (không có SIM).</string>
+    <string name="diag_dev_x826">SM-X826 = Galaxy Tab S10+ bản 5G (có SIM).</string>
+    <string name="diag_dev_x920">SM-X920 = Galaxy Tab S10 Ultra bản Wi-Fi.</string>
+    <string name="diag_dev_x926">SM-X926 = Galaxy Tab S10 Ultra bản 5G.</string>
+    <string name="diag_device_explain">Thông tin này giúp đối chiếu với các kết luận bên dưới. Số hiệu model cho biết máy là bản Wi-Fi hay 5G.</string>
+    <string name="diag_l_feature_tel">FEATURE_TELEPHONY</string>
+    <string name="diag_l_phone_type">phoneType</string>
+    <string name="diag_l_sim_state">simState (mã)</string>
+    <string name="diag_cell_wifi_only">Hệ thống không báo có phần cứng điện thoại/di động.</string>
+    <string name="diag_cell_wifi_only_explain">Chỉ mang tính tham khảo: máy không khai báo FEATURE_TELEPHONY hoặc phoneType = NONE. Nếu bạn dùng bản 5G (SM-X826) mà vẫn ra kết quả này thì có thể do chưa lắp SIM hoặc ROM khai báo khác. Mục này không dùng để kết luận về USB tethering.</string>
+    <string name="diag_cell_wifi_only_fix">Không cần xử lý. Xem mục \"Theo dõi USB tethering\" để biết vì sao công tắc tự tắt.</string>
+    <string name="diag_cell_has">Máy có phần cứng di động (bản 5G/LTE).</string>
+    <string name="diag_cell_has_explain">Mục Điểm truy cập di động và Chia sẻ kết nối có sẵn. Nếu bật USB tethering mà công tắc tự nhảy về tắt, nguyên nhân thường nằm ở driver Windows hoặc cấu hình USB, không phải do thiếu phần cứng.</string>
+    <string name="diag_cell_has_fix">Dùng mục \"Theo dõi USB tethering\" bên dưới để ghi lại diễn biến khi bật.</string>
+    <string name="diag_l_usb_connected">connected</string>
+    <string name="diag_l_usb_configured">configured</string>
+    <string name="diag_l_usb_function">Function đang bật</string>
+    <string name="diag_l_usb_other">Extra khác</string>
+    <string name="diag_usb_nobroadcast">Không đọc được trạng thái USB từ hệ thống.</string>
+    <string name="diag_usb_nobroadcast_explain">Hệ thống không phát broadcast USB_STATE (các extra này là de-facto, không được tài liệu hóa chính thức, nên máy có thể không có).</string>
+    <string name="diag_usb_none">Không phát hiện cáp hoặc máy chủ (host) USB.</string>
+    <string name="diag_usb_none_explain">Máy tính bảng chưa thấy laptop ở đầu bên kia. Có thể cáp chưa cắm, laptop đang tắt/ngủ, cổng laptop chỉ sạc, hoặc cáp lỏng.</string>
+    <string name="diag_usb_plug_fix">Cắm cáp USB-C vào cổng USB của laptop (laptop đang bật, ưu tiên cổng có biểu tượng dữ liệu/Thunderbolt), rồi bấm Chạy lại.</string>
+    <string name="diag_usb_chargeonly">USB đang chỉ sạc / không có dữ liệu.</string>
+    <string name="diag_usb_chargeonly_explain">Đã thấy nguồn/kết nối nhưng chưa có cấu hình dữ liệu (configured = false, không có function nào). Có thể là cáp chỉ sạc, cổng laptop không có dữ liệu, hoặc thông báo USB đang ở chế độ \"Chỉ sạc\".</string>
+    <string name="diag_usb_chargeonly_fix">Thử cáp khác hoặc cổng khác của laptop; kéo thanh thông báo &gt; chạm thông báo USB &gt; chọn \"Truyền tệp\" (File transfer) để buộc bật dữ liệu rồi chạy lại.</string>
+    <string name="diag_usb_data">Cáp có truyền dữ liệu. Function đang bật: %1$s.</string>
+    <string name="diag_usb_data_explain">USB đã được cấu hình (configured) hoặc có function dữ liệu hoạt động, tức cáp và cổng đều truyền dữ liệu được.</string>
+    <string name="diag_usb_data_fix">Không cần xử lý. Để dùng màn hình phụ, host Windows của app cần chuyển máy sang chế độ AOA (mục 4).</string>
+    <string name="diag_usb_unknown">Trạng thái USB chưa rõ.</string>
+    <string name="diag_usb_unknown_explain">Có broadcast nhưng thiếu extra connected/configured nên không kết luận chắc chắn được.</string>
+    <string name="diag_l_feature_acc">FEATURE_USB_ACCESSORY</string>
+    <string name="diag_l_feature_host">FEATURE_USB_HOST</string>
+    <string name="diag_l_acc_count">Số accessory đang gắn</string>
+    <string name="diag_acc_item">Accessory: hãng=%1$s model=%2$s có quyền=%3$s</string>
+    <string name="diag_aoa_unsupported">Máy không khai báo hỗ trợ USB accessory.</string>
+    <string name="diag_aoa_unsupported_explain">Không có FEATURE_USB_ACCESSORY nên chế độ AOA không dùng được.</string>
+    <string name="diag_aoa_unsupported_fix">Dùng ADB reverse (bật Gỡ lỗi USB) hoặc Wi-Fi/LAN.</string>
+    <string name="diag_aoa_ok">Đã gắn accessory RemoteView và có quyền truy cập.</string>
+    <string name="diag_aoa_ok_explain">Host Windows đã chuyển máy sang chế độ AOA thành công. Đây là đường USB chính của app.</string>
+    <string name="diag_aoa_noperm">Đã gắn accessory RemoteView nhưng chưa có quyền.</string>
+    <string name="diag_aoa_noperm_explain">Android cần bạn cấp quyền truy cập accessory.</string>
+    <string name="diag_aoa_noperm_fix">Rút cắm lại cáp và chọn Cho phép/OK ở hộp thoại; hoặc mở app qua thông báo USB.</string>
+    <string name="diag_aoa_waiting">Chưa có accessory RemoteView nào được gắn.</string>
+    <string name="diag_aoa_waiting_explain">AOA chỉ xuất hiện sau khi chương trình host (app Windows của Remote View) chạy trên laptop và đưa máy vào chế độ accessory. Thông báo USB mặc định chỉ có Truyền tệp/Android Auto là bình thường khi host chưa chạy.</string>
+    <string name="diag_aoa_waiting_fix">Chạy app host Remote View trên laptop với cáp đã cắm, rồi bấm Chạy lại.</string>
+    <string name="diag_l_dev_opts">Tùy chọn nhà phát triển bật</string>
+    <string name="diag_l_adb">Gỡ lỗi USB (ADB) bật</string>
+    <string name="diag_dev_adb_on">Gỡ lỗi USB đang bật.</string>
+    <string name="diag_dev_adb_off">Gỡ lỗi USB đang tắt hoặc không đọc được.</string>
+    <string name="diag_dev_explain">Đường dự phòng ADB reverse cần bật Tùy chọn nhà phát triển và Gỡ lỗi USB, và laptop phải chấp nhận khóa RSA. Chế độ AOA thì không cần.</string>
+    <string name="diag_dev_fix">Chỉ cần nếu muốn dùng ADB: Cài đặt &gt; Giới thiệu máy &gt; Thông tin phần mềm &gt; chạm 7 lần Số bản dựng, rồi bật Gỡ lỗi USB.</string>
+    <string name="diag_if_item">%1$s: %2$s%3$s%4$s | IPv4 %5$s | IPv6 %6$s</string>
+    <string name="diag_l_active_net">Mạng đang dùng</string>
+    <string name="diag_net_active_fmt">%1$s, đã xác thực=%2$s, tính phí=%3$s</string>
+    <string name="diag_l_all_net">Tất cả mạng</string>
+    <string name="diag_l_wifi_enabled">Wi-Fi bật</string>
+    <string name="diag_l_wifi_link">Liên kết Wi-Fi</string>
+    <string name="diag_wifi_fmt">%1$d Mbps, RSSI %2$d dBm, %3$d MHz</string>
+    <string name="diag_net_tether">Có giao diện USB tethering (rndis/usb/ncm) đang hoạt động.</string>
+    <string name="diag_net_tether_explain">USB tethering đang chạy: app có thể kết nối qua IP của giao diện này.</string>
+    <string name="diag_net_notether">Không có giao diện USB tethering.</string>
+    <string name="diag_net_notether_explain">Không thấy rndis*/usb*/ncm* ở trạng thái up có IPv4. Nghĩa là USB tethering chưa bật (hoặc không bật được).</string>
+    <string name="diag_net_notether_fix">Không bắt buộc: dùng chế độ AOA của app. Nếu cần tethering: mục Điểm phát sóng và chia sẻ kết nối &gt; USB tethering (có thể bị ẩn trên máy Wi-Fi-only).</string>
+    <string name="diag_l_adb_reverse">127.0.0.1:47810 mở (ADB reverse)</string>
+    <string name="diag_l_hosts_found">Số host phản hồi beacon (UDP 47800)</string>
+    <string name="diag_host_item">Host %1$s: %2$s</string>
+    <string name="diag_reach_both">ADB reverse đang hoạt động và có host trong LAN.</string>
+    <string name="diag_reach_adb">ADB reverse đang hoạt động (cổng 47810 mở).</string>
+    <string name="diag_reach_lan">Tìm thấy %1$d host trong mạng LAN.</string>
+    <string name="diag_reach_none">Chưa thấy ADB reverse và chưa thấy host nào trong LAN.</string>
+    <string name="diag_reach_explain">Mở được cổng 47810 chỉ cho biết lệnh adb reverse đã thiết lập, không chắc host đang lắng nghe. Phát UDP broadcast cổng 47800 và nghe 1,5 giây; thiếu phản hồi có thể do host chưa chạy, khác mạng, tường lửa hoặc Wi-Fi chặn broadcast (AP isolation). Không phát hiện được AOA ở bước này (xem mục 4).</string>
+    <string name="diag_reach_fix">Chạy app host trên laptop; cho phép nó qua Windows Firewall; đảm bảo cả hai cùng mạng Wi-Fi. Với USB: chạy adb reverse tcp:47810 tcp:47810 hoặc dùng AOA.</string>
+    <string name="diag_l_pkg">Gói</string>
+    <string name="diag_apps_installed">Đã cài spacedesk.</string>
+    <string name="diag_apps_none">Chưa cài spacedesk.</string>
+    <string name="diag_apps_explain">Chỉ báo có/không. Chế độ USB của spacedesk thường dựa trên USB tethering nên cần mục tethering của Android; nếu tethering bị ẩn thì chế độ đó không hoạt động offline.</string>
+    <string name="diag_codec_missing">%1$s: không có bộ giải mã</string>
+    <string name="diag_codec_item">%1$s | %2$s | %3$s | độ trễ thấp=%4$s | 2800x1752@120=%5$s | fps tối đa=%6$s | tham số vendor=%7$s</string>
+    <string name="diag_size_unsupported">không hỗ trợ</string>
+    <string name="diag_l_chosen_codec">Dự kiến app chọn</string>
+    <string name="diag_codec_none">Không tìm thấy bộ giải mã video nào.</string>
+    <string name="diag_codec_none_explain">Hiếm gặp: danh sách MediaCodec trống hoặc bị lỗi.</string>
+    <string name="diag_codec_nosize">Không bộ giải mã H.264/HEVC nào báo chịu được 2800x1752@120.</string>
+    <string name="diag_codec_nosize_explain">App vẫn có thể chạy ở độ phân giải hoặc FPS thấp hơn; thiết bị tự hạ theo khả năng báo cáo.</string>
+    <string name="diag_codec_nosize_fix">Giảm độ phân giải/FPS trong Cài đặt (ví dụ 60 FPS) và thử HEVC.</string>
+    <string name="diag_codec_pick">App dự kiến dùng %1$s.</string>
+    <string name="diag_codec_explain">Ưu tiên HEVC phần cứng, rồi H.264; AV1 chỉ dùng khi bật cờ cho phép. Giá trị độ trễ thấp và tham số vendor chỉ mang tính tham khảo, cần đo trên máy thật.</string>
+    <string name="diag_codec_sw_explain">Chỉ giải mã phần mềm mới đủ khả năng: sẽ chậm và tốn pin.</string>
+    <string name="diag_l_cur_mode">Chế độ hiện tại</string>
+    <string name="diag_l_cur_refresh">Tần số quét hiện tại</string>
+    <string name="diag_l_hdr">HDR</string>
+    <string name="diag_display_120">Màn hình hỗ trợ tới %1$s Hz.</string>
+    <string name="diag_display_lower">Tần số quét tối đa đọc được: %1$s Hz.</string>
+    <string name="diag_display_explain">Danh sách chế độ (độ phân giải + Hz) mà app dùng để khóa tần số quét ở độ phân giải gốc.</string>
+    <string name="diag_display_fix">Nếu thấp hơn 120 Hz: bật Cài đặt &gt; Màn hình &gt; Độ mượt chuyển động = Cao/Thích ứng.</string>
+    <string name="diag_l_thermal">Trạng thái nhiệt</string>
+    <string name="diag_l_headroom">Dự trữ nhiệt (headroom 10 giây, 1.0 = ngưỡng bóp)</string>
+    <string name="diag_l_powersave">Tiết kiệm pin bật</string>
+    <string name="diag_l_battery">Pin</string>
+    <string name="diag_l_charging">Tình trạng sạc</string>
+    <string name="diag_l_plugged">Nguồn cắm</string>
+    <string name="diag_bat_charging">đang sạc</string>
+    <string name="diag_bat_discharging">đang xả</string>
+    <string name="diag_bat_full">đầy</string>
+    <string name="diag_bat_notcharging">không sạc</string>
+    <string name="diag_thermal_ok">Nhiệt và nguồn bình thường.</string>
+    <string name="diag_thermal_warn">Có yếu tố có thể làm giảm hiệu năng (nóng, tiết kiệm pin hoặc pin thấp).</string>
+    <string name="diag_thermal_explain">Máy nóng hoặc bật tiết kiệm pin sẽ bị giảm xung, ảnh hưởng FPS/độ trễ. Khi cắm USB vào laptop, nguồn cấp có thể yếu hơn bộ sạc riêng.</string>
+    <string name="diag_thermal_fix">Để máy nguội, tắt Tiết kiệm pin, cắm sạc.</string>
+    <string name="diag_l_fpb">Frames mỗi buffer</string>
+    <string name="diag_l_rate">Tần số lấy mẫu đầu ra (Hz)</string>
+    <string name="diag_l_audio_ll">FEATURE_AUDIO_LOW_LATENCY</string>
+    <string name="diag_l_audio_pro">FEATURE_AUDIO_PRO</string>
+    <string name="diag_audio_ok">Máy hỗ trợ âm thanh độ trễ thấp.</string>
+    <string name="diag_audio_nolow">Máy không khai báo âm thanh độ trễ thấp.</string>
+    <string name="diag_audio_explain">App phát PCM 48 kHz qua AudioTrack chế độ độ trễ thấp; kết quả thực tế phải đo trên máy.</string>
+    <string name="diag_audio_fix">Âm thanh có thể trễ hơn; có thể tắt âm thanh trong Cài đặt nếu bị lệch hình.</string>
+    <string name="diag_sum_data_mtp">Cáp có truyền dữ liệu (MTP/PTP đang hoạt động).</string>
+    <string name="diag_sum_data">Cáp có truyền dữ liệu (function: %1$s).</string>
+    <string name="diag_sum_chargeonly">USB đang chỉ sạc / không có dữ liệu: kiểm tra cáp, cổng laptop, và chọn Truyền tệp trong thông báo USB.</string>
+    <string name="diag_sum_nousb">Không phát hiện laptop qua USB: cắm cáp vào laptop đang bật rồi chạy lại.</string>
+    <string name="diag_sum_spacedesk">Đã cài spacedesk (chế độ USB của nó thường cần USB tethering hoạt động).</string>
+    <string name="diag_sum_tether">USB tethering đang hoạt động (có giao diện rndis/usb/ncm).</string>
+    <string name="diag_sum_aoa_ok">Đã có accessory RemoteView (AOA): đường USB chính sẵn sàng.</string>
+    <string name="diag_sum_aoa_wait">Chưa có accessory RemoteView: cần chạy app host trên laptop để chuyển máy sang AOA.</string>
+    <string name="diag_sum_adb_ok">ADB reverse đang hoạt động.</string>
+    <string name="diag_sum_adb_off">Gỡ lỗi USB đang tắt nên đường ADB dự phòng không dùng được (AOA không cần).</string>
+    <string name="diag_sum_lan">Thấy %1$d host trong LAN.</string>
+    <string name="diag_sum_codec">Bộ giải mã dự kiến: %1$s.</string>
+    <string name="diag_sum_head_route">Có ít nhất một đường kết nối sẵn sàng.</string>
+    <string name="diag_sum_head_data_noroute">Cáp ổn nhưng chưa có đường kết nối nào của app.</string>
+    <string name="diag_sum_head_charge">USB chưa có dữ liệu, chưa kết nối được.</string>
+    <string name="diag_sum_head_nousb">Chưa phát hiện USB và chưa có đường kết nối nào.</string>
+    <string name="diag_sum_fix_data">Chạy app host Remote View trên laptop (AOA) hoặc adb reverse, rồi bấm Chạy lại.</string>
+    <string name="diag_sum_fix_cable">Cắm cáp USB-C vào laptop đang bật, thử cáp/cổng khác, rồi bấm Chạy lại.</string>
+    <string name="diag_sum_tether_hint">USB tethering chưa chạy: dùng nút Theo dõi bật USB tethering (20 giây) để biết vì sao công tắc tự tắt.</string>
+    <string name="diag_c_tether">13. Theo dõi USB tethering</string>
+    <string name="diag_c_windows">14. Thông tin Windows cần kiểm tra</string>
+    <string name="diag_tm_button">Theo dõi bật USB tethering (20 giây)</string>
+    <string name="diag_tm_stop_running">Đang theo dõi… (%1$d sự kiện)</string>
+    <string name="diag_tm_howto">Bấm nút này, rồi vào Cài đặt bật Chia sẻ kết nối qua USB, rồi quay lại app. Cáp phải đang cắm vào laptop đang bật.</string>
+    <string name="diag_tm_title">Theo dõi USB tethering</string>
+    <string name="diag_tm_no_events">Không ghi nhận sự kiện nào trong 20 giây.</string>
+    <string name="diag_tm_ok">rndis/ncm xuất hiện và giao diện có địa chỉ IPv4: tethering hoạt động.</string>
+    <string name="diag_tm_ok_explain">Windows đã nhận driver và Android giữ được USB tethering.</string>
+    <string name="diag_tm_driver">rndis/ncm bật rồi tắt trong vài giây và chưa từng có IP.</string>
+    <string name="diag_tm_driver_explain">Máy tính (Windows) không nhận driver RNDIS/NCM nên Android tự tắt lại: công tắc nhảy về tắt và thông báo USB quay về Truyền tệp/Android Auto.</string>
+    <string name="diag_tm_driver_fix">Trên Windows: mở Device Manager, tìm thiết bị lạ tên RNDIS / Android / SAMSUNG Mobile USB Remote NDIS dưới Other devices &gt; Update driver &gt; Browse my computer &gt; Let me pick from a list &gt; Network adapters &gt; Microsoft &gt; Remote NDIS Compatible Device (hoặc UsbNcm Host Device). Hoặc cài Samsung USB Driver for Mobile Phones.</string>
+    <string name="diag_tm_noip">rndis/ncm xuất hiện nhưng giao diện chưa nhận được IPv4.</string>
+    <string name="diag_tm_noip_explain">Cấu hình USB đã chuyển nhưng host chưa hoàn tất (thiếu driver hoặc dịch vụ chia sẻ DHCP trên Windows không nhận).</string>
+    <string name="diag_tm_nocable">Trong 20 giây không thấy USB kết nối với host.</string>
+    <string name="diag_tm_nocable_explain">Không có connected = true trong lúc theo dõi: cáp rút ra, laptop tắt/ngủ, hoặc cổng không cấp dữ liệu.</string>
+    <string name="diag_tm_powerOnly">USB có kết nối nhưng chưa từng được cấu hình (configured = false).</string>
+    <string name="diag_tm_powerOnly_explain">Cáp/cổng chỉ cấp nguồn hoặc host không liệt kê (enumerate) thiết bị. Vì vậy mọi chế độ dữ liệu đều không thể bật.</string>
+    <string name="diag_tm_rejected">Function không bao giờ chuyển sang rndis/ncm.</string>
+    <string name="diag_tm_rejected_explain">Android/One UI từ chối đổi cấu hình USB: có thể do Tự động chặn (Auto Blocker), khóa màn hình, hoặc chính sách hệ thống. Cũng có thể bạn chưa bật công tắc trong 20 giây.</string>
+    <string name="diag_tm_rejected_fix">Tùy chọn nhà phát triển &gt; Cấu hình USB mặc định (Default USB configuration) = USB tethering. Tắt Tự động chặn: Cài đặt &gt; Bảo mật và quyền riêng tư &gt; Tự động chặn. Thử cổng USB-C khác trên laptop (phải là cổng dữ liệu, không phải chỉ DisplayPort/chỉ sạc), thử xoay đầu cáp hoặc dùng cáp USB 2.0.</string>
+    <string name="diag_win_headline">Các bước kiểm tra phía Windows khi USB tethering tự tắt.</string>
+    <string name="diag_win_steps">1. Cắm cáp, bật USB tethering trên máy tính bảng.
+2. Mở Device Manager (Win+X &gt; Device Manager).
+3. Tìm mục Other devices: thiết bị lạ có tên RNDIS, Android hoặc SAMSUNG Mobile USB Remote NDIS (dấu chấm than vàng).
+4. Chuột phải &gt; Update driver &gt; Browse my computer for drivers &gt; Let me pick from a list of available drivers.
+5. Chọn Network adapters &gt; Microsoft &gt; Remote NDIS Compatible Device (hoặc UsbNcm Host Device) &gt; Next.
+6. Nếu không có thiết bị lạ nào: cổng/cáp không truyền dữ liệu, thử cổng khác.
+7. Hoặc cài Samsung USB Driver for Mobile Phones từ trang Samsung Developer rồi cắm lại.
+</string>
+    <string name="diag_win_explain">Windows 10/11 thường tự nhận NCM/RNDIS; khi không nhận, thiết bị hiện là thiết bị lạ và Android tắt tethering sau vài giây.</string>
 </resources>

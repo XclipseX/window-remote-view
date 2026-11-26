@@ -56,6 +56,29 @@ Biến máy Android thành màn hình thứ hai của PC qua cáp USB; host tạ
 
 Chuỗi tiếng Việt: `app/src/main/res/values/strings.xml`.
 
+## Chẩn đoán toàn diện (`diag/`, `ui/DiagnosticsScreen.kt`)
+
+Nút "Chẩn đoán toàn diện" ở màn hình chính. Các mục chạy ở luồng nền, mỗi mục là một thẻ (thông tin / OK / cảnh báo / lỗi) kèm giải thích và cách xử lý bằng tiếng Việt; phần "Kết luận" ở đầu gộp kết quả.
+Nên cắm cáp USB-C vào laptop đang bật trước khi chạy; cắm/rút cáp khi đang mở màn hình thì tự chạy lại (receiver `USB_STATE`).
+Xuất báo cáo: "Sao chép báo cáo", "Chia sẻ", và tự lưu `diagnostics-<thời gian>.txt` trong thư mục file riêng của app (`getExternalFilesDir`; đường dẫn hiện trên màn hình).
+
+| Mục | Phát hiện được | Không phát hiện được |
+|---|---|---|
+| Thiết bị | hãng, model (SM-X820 Wi-Fi / SM-X826 5G), Android, SoC (API 31+) | phiên bản One UI (không có API công khai, bỏ qua) |
+| Mạng di động | FEATURE_TELEPHONY, phoneType (chỉ tham khảo) | menu tethering có bị ẩn hay không |
+| Trạng thái USB | extra de-facto của `USB_STATE`: connected/configured/mtp/ptp/rndis/ncm/adb/midi/accessory | extra vắng mặt = "không rõ"; không phân biệt chắc cáp chỉ sạc với bộ sạc tường |
+| USB accessory | FEATURE_USB_ACCESSORY/HOST, accessory RemoteView đã gắn, quyền | host chưa chạy thì không có accessory |
+| Nhà phát triển/ADB | `DEVELOPMENT_SETTINGS_ENABLED`, `ADB_ENABLED` | adbd có được laptop cấp khóa RSA hay chưa |
+| Giao diện mạng | mọi `NetworkInterface`, rndis/usb/ncm, transport, validated/metered, link speed Wi-Fi (không lấy SSID) | băng thông thực |
+| Kết nối cục bộ | TCP 127.0.0.1:47810 (adb reverse đã thiết lập), UDP broadcast 47800 nghe 1,5 s | cổng mở chưa chắc host đang nghe; Wi-Fi chặn broadcast hoặc tường lửa khiến không thấy host |
+| Ứng dụng | spacedesk có cài hay không (`<queries>`) | spacedesk có chạy được hay không |
+| Bộ giải mã | AVC/HEVC/AV1/VP9: HW/SW, low-latency, hỗ trợ 2800x1752@120, số tham số vendor (API 31+) | hiệu năng thực tế; số liệu chỉ là khả năng báo cáo |
+| Màn hình | mọi mode, tần số quét, HDR | |
+| Nhiệt/pin | trạng thái nhiệt, headroom, tiết kiệm pin, pin, nguồn cắm | |
+| Âm thanh | frames/buffer, sample rate, FEATURE_AUDIO_LOW_LATENCY | độ trễ thực |
+| Theo dõi USB tethering | ghi 20 s mọi `USB_STATE` và giao diện rndis*/ncm*/usb* (300 ms), kết luận: thiếu driver Windows / Android từ chối / cáp chỉ sạc | cần người dùng tự bật công tắc trong 20 s |
+| Thông tin Windows | các bước Device Manager (Remote NDIS / UsbNcm) | không đọc được trạng thái Windows |
+
 ## Việc còn thiếu / điểm cần xác minh trên máy thật
 
 - Toàn bộ mã **chưa biên dịch**; chưa có bài kiểm thử.

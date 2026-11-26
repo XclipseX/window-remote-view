@@ -50,6 +50,9 @@ object DiagRunner {
             out += r
             onEach(r)
         }
+        val win = TetherMonitor.windowsInfo(ctx)
+        out += win
+        onEach(win)
         return DiagReport(System.currentTimeMillis(), summarize(ctx, facts), out)
     }
 
@@ -70,8 +73,8 @@ object DiagRunner {
             chargeOnly -> lines += s(R.string.diag_sum_chargeonly)
             noUsb -> lines += s(R.string.diag_sum_nousb)
         }
-        if (f.wifiOnly == true) lines += s(R.string.diag_sum_wifionly)
-        if (f.spacedeskInstalled) lines += s(if (f.wifiOnly == true) R.string.diag_sum_spacedesk_wifionly else R.string.diag_sum_spacedesk)
+        if (f.spacedeskInstalled) lines += s(R.string.diag_sum_spacedesk)
+        if (dataLink && !f.tetherActive) lines += s(R.string.diag_sum_tether_hint)
         if (f.tetherActive) lines += s(R.string.diag_sum_tether)
         if (f.accessoryAttached) lines += s(R.string.diag_sum_aoa_ok)
         else if (dataLink) lines += s(R.string.diag_sum_aoa_wait)
