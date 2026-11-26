@@ -2,11 +2,12 @@
 
 use windows::core::Interface;
 use windows::Win32::Foundation::{HMODULE, RECT};
+use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::*;
 
-use crate::capture::{CapturedFrame, FrameData, OutputInfo};
+use crate::capture::{pick_output_index, CapturedFrame, FrameData, OutputInfo};
 use crate::{HostError, Rect, Result};
 
 fn from_rect(r: RECT) -> Rect {
@@ -18,29 +19,51 @@ fn from_rect(r: RECT) -> Rect {
     }
 }
 
-pub fn list_outputs() -> Result<Vec<OutputInfo>> {
+fn wstr(buf: &[u16]) -> String {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len])
+}
+
+/// One enumerated output with the COM objects needed to duplicate it.
+struct Found {
+    adapter: IDXGIAdapter1,
+    output: IDXGIOutput,
+    info: OutputInfo,
+}
+
+/// Fresh enumeration of every adapter and every output. Ordinals are only
+/// valid for this snapshot (adapters/outputs come and go: spacedesk, IddCx,
+/// hybrid GPUs), so nothing here may be cached across re-inits.
+fn enumerate_all() -> Result<Vec<Found>> {
     let mut v = Vec::new();
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
         let mut ai = 0;
         while let Ok(adapter) = factory.EnumAdapters1(ai) {
+            let adapter_name = adapter.GetDesc1().map(|d| wstr(&d.Description)).unwrap_or_default();
             let mut oi = 0;
             while let Ok(out) = adapter.EnumOutputs(oi) {
-                let d = out.GetDesc()?;
-                let len = d.DeviceName.iter().position(|&c| c == 0).unwrap_or(d.DeviceName.len());
-                v.push(OutputInfo {
-                    adapter_index: ai,
-                    output_index: oi,
-                    name: String::from_utf16_lossy(&d.DeviceName[..len]),
-                    desktop_rect: from_rect(d.DesktopCoordinates),
-                    attached: d.AttachedToDesktop.as_bool(),
-                });
+                if let Ok(d) = out.GetDesc() {
+                    let info = OutputInfo {
+                        adapter_index: ai,
+                        output_index: oi,
+                        name: wstr(&d.DeviceName),
+                        adapter_name: adapter_name.clone(),
+                        desktop_rect: from_rect(d.DesktopCoordinates),
+                        attached: d.AttachedToDesktop.as_bool(),
+                    };
+                    v.push(Found { adapter: adapter.clone(), output: out, info });
+                }
                 oi += 1;
             }
             ai += 1;
         }
     }
     Ok(v)
+}
+
+pub fn list_outputs() -> Result<Vec<OutputInfo>> {
+    Ok(enumerate_all()?.into_iter().map(|f| f.info).collect())
 }
 
 /// GPU-side frame: a texture we own (copy of the duplication surface), so the
@@ -82,8 +105,7 @@ impl GpuFrame {
 }
 
 pub struct DesktopDuplicator {
-    adapter_index: u32,
-    output_index: u32,
+    name: String,
     device: ID3D11Device,
     ctx: ID3D11DeviceContext,
     dup: IDXGIOutputDuplication,
@@ -94,14 +116,25 @@ pub struct DesktopDuplicator {
 }
 
 impl DesktopDuplicator {
-    pub fn new(adapter_index: u32, output_index: u32) -> Result<Self> {
+    /// (Re)initialises duplication from scratch: new factory, full adapter and
+    /// output enumeration, then picks the output named `prefer` if it is still
+    /// attached, else the primary one, else the first attached one. The D3D11
+    /// device is created on the chosen output's own adapter.
+    pub fn open(prefer: Option<&str>) -> Result<Self> {
+        let mut all = enumerate_all()?;
+        let infos: Vec<OutputInfo> = all.iter().map(|f| f.info.clone()).collect();
+        let idx = pick_output_index(&infos, prefer)
+            .ok_or_else(|| HostError::Os("no attached DXGI output".into()))?;
+        let Found { adapter, output, info } = all.swap_remove(idx);
+        crate::control::log(
+            crate::control::Level::Info,
+            &format!(
+                "capture: DXGI adapter '{}' output {} {:?} (adapter #{} output #{})",
+                info.adapter_name, info.name, info.desktop_rect, info.adapter_index, info.output_index
+            ),
+        );
         unsafe {
-            let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
-            let adapter = factory.EnumAdapters1(adapter_index)?;
-            let output = adapter.EnumOutputs(output_index)?;
-            let desc = output.GetDesc()?;
             let output1: IDXGIOutput1 = output.cast()?;
-
             let base: IDXGIAdapter = adapter.cast()?;
             let mut device = None;
             let mut ctx = None;
@@ -119,10 +152,9 @@ impl DesktopDuplicator {
             let device = device.ok_or_else(|| HostError::Os("no D3D11 device".into()))?;
             let ctx = ctx.ok_or_else(|| HostError::Os("no D3D11 context".into()))?;
             let dup = output1.DuplicateOutput(&device)?;
-            let rect = from_rect(desc.DesktopCoordinates);
+            let rect = info.desktop_rect;
             Ok(Self {
-                adapter_index,
-                output_index,
+                name: info.name,
                 device,
                 ctx,
                 dup,
@@ -132,6 +164,11 @@ impl DesktopDuplicator {
                 rects_buf: vec![RECT::default(); 64],
             })
         }
+    }
+
+    /// GDI device name of the duplicated output (e.g. `\\.\DISPLAY1`).
+    pub fn device_name(&self) -> &str {
+        &self.name
     }
 
     /// Output rectangle in virtual-desktop coordinates (for input mapping).
@@ -161,7 +198,8 @@ impl DesktopDuplicator {
 
     /// Waits up to `timeout_ms` for a new frame. `Ok(None)` means nothing new
     /// to encode: timeout, a cursor-only update (`AccumulatedFrames == 0`), or
-    /// the duplication was lost and recreated (e.g. mode switch, UAC desktop).
+    /// Errors (including `DXGI_ERROR_ACCESS_LOST`) are returned to the caller, which
+    /// re-opens from scratch with a full re-enumeration.
     pub fn acquire(&mut self, timeout_ms: u32) -> Result<Option<CapturedFrame>> {
         unsafe {
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -169,10 +207,6 @@ impl DesktopDuplicator {
             match self.dup.AcquireNextFrame(timeout_ms, &mut info, &mut res) {
                 Ok(()) => {}
                 Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
-                Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
-                    *self = Self::new(self.adapter_index, self.output_index)?;
-                    return Ok(None);
-                }
                 Err(e) => return Err(e.into()),
             }
             if info.AccumulatedFrames == 0 {
@@ -211,6 +245,96 @@ impl DesktopDuplicator {
                     ctx: self.ctx.clone(),
                 }),
             }))
+        }
+    }
+}
+
+/// GDI fallback capture: BitBlt from the screen DC into a top-down 32-bit DIB
+/// section. Slower than DXGI and misses some protected content, but works
+/// where duplication is unavailable (virtual-display drivers, RDP, GPU resets).
+pub struct GdiCapture {
+    rect: Rect,
+    screen: HDC,
+    mem: HDC,
+    bmp: HBITMAP,
+    old: HGDIOBJ,
+    bits: *mut u8,
+    w: u32,
+    h: u32,
+}
+
+impl GdiCapture {
+    pub fn new(rect: Rect) -> Result<Self> {
+        let (w, h) = (rect.width().max(0) as u32, rect.height().max(0) as u32);
+        if w == 0 || h == 0 {
+            return Err(HostError::Os("GDI capture: empty rect".into()));
+        }
+        unsafe {
+            let screen = GetDC(None);
+            if screen.is_invalid() {
+                return Err(HostError::Os("GetDC(NULL) failed".into()));
+            }
+            let mem = CreateCompatibleDC(Some(screen));
+            if mem.is_invalid() {
+                ReleaseDC(None, screen);
+                return Err(HostError::Os("CreateCompatibleDC failed".into()));
+            }
+            let mut bmi = BITMAPINFO::default();
+            bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            bmi.bmiHeader.biWidth = w as i32;
+            bmi.bmiHeader.biHeight = -(h as i32); // top-down
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB.0;
+            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            let bmp = match CreateDIBSection(Some(screen), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+                Ok(b) if !bits.is_null() => b,
+                _ => {
+                    let _ = DeleteDC(mem);
+                    ReleaseDC(None, screen);
+                    return Err(HostError::Os("CreateDIBSection failed".into()));
+                }
+            };
+            let old = SelectObject(mem, bmp.into());
+            Ok(Self { rect, screen, mem, bmp, old, bits: bits as *mut u8, w, h })
+        }
+    }
+
+    pub fn rect(&self) -> Rect {
+        self.rect
+    }
+
+    pub fn grab(&mut self) -> Result<CapturedFrame> {
+        unsafe {
+            BitBlt(
+                self.mem,
+                0,
+                0,
+                self.w as i32,
+                self.h as i32,
+                Some(self.screen),
+                self.rect.left,
+                self.rect.top,
+                SRCCOPY | CAPTUREBLT,
+            )
+            .map_err(|e| HostError::Os(format!("BitBlt: {e}")))?;
+            let n = (self.w * self.h * 4) as usize;
+            let mut v = std::slice::from_raw_parts(self.bits, n).to_vec();
+            for px in v.chunks_exact_mut(4) {
+                px[3] = 255; // GDI leaves alpha undefined
+            }
+            Ok(CapturedFrame::from_bgra(self.w, self.h, v))
+        }
+    }
+}
+
+impl Drop for GdiCapture {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.mem, self.old);
+            let _ = DeleteObject(self.bmp.into());
+            let _ = DeleteDC(self.mem);
+            ReleaseDC(None, self.screen);
         }
     }
 }

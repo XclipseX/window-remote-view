@@ -79,6 +79,108 @@ pub trait VideoEncoder {
     fn set_bitrate(&mut self, _bps: u32) -> Result<bool> {
         Ok(false)
     }
+    /// True if the encoder is fed from D3D11 textures (MF hardware path with a
+    /// D3D manager). A failing D3D encoder is retried once in system-memory mode.
+    fn uses_d3d(&self) -> bool {
+        false
+    }
+}
+
+/// Software path limits (keeps CPU sane): at most 1920x1080 and 60 fps.
+pub const SW_MAX_W: u32 = 1920;
+pub const SW_MAX_H: u32 = 1080;
+pub const SW_MAX_FPS: u32 = 60;
+
+/// Caps an encode size/fps for the OpenH264 software path, keeping the aspect
+/// ratio and even dimensions.
+pub fn cap_software(w: u32, h: u32, fps: u32) -> (u32, u32, u32) {
+    let fps = fps.min(SW_MAX_FPS);
+    if w <= SW_MAX_W && h <= SW_MAX_H {
+        return (w & !1, h & !1, fps);
+    }
+    let sx = SW_MAX_W as f64 / w as f64;
+    let sy = SW_MAX_H as f64 / h as f64;
+    let s = sx.min(sy);
+    let nw = ((w as f64 * s) as u32 & !1).max(2);
+    let nh = ((h as f64 * s) as u32 & !1).max(2);
+    (nw, nh, fps)
+}
+
+/// Watches a hardware encoder and decides when it must be abandoned: it did
+/// not emit any output within 1 s of the first input, or it errored before it
+/// ever produced output. Once it has produced output it is given more slack.
+#[derive(Debug, Default)]
+pub struct HwSupervisor {
+    produced: bool,
+    fail_streak: u32,
+}
+
+/// How long a hardware encoder may stay silent after its first input.
+pub const HW_FIRST_OUTPUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl HwSupervisor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn on_output(&mut self) {
+        self.produced = true;
+        self.fail_streak = 0;
+    }
+    /// `since_first_input`: time since the first frame was fed to this encoder.
+    /// `Some(reason)` = give up on the hardware encoder.
+    pub fn on_empty(&mut self, since_first_input: std::time::Duration) -> Option<&'static str> {
+        if !self.produced && since_first_input > HW_FIRST_OUTPUT {
+            Some("no output within 1 s of the first input")
+        } else {
+            None
+        }
+    }
+    /// An encode error. `Some(reason)` = give up.
+    pub fn on_error(&mut self) -> Option<&'static str> {
+        self.fail_streak += 1;
+        if !self.produced {
+            Some("error before any output")
+        } else if self.fail_streak >= 3 {
+            Some("3 consecutive errors")
+        } else {
+            None
+        }
+    }
+}
+
+/// When set, MF hardware encoders are built without the D3D11 device manager
+/// (system-memory NV12 input): second hardware attempt for MFTs whose D3D path
+/// never asks for input (seen on AMD).
+static NO_D3D: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_no_d3d(v: bool) {
+    NO_D3D.store(v, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn no_d3d() -> bool {
+    NO_D3D.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// What to do after a hardware encoder was declared broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HwFailAction {
+    /// Rebuild the hardware encoder in system-memory mode.
+    RetryWithoutD3d,
+    /// Stop using hardware encoders (OpenH264 for the rest of the process).
+    UseSoftware,
+}
+
+/// Applies the policy: D3D failure -> retry without D3D once; anything else ->
+/// block all MF encoders so `create_encoder` yields OpenH264.
+pub fn on_hw_failure(uses_d3d: bool) -> HwFailAction {
+    if uses_d3d && !no_d3d() {
+        set_no_d3d(true);
+        HwFailAction::RetryWithoutD3d
+    } else {
+        block_encoder(EncoderKind::MfHevcHw);
+        block_encoder(EncoderKind::MfH264Hw);
+        HwFailAction::UseSoftware
+    }
 }
 
 /// Builds the best available encoder. `sample` is a real captured frame (its
@@ -127,7 +229,7 @@ pub fn create_encoder(
                     continue;
                 }
                 let c = EncoderConfig { bitrate_bps: bitrate_for(k.slider_codec()), ..cfg };
-                match mf::MfEncoder::new(k, c, sample) {
+                match mf::MfEncoder::new(k, c, sample, !no_d3d()) {
                     Ok(e) => {
                         log(&format!("encoder: {} ({})", k.name(), e.describe()));
                         return Ok(Box::new(e));
@@ -452,6 +554,72 @@ mod tests {
         assert!(has_sps(&[0, 0, 0, 1, 0x40, 1, 0, 0, 1, 0x42, 1], true));
         assert!(!has_sps(&[0, 0, 1, 0x26, 1], true));
         assert!(!has_sps(&[], true));
+    }
+
+    /// Encoder that always errors, standing in for a broken hardware MFT.
+    struct FailingEncoder;
+    impl VideoEncoder for FailingEncoder {
+        fn encode(&mut self, _f: &CapturedFrame, _idr: bool) -> Result<Vec<u8>> {
+            Err(HostError::Encoder("timeout waiting for METransformNeedInput".into()))
+        }
+        fn codec(&self) -> u8 {
+            rv_proto::codec_flags::CODEC_H264
+        }
+        fn kind(&self) -> EncoderKind {
+            EncoderKind::MfH264Hw
+        }
+        fn uses_d3d(&self) -> bool {
+            true
+        }
+    }
+
+    /// Mirrors the engine loop: a failing HW encoder is retried without D3D
+    /// once, then replaced by OpenH264 which really produces H.264.
+    #[test]
+    fn failing_hw_encoder_falls_back_to_openh264() {
+        let f = CapturedFrame::from_bgra(64, 64, vec![90u8; 64 * 64 * 4]);
+        set_no_d3d(false);
+        let mut e: Box<dyn VideoEncoder> = Box::new(FailingEncoder);
+        let mut sup = HwSupervisor::new();
+        assert!(e.encode(&f, true).is_err());
+        assert!(sup.on_error().is_some(), "first error before output must give up");
+        assert_eq!(on_hw_failure(e.uses_d3d()), HwFailAction::RetryWithoutD3d);
+        assert!(no_d3d());
+        // second attempt (also failing) -> software
+        let mut sup = HwSupervisor::new();
+        assert!(e.encode(&f, true).is_err());
+        assert!(sup.on_error().is_some());
+        assert_eq!(on_hw_failure(true), HwFailAction::UseSoftware);
+        assert!(is_blocked(EncoderKind::MfH264Hw) && is_blocked(EncoderKind::MfHevcHw));
+        let cfg = EncoderConfig { width: 64, height: 64, fps: 30, bitrate_bps: 1_000_000 };
+        let mut sw = create_encoder(CodecPref::Auto, EncoderPref::Auto, cfg, &f, &|_| 1_000_000, &mut |_| {}).unwrap();
+        assert_eq!(sw.kind(), EncoderKind::OpenH264);
+        assert_eq!(sw.codec(), rv_proto::codec_flags::CODEC_H264);
+        assert!(sw.encode(&f, true).unwrap().len() > 8);
+        // leave global state clean for other tests
+        if let Ok(mut b) = BLOCKED.lock() {
+            b.clear();
+        }
+        set_no_d3d(false);
+    }
+
+    #[test]
+    fn supervisor_silent_hw_gives_up_after_one_second() {
+        use std::time::Duration;
+        let mut s = HwSupervisor::new();
+        assert!(s.on_empty(Duration::from_millis(900)).is_none());
+        assert!(s.on_empty(Duration::from_millis(1100)).is_some());
+        let mut s = HwSupervisor::new();
+        s.on_output();
+        assert!(s.on_empty(Duration::from_secs(5)).is_none());
+        assert!(s.on_error().is_none());
+    }
+
+    #[test]
+    fn software_caps() {
+        assert_eq!(cap_software(2800, 1752, 120), (1726, 1080, 60));
+        assert_eq!(cap_software(1920, 1080, 30), (1920, 1080, 30));
+        assert_eq!(cap_software(1280, 721, 60), (1280, 720, 60));
     }
 
     #[test]

@@ -19,6 +19,7 @@
 
 use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, GUID};
@@ -35,6 +36,60 @@ use crate::capture::CapturedFrame;
 use crate::{HostError, Result};
 
 const POOL: usize = 8;
+
+fn log(level: crate::control::Level, m: &str) {
+    crate::control::log(level, m);
+}
+
+/// `(event type, status HRESULT)`; type `u32::MAX` = the pump thread ended.
+type EvMsg = (u32, i32);
+
+struct SendGen(IMFMediaEventGenerator);
+// SAFETY: MF event generators are free-threaded (MTA) objects; GetEvent is
+// documented to be callable from any thread.
+unsafe impl Send for SendGen {}
+
+/// Blocks in `IMFMediaEventGenerator::GetEvent(0)` on a helper thread and
+/// forwards events over a channel, so the encoder thread can wait with a real
+/// timeout instead of polling with MF_EVENT_FLAG_NO_WAIT.
+fn spawn_event_pump(gen: IMFMediaEventGenerator) -> Receiver<EvMsg> {
+    let (tx, rx) = mpsc::channel();
+    let w = SendGen(gen);
+    std::thread::spawn(move || {
+        let w = w;
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            loop {
+                match w.0.GetEvent(MF_EVENT_FLAG_NONE) {
+                    Ok(ev) => {
+                        let t = ev.GetType().unwrap_or(0);
+                        let st = ev.GetStatus().map(|h| h.0).unwrap_or(0);
+                        if tx.send((t, st)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send((u32::MAX, e.code().0));
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    rx
+}
+
+fn event_name(t: u32) -> String {
+    match t {
+        x if x == METransformNeedInput.0 as u32 => "METransformNeedInput".into(),
+        x if x == METransformHaveOutput.0 as u32 => "METransformHaveOutput".into(),
+        x if x == METransformDrainComplete.0 as u32 => "METransformDrainComplete".into(),
+        x if x == METransformMarker.0 as u32 => "METransformMarker".into(),
+        x if x == MEError.0 as u32 => "MEError".into(),
+        x if x == MEUnknown.0 as u32 => "MEUnknown".into(),
+        x => format!("event#{x}"),
+    }
+}
 
 fn err(ctx: &str, e: windows::core::Error) -> HostError {
     HostError::Encoder(format!("{ctx}: {e}"))
@@ -222,7 +277,8 @@ pub struct MfEncoder {
     cfg: EncoderConfig,
     transform: IMFTransform,
     activate: IMFActivate,
-    events: Option<IMFMediaEventGenerator>,
+    events: Option<Receiver<EvMsg>>,
+    born: Instant,
     codec_api: Option<ICodecAPI>,
     _mgr: Option<IMFDXGIDeviceManager>,
     d3d: Option<D3dPath>,
@@ -253,7 +309,7 @@ impl MfEncoder {
         )
     }
 
-    pub fn new(kind: EncoderKind, cfg: EncoderConfig, sample: &CapturedFrame) -> Result<Self> {
+    pub fn new(kind: EncoderKind, cfg: EncoderConfig, sample: &CapturedFrame, allow_d3d: bool) -> Result<Self> {
         let subtype = match kind {
             EncoderKind::MfHevcHw => MFVideoFormat_HEVC,
             EncoderKind::MfH264Hw => MFVideoFormat_H264,
@@ -263,10 +319,13 @@ impl MfEncoder {
             return Err(HostError::Encoder("encoder size must be set".into()));
         }
         unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            // MTA on the thread that drives the MFT (S_FALSE = already initialised).
+            if let Err(e) = CoInitializeEx(None, COINIT_MULTITHREADED).ok() {
+                log(crate::control::Level::Warn, &format!("mf: CoInitializeEx(MTA): {e}"));
+            }
             MFStartup(MF_VERSION, MFSTARTUP_FULL).map_err(|e| err("MFStartup", e))?;
         }
-        let r = Self::init_any(kind, subtype, cfg, sample);
+        let r = Self::init_any(kind, subtype, cfg, sample, allow_d3d);
         if r.is_err() {
             unsafe {
                 let _ = MFShutdown();
@@ -275,14 +334,14 @@ impl MfEncoder {
         r
     }
 
-    fn init_any(kind: EncoderKind, subtype: GUID, cfg: EncoderConfig, sample: &CapturedFrame) -> Result<Self> {
+    fn init_any(kind: EncoderKind, subtype: GUID, cfg: EncoderConfig, sample: &CapturedFrame, allow_d3d: bool) -> Result<Self> {
         let activates = enum_hw_encoders(subtype)?;
         if activates.is_empty() {
             return Err(HostError::Encoder("no hardware MFT for this codec".into()));
         }
         let mut last = HostError::Encoder("no MFT".into());
         for act in activates {
-            match Self::init_one(kind, subtype, cfg, sample, act) {
+            match Self::init_one(kind, subtype, cfg, sample, act, allow_d3d) {
                 Ok(e) => return Ok(e),
                 Err(e) => last = e,
             }
@@ -296,6 +355,7 @@ impl MfEncoder {
         cfg: EncoderConfig,
         sample: &CapturedFrame,
         activate: IMFActivate,
+        allow_d3d: bool,
     ) -> Result<Self> {
         unsafe {
             let friendly = {
@@ -318,17 +378,22 @@ impl MfEncoder {
                 }
                 let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
             }
-            let events = if is_async { transform.cast::<IMFMediaEventGenerator>().ok() } else { None };
-            if is_async && events.is_none() {
-                return Err(HostError::Encoder("async MFT without event generator".into()));
-            }
+            let events = if is_async {
+                match transform.cast::<IMFMediaEventGenerator>() {
+                    Ok(g) => Some(spawn_event_pump(g)),
+                    Err(_) => return Err(HostError::Encoder("async MFT without event generator".into())),
+                }
+            } else {
+                None
+            };
 
             // D3D11 device sharing + video processor (GPU path); any failure
             // falls back to CPU buffers.
             let mut mgr = None;
             let mut d3d = None;
             let mut device = None;
-            if let Some(tex) = sample.texture() {
+            let gpu_sample = if allow_d3d { sample.texture() } else { None };
+            if let Some(tex) = gpu_sample {
                 if let Ok(dev) = tex.GetDevice() {
                     if let Ok(mt) = dev.cast::<ID3D11Multithread>() {
                         let _ = mt.SetMultithreadProtected(true);
@@ -395,6 +460,7 @@ impl MfEncoder {
                 transform,
                 activate,
                 events,
+                born: Instant::now(),
                 codec_api,
                 _mgr: mgr,
                 d3d,
@@ -438,20 +504,26 @@ impl MfEncoder {
 
     // ---- event pump -------------------------------------------------------
 
-    /// Waits up to `deadline` for one MFT event. Returns its type.
+    /// Waits up to `deadline` for one MFT event (blocking on the pump thread's
+    /// channel). Returns its type.
     fn next_event(&self, deadline: Instant) -> Result<Option<u32>> {
-        let gen = self.events.as_ref().expect("async only");
-        loop {
-            match unsafe { gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
-                Ok(ev) => return unsafe { ev.GetType() }.map(Some).map_err(|e| err("event type", e)),
-                Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
-                    if Instant::now() >= deadline {
-                        return Ok(None);
-                    }
-                    std::thread::sleep(Duration::from_micros(150));
+        let rx = self.events.as_ref().expect("async only");
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok((t, st)) => {
+                if self.born.elapsed() < Duration::from_secs(2) {
+                    log(
+                        crate::control::Level::Info,
+                        &format!("mft event: {} (0x{:X}) status 0x{:08X} at +{} ms", event_name(t), t, st as u32, self.born.elapsed().as_millis()),
+                    );
                 }
-                Err(e) => return Err(err("GetEvent", e)),
+                if t == u32::MAX {
+                    return Err(HostError::Encoder(format!("MFT event pump ended: 0x{:08X}", st as u32)));
+                }
+                Ok(Some(t))
             }
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => Err(HostError::Encoder("MFT event pump disconnected".into())),
         }
     }
 
@@ -604,10 +676,18 @@ impl VideoEncoder for MfEncoder {
         }
         unsafe {
             if self.is_async {
-                let deadline = Instant::now() + Duration::from_millis(500);
+                let first = self.frame_no == 0;
+                let deadline = Instant::now() + Duration::from_millis(if first { 300 } else { 500 });
                 while self.need_input == 0 {
                     match self.next_event(deadline)? {
                         Some(ev) => self.on_event(ev)?,
+                        None if first => {
+                            log(
+                                crate::control::Level::Warn,
+                                &format!("mf: {}: no METransformNeedInput within 300 ms; trying ProcessInput anyway", self.friendly),
+                            );
+                            self.need_input = 1;
+                        }
                         None => return Err(HostError::Encoder("timeout waiting for METransformNeedInput".into())),
                     }
                 }
@@ -661,6 +741,10 @@ impl VideoEncoder for MfEncoder {
 
     fn kind(&self) -> EncoderKind {
         self.kind
+    }
+
+    fn uses_d3d(&self) -> bool {
+        self.d3d.is_some()
     }
 
     fn set_bitrate(&mut self, bps: u32) -> Result<bool> {

@@ -15,9 +15,12 @@ use std::time::{Duration, Instant};
 
 use rv_crypto::Keypair;
 use crate::audio::{LoopbackCapture, OpusFrameEncoder, CHANNELS_RATE, FRAME_MS};
-use crate::capture::{list_outputs, CapturedFrame, DesktopDuplicator};
+use crate::capture::{list_outputs, pick_output, CapturedFrame, Capturer, DesktopDuplicator};
 use crate::control::{self, Command, DeviceItem, Level, State, Stats};
-use crate::encode::{create_encoder, CodecPref, EncoderConfig, EncoderKind, EncoderPref, VideoEncoder};
+use crate::encode::{
+    cap_software, create_encoder, is_blocked, on_hw_failure, CodecPref, EncoderConfig, EncoderKind, EncoderPref, HwFailAction,
+    HwSupervisor, VideoEncoder,
+};
 use crate::input::{InputInjector, WinInjector};
 use crate::vdisplay::{DisplayMode, ExistingOutput, IddCxDisplay, VirtualDisplay};
 use rv_proto::ControlMessage;
@@ -368,15 +371,33 @@ struct VideoPrefs {
     encoder: EncoderPref,
 }
 
+/// A hardware encoder was declared broken: retry it once without D3D, else
+/// switch to OpenH264 for the rest of the process.
+fn hw_gave_up(kind: EncoderKind, uses_d3d: bool, reason: &str) {
+    warn!("video: hardware encoder {} failed ({reason})", kind.name());
+    match on_hw_failure(uses_d3d) {
+        HwFailAction::RetryWithoutD3d => {
+            info!("video: retrying the hardware encoder in system-memory mode (no D3D11 manager)")
+        }
+        HwFailAction::UseSoftware => {
+            warn!("video: falling back to OpenH264 (software H.264) for the rest of the session")
+        }
+    }
+}
+
 fn video_thread(
-    out_idx: (u32, u32),
+    out_name: String,
+    out_rect: crate::Rect,
     prefs: VideoPrefs,
     start: Instant,
     sh: Arc<Shared>,
     tx: SyncSender<VideoOut>,
     ev: Sender<VideoEvent>,
 ) {
-    let mut dup: Option<DesktopDuplicator> = None;
+    let mut cap = Capturer::new(Some(out_name), out_rect);
+    let mut sup = HwSupervisor::new();
+    let mut first_input: Option<Instant> = None;
+    let mut force_sw = false;
     let mut enc: Option<Box<dyn VideoEncoder>> = None;
     let mut active: Option<ActiveEnc> = None;
     let mut seen_gen = u32::MAX;
@@ -395,32 +416,19 @@ fn video_thread(
             std::thread::sleep(Duration::from_millis(5));
             continue;
         }
-        if dup.is_none() {
-            match DesktopDuplicator::new(out_idx.0, out_idx.1) {
-                Ok(d) => dup = Some(d),
-                Err(e) => {
-                    warn!("video: capture init failed: {e}; retrying");
-                    std::thread::sleep(Duration::from_secs(1));
-                    continue;
-                }
-            }
-        }
-        let acquired = match dup.as_mut().unwrap().acquire(8) {
-            Ok(f) => f,
-            Err(e) => {
-                warn!("video: capture error: {e}; re-creating duplicator");
-                dup = None;
-                std::thread::sleep(Duration::from_millis(300));
-                continue;
-            }
-        };
+        let acquired = cap.acquire(8).unwrap_or(None);
         if let Some(f) = acquired {
             last_frame = Some(f);
             dirty = true;
         }
         let Some(frame) = last_frame.as_ref() else { continue };
 
+        // Software path (forced, or every hardware encoder blocked): <=1920x1080, <=60 fps.
+        let sw_mode = force_sw
+            || prefs.encoder == EncoderPref::Sw
+            || (is_blocked(EncoderKind::MfHevcHw) && is_blocked(EncoderKind::MfH264Hw));
         let fps = sh.fps.load(Ordering::Relaxed).max(1);
+        let fps = if sw_mode { fps.min(crate::encode::SW_MAX_FPS) } else { fps };
         let min_interval = Duration::from_micros(1_000_000 / fps as u64);
         let want_idr = sh.idr.load(Ordering::Relaxed);
         let due = dirty && last_encode.elapsed() + Duration::from_micros(500) >= min_interval;
@@ -436,6 +444,7 @@ fn video_thread(
         let rh = sh.height.load(Ordering::Relaxed);
         let (tw, th) = if rw > 0 && rh > 0 { (rw.min(nw), rh.min(nh)) } else { (nw, nh) };
         let (tw, th) = (tw & !1, th & !1);
+        let (tw, th) = if sw_mode { let c = cap_software(tw, th, fps); (c.0, c.1) } else { (tw, th) };
         let q = sh.quality.load(Ordering::Relaxed) as u8;
         let over = sh.bitrate_override_bps.load(Ordering::Relaxed);
         let bitrate_for = |c: rv_session::Codec| -> u32 {
@@ -472,7 +481,7 @@ fn video_thread(
                 drop(enc.take());
                 let cfg = EncoderConfig { width: tw, height: th, fps, bitrate_bps: 0 };
                 let mut log = |m: &str| info!("{m}");
-                match create_encoder(eff_codec, prefs.encoder, cfg, frame, &bitrate_for, &mut log) {
+                match create_encoder(eff_codec, if sw_mode { EncoderPref::Sw } else { prefs.encoder }, cfg, frame, &bitrate_for, &mut log) {
                     Ok(e) => {
                         let a = ActiveEnc {
                             kind: e.kind(),
@@ -486,6 +495,8 @@ fn video_thread(
                         active = Some(a);
                         enc = Some(e);
                         empty_since = None;
+                        sup = HwSupervisor::new();
+                        first_input = None;
                         sh.idr.store(true, Ordering::Relaxed);
                         let _ = ev.send(VideoEvent::Active(a));
                     }
@@ -500,12 +511,14 @@ fn video_thread(
 
         let force = sh.idr.swap(false, Ordering::Relaxed) || frame_id == 0;
         let t0 = Instant::now();
+        let fi = *first_input.get_or_insert(t0);
         let r = e.encode(frame, force);
         let dt = t0.elapsed();
         dirty = false;
         last_encode = Instant::now();
         match r {
             Ok(data) if !data.is_empty() => {
+                sup.on_output();
                 fail_streak = 0;
                 empty_since = None;
                 w_frames += 1;
@@ -522,33 +535,49 @@ fn video_thread(
                 if force {
                     sh.idr.store(true, Ordering::Relaxed);
                 }
-                // An encoder that accepts input but never produces output for 2 s is broken.
-                let since = *empty_since.get_or_insert_with(Instant::now);
-                if since.elapsed() > Duration::from_secs(2) {
-                    let k = e.kind();
-                    warn!("video: encoder {} produced no output for 2 s; falling back", k.name());
-                    crate::encode::block_encoder(k);
-                    empty_since = None;
-                    enc = None;
-                    active = None;
+                let k = e.kind();
+                let d3d = e.uses_d3d();
+                if k != EncoderKind::OpenH264 {
+                    // Hardware MFT silent for >1 s after its first input: give up on it.
+                    if let Some(reason) = sup.on_empty(fi.elapsed()) {
+                        hw_gave_up(k, d3d, reason);
+                        force_sw = is_blocked(EncoderKind::MfHevcHw) && is_blocked(EncoderKind::MfH264Hw);
+                        sh.idr.store(true, Ordering::Relaxed);
+                        empty_since = None;
+                        enc = None;
+                        active = None;
+                    }
+                } else {
+                    // A software encoder that accepts input but never produces output for 2 s is broken.
+                    let since = *empty_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() > Duration::from_secs(2) {
+                        warn!("video: encoder {} produced no output for 2 s; rebuilding", k.name());
+                        empty_since = None;
+                        enc = None;
+                        active = None;
+                    }
                 }
             }
             Err(err) => {
                 warn!("video: encode error: {err}");
                 fail_streak += 1;
-                if fail_streak >= 3 {
-                    let k = e.kind();
-                    warn!("video: encoder {} failed {fail_streak} times in a row; falling back", k.name());
-                    crate::encode::block_encoder(k);
-                    fail_streak = 0;
+                let k = e.kind();
+                if k != EncoderKind::OpenH264 {
+                    // Error before any output, or repeated errors: stop using this hardware path now.
+                    let first = sup.on_error();
+                    let reason = first.or(if fail_streak >= 3 { Some("3 consecutive errors") } else { None });
+                    if let Some(reason) = reason {
+                        hw_gave_up(k, e.uses_d3d(), reason);
+                        force_sw = is_blocked(EncoderKind::MfHevcHw) && is_blocked(EncoderKind::MfH264Hw);
+                        fail_streak = 0;
+                    }
                 }
-                if force {
-                    sh.idr.store(true, Ordering::Relaxed);
-                }
-                // A wedged MFT: rebuild it on the next frame.
+                sh.idr.store(true, Ordering::Relaxed);
+                // A wedged encoder: rebuild it on the next frame.
+                empty_since = None;
                 enc = None;
                 active = None;
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(50));
             }
         }
         let el = w_start.elapsed();
@@ -1267,7 +1296,8 @@ fn run(argv: Vec<String>) -> Result<(), String> {
 
     // Pick the display to capture.
     let monitor = if a.mirror {
-        outputs.iter().find(|o| o.attached).cloned().ok_or("no attached output")?
+        // Primary output (not "first enumerated": virtual drivers such as spacedesk can sort first).
+        pick_output(&outputs, None).cloned().ok_or("no attached output")?
     } else {
         let mut idd = IddCxDisplay;
         match idd.create(a.display_mode) {
@@ -1278,12 +1308,17 @@ fn run(argv: Vec<String>) -> Result<(), String> {
             }
         }
     };
-    info!("capturing {} {:?}", monitor.name, monitor.desktop_rect);
+    info!("capturing {} {:?} on '{}'", monitor.name, monitor.desktop_rect, monitor.adapter_name);
 
     // Probe capture + input early so we fail before waiting on a cable.
-    let probe = DesktopDuplicator::new(monitor.adapter_index, monitor.output_index).map_err(|e| e.to_string())?;
-    let (w, h) = probe.size();
-    drop(probe);
+    // A failing probe is not fatal: the video thread re-enumerates, backs off and falls back to GDI.
+    let (w, h) = match DesktopDuplicator::open(Some(&monitor.name)) {
+        Ok(p) => p.size(),
+        Err(e) => {
+            warn!("capture: DXGI probe failed ({e}); the video thread will retry and fall back to GDI");
+            (monitor.desktop_rect.width().max(0) as u32, monitor.desktop_rect.height().max(0) as u32)
+        }
+    };
     let injector = match WinInjector::new(monitor.desktop_rect) {
         Ok(i) => Some(i),
         Err(e) => {
@@ -1304,9 +1339,9 @@ fn run(argv: Vec<String>) -> Result<(), String> {
     let (evtx, evrx) = mpsc::channel::<VideoEvent>();
     {
         let sh = sh.clone();
-        let out = (monitor.adapter_index, monitor.output_index);
+        let (out_name, out_rect) = (monitor.name.clone(), monitor.desktop_rect);
         let prefs = VideoPrefs { codec: a.codec, encoder: a.encoder };
-        std::thread::spawn(move || video_thread(out, prefs, start, sh, vtx, evtx));
+        std::thread::spawn(move || video_thread(out_name, out_rect, prefs, start, sh, vtx, evtx));
     }
     {
         let sh = sh.clone();

@@ -961,7 +961,7 @@ impl App {
 
                     ui.label("Chế độ màn hình");
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.cfg.display, Display::Mirror, "Nhân bản");
+                        ui.selectable_value(&mut self.cfg.display, Display::Mirror, "Hiển thị màn hình laptop");
                         ui.selectable_value(&mut self.cfg.display, Display::Extend, "Mở rộng");
                         if self.cfg.display == Display::Extend {
                             ui.colored_label(Color32::from_rgb(230, 160, 40), "sắp có - cần driver màn hình ảo");
