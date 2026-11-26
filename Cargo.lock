@@ -2569,6 +2569,7 @@ dependencies = [
  "rv-proto",
  "rv-session",
  "rv-usb-link",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "windows",

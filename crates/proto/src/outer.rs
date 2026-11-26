@@ -4,7 +4,7 @@ use crate::error::{ProtoError, Result};
 use crate::wire::{atomic, put_u32, Reader};
 
 /// Protocol version carried in the high nibble of `version_flags`.
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 /// Size of the outer header in bytes.
 pub const OUTER_HEADER_LEN: usize = 12;
 /// Nonce counter is 48 bits wide.

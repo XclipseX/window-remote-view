@@ -1,11 +1,15 @@
 use std::collections::VecDeque;
+use std::time::Instant;
 
-use rv_crypto::{derive_psk, HandshakeKind, Keypair, Psk, Responder};
+use rv_crypto::{derive_psk, AttemptLimiter, HandshakeKind, Keypair, Psk, Responder};
 use rv_proto::{codec_flags, AudioPacket, ControlMessage, InputEvent, Packet, VideoPacket};
 use rv_transport::fec;
 
 use crate::channel::{random_session_id, Channel};
-use crate::{hs_packet, hs_parse, DatagramIo, Result, SessionError, PROLOGUE};
+use crate::{
+    hs_packet, hs_parse, DatagramIo, Result, SessionError, HANDSHAKE_MIN_INTERVAL, IDLE_TIMEOUT,
+    KEEPALIVE_INTERVAL, PEER_UNKNOWN, PROLOGUE,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostEvent {
@@ -18,12 +22,23 @@ pub enum HostEvent {
         event: InputEvent,
     },
     Control(ControlMessage),
+    /// The client went silent for [`crate::IDLE_TIMEOUT`] or was replaced by a
+    /// new handshake. Stop streaming; a new msg1 is accepted at any time.
+    /// (Emitted from `tick`, so the caller must call `HostSession::tick`.)
+    Disconnected,
 }
 
 enum State {
     Idle,
-    WaitMsg3(Box<Responder>),
     Established(Box<Channel>),
+}
+
+/// Handshake in flight (msg1 seen, waiting for the OTP-bound msg3). The
+/// established channel, if any, keeps running until msg3 verifies, so an
+/// unauthenticated msg1 can never kick a live session.
+struct Pending {
+    responder: Box<Responder>,
+    session_id: u32,
 }
 
 /// Host (Noise responder, video sender).
@@ -33,24 +48,37 @@ pub struct HostSession<I: DatagramIo> {
     psk: Psk,
     session_id: u32,
     state: State,
+    pending: Option<Pending>,
     events: VecDeque<HostEvent>,
     loss: f32,
     codec: u8,
+    epoch: Instant,
+    last_msg1: Option<Instant>,
+    limiter: AttemptLimiter<u64>,
+    last_rx: Instant,
+    last_tx: Instant,
 }
 
 impl<I: DatagramIo> HostSession<I> {
     /// `otp` is the 6-9 digit one-time password shown to the user; `host_id`
     /// (>= 8 bytes) is the Argon2 salt and must be known to the client too.
     pub fn new(io: I, keypair: Keypair, otp: &str, host_id: &[u8]) -> Result<Self> {
+        let now = Instant::now();
         Ok(Self {
             io,
             keypair,
             psk: derive_psk(otp, host_id)?,
             session_id: random_session_id()?,
             state: State::Idle,
+            pending: None,
             events: VecDeque::new(),
             loss: 0.0,
             codec: codec_flags::CODEC_H265,
+            epoch: now,
+            last_msg1: None,
+            limiter: AttemptLimiter::default(),
+            last_rx: now,
+            last_tx: now,
         })
     }
 
@@ -80,15 +108,28 @@ impl<I: DatagramIo> HostSession<I> {
         self.events.pop_front()
     }
 
-    /// Process one received datagram. Errors are per-datagram and non-fatal.
+    /// Process one received datagram from an unknown peer.
     pub fn handle_datagram(&mut self, data: &[u8]) -> Result<()> {
+        self.handle_datagram_from(PEER_UNKNOWN, data, Instant::now())
+    }
+
+    /// Like [`Self::handle_datagram`] with an explicit time (tests).
+    pub fn handle_datagram_at(&mut self, data: &[u8], now: Instant) -> Result<()> {
+        self.handle_datagram_from(PEER_UNKNOWN, data, now)
+    }
+
+    /// Process one received datagram. `peer` (see [`crate::peer_key`]) keys the
+    /// OTP-failure limiter. Errors are per-datagram and non-fatal.
+    pub fn handle_datagram_from(&mut self, peer: u64, data: &[u8], now: Instant) -> Result<()> {
         if data.first() == Some(&crate::HS_MAGIC) {
-            return self.handle_handshake(data);
+            return self.handle_handshake(peer, data, now);
         }
         let State::Established(ch) = &mut self.state else {
             return Err(SessionError::NotEstablished);
         };
-        match ch.open(data)? {
+        let pkt = ch.open(data)?;
+        self.last_rx = now;
+        match pkt {
             Packet::Input(p) => self.events.push_back(HostEvent::Input {
                 seq: p.input_seq,
                 event: p.event,
@@ -97,20 +138,46 @@ impl<I: DatagramIo> HostSession<I> {
                 if let ControlMessage::FeedbackStats { loss_permille, .. } = &c.message {
                     self.loss = (f32::from(*loss_permille) / 1000.0).clamp(0.0, 1.0);
                 }
-                self.events.push_back(HostEvent::Control(c.message));
+                if c.message != ControlMessage::Keepalive {
+                    self.events.push_back(HostEvent::Control(c.message));
+                }
             }
             _ => {}
         }
         Ok(())
     }
 
-    fn handle_handshake(&mut self, data: &[u8]) -> Result<()> {
+    /// Drive timers; call every ~100 ms. Sends keepalives while established and
+    /// emits [`HostEvent::Disconnected`] (returning to the waiting state, ready
+    /// for a new handshake) after [`IDLE_TIMEOUT`] without an authenticated packet.
+    pub fn tick(&mut self, now: Instant) {
+        if self.is_established() {
+            if now.saturating_duration_since(self.last_rx) >= IDLE_TIMEOUT {
+                self.state = State::Idle;
+                self.events.push_back(HostEvent::Disconnected);
+            } else if now.saturating_duration_since(self.last_tx) >= KEEPALIVE_INTERVAL {
+                let _ = self.send_control(ControlMessage::Keepalive);
+            }
+        }
+    }
+
+    fn ms(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.epoch).as_millis() as u64
+    }
+
+    fn handle_handshake(&mut self, peer: u64, data: &[u8], now: Instant) -> Result<()> {
         let (step, sid, msg) = hs_parse(data)?;
         match step {
             1 => {
-                if self.is_established() {
-                    return Ok(()); // ignore stray/retransmitted msg1
+                if let Some(t) = self.last_msg1 {
+                    if now.saturating_duration_since(t) < HANDSHAKE_MIN_INTERVAL {
+                        return Err(SessionError::RateLimited);
+                    }
                 }
+                if let Err(left) = self.limiter.check(&peer, self.ms(now)) {
+                    return Err(SessionError::Locked(left));
+                }
+                self.last_msg1 = Some(now);
                 let mut r = Responder::new(
                     HandshakeKind::XxPsk3,
                     &self.keypair,
@@ -119,26 +186,44 @@ impl<I: DatagramIo> HostSession<I> {
                     PROLOGUE,
                 )?;
                 r.read_message(msg)?;
-                let m2 = r.write_message(&self.session_id.to_be_bytes())?;
-                self.io.send(&hs_packet(2, self.session_id, &m2));
-                self.state = State::WaitMsg3(Box::new(r));
+                let session_id = random_session_id()?;
+                let m2 = r.write_message(&session_id.to_be_bytes())?;
+                self.io.send(&hs_packet(2, session_id, &m2));
+                self.pending = Some(Pending {
+                    responder: Box::new(r),
+                    session_id,
+                });
                 Ok(())
             }
             3 => {
-                let State::WaitMsg3(r) = std::mem::replace(&mut self.state, State::Idle) else {
-                    return Err(SessionError::Handshake("unexpected msg3"));
-                };
-                if sid != self.session_id {
-                    return Err(SessionError::SessionId);
+                let ms = self.ms(now);
+                if let Err(left) = self.limiter.check(&peer, ms) {
+                    return Err(SessionError::Locked(left));
                 }
-                let mut r = *r;
+                match &self.pending {
+                    None => return Err(SessionError::Handshake("unexpected msg3")),
+                    Some(p) if p.session_id != sid => return Err(SessionError::SessionId),
+                    _ => {}
+                }
+                let p = self.pending.take().expect("checked above");
+                let mut r = *p.responder;
                 // Wrong OTP surfaces here: the PSK is mixed into msg3.
-                r.read_message(msg)?;
+                if let Err(e) = r.read_message(msg) {
+                    self.limiter.record_failure(peer, ms);
+                    return Err(e.into());
+                }
                 let session = r.finish()?;
                 let client_static = session
                     .remote_static()
                     .ok_or(SessionError::Handshake("no client key"))?;
-                self.state = State::Established(Box::new(Channel::new(session, self.session_id)));
+                self.limiter.record_success(&peer);
+                if self.is_established() {
+                    self.events.push_back(HostEvent::Disconnected);
+                }
+                self.session_id = p.session_id;
+                self.state = State::Established(Box::new(Channel::new(session, p.session_id)));
+                self.last_rx = now;
+                self.last_tx = now;
                 self.events
                     .push_back(HostEvent::Established { client_static });
                 Ok(())
@@ -170,14 +255,8 @@ impl<I: DatagramIo> HostSession<I> {
         let mut framed = Vec::with_capacity(data.len() + 4);
         framed.extend_from_slice(&(data.len() as u32).to_be_bytes());
         framed.extend_from_slice(data);
-        let mut shards = fec::encode_frame(frame_id, &framed, loss)?;
-        if shards.len() > 255 {
-            // Too many shards for the u8 fields: drop parity, then give up.
-            shards = fec::encode_frame(frame_id, &framed, 0.0)?;
-            if shards.len() > 255 {
-                return Err(SessionError::FrameTooLarge(shards.len()));
-            }
-        }
+        // Frames are split into FEC blocks of <= 64 data shards (see ADR-0002).
+        let shards = fec::encode_frame(frame_id, &framed, loss)?;
         let last = shards.len() - 1;
         let mut sent = 0;
         for (i, s) in shards.into_iter().enumerate() {
@@ -195,15 +274,18 @@ impl<I: DatagramIo> HostSession<I> {
                 frame_id,
                 capture_ts_us,
                 codec_flags: flags,
-                shard_idx: s.index as u8,
-                data_k: s.k as u8,
-                parity_m: s.m as u8,
+                block_idx: s.block,
+                block_count: s.blocks,
+                shard_idx: s.index,
+                data_k: s.k,
+                parity_m: s.m,
                 payload: s.data,
             };
             let dg = self.channel()?.seal(&Packet::Video(vp))?;
             self.io.send(&dg);
             sent += 1;
         }
+        self.last_tx = Instant::now();
         Ok(sent)
     }
 
@@ -225,12 +307,14 @@ impl<I: DatagramIo> HostSession<I> {
         });
         let dg = self.channel()?.seal(&pkt)?;
         self.io.send(&dg);
+        self.last_tx = Instant::now();
         Ok(())
     }
 
     pub fn send_control(&mut self, msg: ControlMessage) -> Result<()> {
         let dg = self.channel()?.control(msg)?;
         self.io.send(&dg);
+        self.last_tx = Instant::now();
         Ok(())
     }
 }

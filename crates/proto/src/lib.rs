@@ -1,4 +1,4 @@
-//! `rv-proto`: binary wire protocol v1 (all integers big-endian).
+//! `rv-proto`: binary wire protocol v2 (all integers big-endian).
 //!
 //! Layout on the wire: `OuterHeader` (12 B, plaintext) followed by an
 //! AEAD-encrypted inner packet (see [`Packet`]). This crate only encodes and

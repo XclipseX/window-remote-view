@@ -19,6 +19,7 @@ opus = "0.4"
 thiserror = "2"
 getrandom = "0.2"
 tokio = { version = "1", features = ["rt", "net", "macros"] }
+serde_json = "1"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
@@ -41,4 +42,6 @@ features = [
   "Win32_UI_Input_Pointer",
   "Win32_UI_WindowsAndMessaging",
   "Win32_Devices_Display",
+  "Win32_Media",
+  "Win32_Media_MediaFoundation",
 ]

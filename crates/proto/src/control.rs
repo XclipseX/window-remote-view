@@ -17,6 +17,8 @@ pub mod op_code {
     pub const PAUSE_VIDEO: u8 = 0x07;
     pub const FEEDBACK_STATS: u8 = 0x08;
     pub const ACK: u8 = 0x09;
+    pub const STREAM_CONFIG: u8 = 0x0A;
+    pub const KEEPALIVE: u8 = 0x0B;
 }
 
 /// Codec capability bits for `Hello::codecs`.
@@ -61,6 +63,19 @@ pub enum ControlMessage {
         decode_us: u32,
     },
     Ack { ctrl_seq: u16 },
+    /// Empty liveness ping, sent by both sides when otherwise idle (the
+    /// session layer consumes it; it is never surfaced as an event).
+    Keepalive,
+    /// Host -> client: the codec/geometry actually chosen from the client's
+    /// `Hello::codecs`. `codec` is a `codec_flags::CODEC_*` id (1=H264, 2=HEVC, 3=AV1).
+    /// Sent after the session is established and again on every change.
+    StreamConfig {
+        codec: u8,
+        width: u16,
+        height: u16,
+        fps: u16,
+        bitrate_kbps: u32,
+    },
 }
 
 fn check_quality(q: u8) -> Result<()> {
@@ -84,6 +99,8 @@ impl ControlMessage {
             Self::PauseVideo(_) => PAUSE_VIDEO,
             Self::FeedbackStats { .. } => FEEDBACK_STATS,
             Self::Ack { .. } => ACK,
+            Self::StreamConfig { .. } => STREAM_CONFIG,
+            Self::Keepalive => KEEPALIVE,
         }
     }
 
@@ -110,7 +127,7 @@ impl ControlMessage {
                     put_u16(buf, *h);
                     put_u16(buf, *fps);
                 }
-                Self::RequestIdr => {}
+                Self::RequestIdr | Self::Keepalive => {}
                 Self::CursorShape {
                     w,
                     h,
@@ -160,6 +177,19 @@ impl ControlMessage {
                     put_u32(buf, *decode_us);
                 }
                 Self::Ack { ctrl_seq } => put_u16(buf, *ctrl_seq),
+                Self::StreamConfig {
+                    codec,
+                    width,
+                    height,
+                    fps,
+                    bitrate_kbps,
+                } => {
+                    buf.push(*codec);
+                    put_u16(buf, *width);
+                    put_u16(buf, *height);
+                    put_u16(buf, *fps);
+                    put_u32(buf, *bitrate_kbps);
+                }
             }
             check_max("control payload", buf.len() - start, MAX_CONTROL_PAYLOAD)
         })
@@ -226,6 +256,14 @@ impl ControlMessage {
                 decode_us: r.u32()?,
             },
             ACK => Self::Ack { ctrl_seq: r.u16()? },
+            KEEPALIVE => Self::Keepalive,
+            STREAM_CONFIG => Self::StreamConfig {
+                codec: r.u8()?,
+                width: r.u16()?,
+                height: r.u16()?,
+                fps: r.u16()?,
+                bitrate_kbps: r.u32()?,
+            },
             other => return Err(ProtoError::UnknownOpCode(other)),
         };
         r.finish()?;

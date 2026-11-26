@@ -1,8 +1,10 @@
 //! Adaptive Reed-Solomon FEC over frame shards.
 //!
-//! A frame is split into `k` equally sized data shards (<= [`MAX_SHARD_PAYLOAD`]
-//! bytes, even length as required by `reed-solomon-simd`), `m` parity shards are
-//! added, and any `k` of the `k + m` shards recover the frame.
+//! A frame is split into equally sized data shards (<= [`MAX_SHARD_PAYLOAD`]
+//! bytes, even length as required by `reed-solomon-simd`), grouped into FEC
+//! blocks of <= [`MAX_BLOCK_DATA_SHARDS`] data shards. Each block gets its own
+//! `m` parity shards and any `k` of a block's `k + m` shards recover that block.
+//! See docs/vault/decisions/ADR-0002-large-frames.md.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -12,7 +14,7 @@ use thiserror::Error;
 /// Maximum payload bytes per shard (keeps packets < 1200 bytes with header).
 pub const MAX_SHARD_PAYLOAD: usize = 1150;
 /// Serialized shard header length.
-pub const HEADER_LEN: usize = 14;
+pub const HEADER_LEN: usize = 16;
 /// Loss rate below which FEC is disabled (LAN option).
 pub const LAN_LOSS_THRESHOLD: f32 = 0.001;
 
@@ -36,15 +38,26 @@ pub fn parity_count(k: usize, loss: f32) -> usize {
     ((k as f32) * ratio).ceil() as usize
 }
 
+/// Max data shards per FEC block. Recovery is per block, so a lost shard only
+/// needs parity from its own block and a block decodes as soon as it has `k`
+/// shards (small RS problems keep decode latency low).
+pub const MAX_BLOCK_DATA_SHARDS: usize = 64;
+/// Max blocks per frame (`block`/`blocks` are u8): 255 * 64 * 1150 ~ 18.7 MB.
+pub const MAX_BLOCKS: usize = 255;
+
 /// One wire shard: header + payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shard {
     pub frame_id: u32,
-    /// Data shard count.
+    /// Block index within the frame.
+    pub block: u8,
+    /// Total blocks in the frame.
+    pub blocks: u8,
+    /// Data shard count of this block.
     pub k: u16,
-    /// Parity shard count.
+    /// Parity shard count of this block.
     pub m: u16,
-    /// 0..k are data shards, k..k+m parity.
+    /// 0..k are data shards, k..k+m parity (within the block).
     pub index: u16,
     /// Original frame length in bytes.
     pub frame_len: u32,
@@ -55,6 +68,8 @@ impl Shard {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(HEADER_LEN + self.data.len());
         v.extend_from_slice(&self.frame_id.to_be_bytes());
+        v.push(self.block);
+        v.push(self.blocks);
         v.extend_from_slice(&self.k.to_be_bytes());
         v.extend_from_slice(&self.m.to_be_bytes());
         v.extend_from_slice(&self.index.to_be_bytes());
@@ -71,28 +86,46 @@ impl Shard {
         let u32at = |i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
         let s = Shard {
             frame_id: u32at(0),
-            k: u16at(4),
-            m: u16at(6),
-            index: u16at(8),
-            frame_len: u32at(10),
+            block: b[4],
+            blocks: b[5],
+            k: u16at(6),
+            m: u16at(8),
+            index: u16at(10),
+            frame_len: u32at(12),
             data: b[HEADER_LEN..].to_vec(),
         };
-        if s.k == 0 || s.index >= s.k.saturating_add(s.m) || !s.data.len().is_multiple_of(2) {
+        s.validate()?;
+        Ok(s)
+    }
+
+    /// Structural validity (also applied to shards built from another wire format).
+    pub fn validate(&self) -> Result<(), FecError> {
+        if self.k == 0
+            || self.k as usize > MAX_BLOCK_DATA_SHARDS
+            || self.m as usize > MAX_BLOCK_DATA_SHARDS
+            || self.blocks == 0
+            || self.block >= self.blocks
+            || self.index >= self.k.saturating_add(self.m)
+            || self.data.is_empty()
+            || !self.data.len().is_multiple_of(2)
+        {
             return Err(FecError::Malformed);
         }
-        Ok(s)
+        Ok(())
     }
 }
 
-/// Split `frame` into data shards and add parity according to `loss`.
+/// Split `frame` into FEC blocks of at most [`MAX_BLOCK_DATA_SHARDS`] data
+/// shards each, add parity per block according to `loss`, and return the wire
+/// shards interleaved across blocks (shard 0 of every block, then shard 1, ...)
+/// so a loss burst is spread over blocks instead of exhausting one block.
 pub fn encode_frame(frame_id: u32, frame: &[u8], loss: f32) -> Result<Vec<Shard>, FecError> {
-    let k = frame.len().div_ceil(MAX_SHARD_PAYLOAD).max(1);
-    let m = parity_count(k, loss);
-    if k + m > 60_000 {
-        return Err(FecError::FrameTooLarge(k + m));
+    let est = frame.len().div_ceil(MAX_SHARD_PAYLOAD).max(1);
+    if est > MAX_BLOCKS * MAX_BLOCK_DATA_SHARDS {
+        return Err(FecError::FrameTooLarge(est));
     }
-    // Equal shard size, rounded up to even.
-    let size = (frame.len().div_ceil(k).max(2) + 1) & !1;
+    // Equal shard size across the whole frame, rounded up to even.
+    let size = (frame.len().div_ceil(est).max(2) + 1) & !1;
     let mut data: Vec<Vec<u8>> = frame
         .chunks(size)
         .map(|c| {
@@ -104,38 +137,69 @@ pub fn encode_frame(frame_id: u32, frame: &[u8], loss: f32) -> Result<Vec<Shard>
     if data.is_empty() {
         data.push(vec![0; size]);
     }
-    debug_assert_eq!(data.len(), k);
-    let parity = if m > 0 {
-        reed_solomon_simd::encode(k, m, &data).map_err(|e| FecError::Codec(e.to_string()))?
-    } else {
-        Vec::new()
-    };
-    let mk = |index: usize, data: Vec<u8>| Shard {
-        frame_id,
-        k: k as u16,
-        m: m as u16,
-        index: index as u16,
-        frame_len: frame.len() as u32,
-        data,
-    };
-    Ok(data
-        .into_iter()
-        .chain(parity)
-        .enumerate()
-        .map(|(i, d)| mk(i, d))
-        .collect())
+    let total = data.len();
+    let blocks = total.div_ceil(MAX_BLOCK_DATA_SHARDS);
+    let per_block = total.div_ceil(blocks);
+    let mut per: Vec<Vec<Shard>> = Vec::with_capacity(blocks);
+    let mut it = data.into_iter();
+    for b in 0..blocks {
+        let chunk: Vec<Vec<u8>> = it.by_ref().take(per_block).collect();
+        let k = chunk.len();
+        let m = parity_count(k, loss);
+        let parity = if m > 0 {
+            reed_solomon_simd::encode(k, m, &chunk).map_err(|e| FecError::Codec(e.to_string()))?
+        } else {
+            Vec::new()
+        };
+        per.push(
+            chunk
+                .into_iter()
+                .chain(parity)
+                .enumerate()
+                .map(|(i, d)| Shard {
+                    frame_id,
+                    block: b as u8,
+                    blocks: blocks as u8,
+                    k: k as u16,
+                    m: m as u16,
+                    index: i as u16,
+                    frame_len: frame.len() as u32,
+                    data: d,
+                })
+                .collect(),
+        );
+    }
+    let longest = per.iter().map(Vec::len).max().unwrap_or(0);
+    let mut out = Vec::with_capacity(per.iter().map(Vec::len).sum());
+    let mut iters: Vec<_> = per.into_iter().map(Vec::into_iter).collect();
+    for _ in 0..longest {
+        for it in iters.iter_mut() {
+            if let Some(s) = it.next() {
+                out.push(s);
+            }
+        }
+    }
+    Ok(out)
+}
+
+struct BlockState {
+    k: u16,
+    m: u16,
+    shards: HashMap<u16, Vec<u8>>,
+    /// Recovered concatenated data shards of this block.
+    done: Option<Vec<u8>>,
 }
 
 struct Pending {
-    k: u16,
-    m: u16,
+    blocks: u8,
     frame_len: u32,
     shard_len: usize,
     first_seen: Instant,
-    shards: HashMap<u16, Vec<u8>>,
+    states: HashMap<u8, BlockState>,
+    blocks_done: usize,
 }
 
-/// Collects shards and yields frames once any `k` of `k + m` shards arrived.
+/// Collects shards and yields frames once every block has `k` of `k + m` shards.
 pub struct FrameReassembler {
     timeout: Duration,
     pending: HashMap<u32, Pending>,
@@ -162,62 +226,76 @@ impl FrameReassembler {
     /// Push a shard (arrival time `now`). Returns the frame when it becomes complete.
     pub fn push(&mut self, shard: Shard, now: Instant) -> Option<Vec<u8>> {
         self.evict_expired(now);
-        if self.done.contains(&shard.frame_id) {
+        if shard.validate().is_err() || self.done.contains(&shard.frame_id) {
             return None;
         }
         let id = shard.frame_id;
         let p = self.pending.entry(id).or_insert_with(|| Pending {
-            k: shard.k,
-            m: shard.m,
+            blocks: shard.blocks,
             frame_len: shard.frame_len,
             shard_len: shard.data.len(),
             first_seen: now,
-            shards: HashMap::new(),
+            states: HashMap::new(),
+            blocks_done: 0,
         });
-        if p.k != shard.k
-            || p.m != shard.m
-            || p.frame_len != shard.frame_len
-            || p.shard_len != shard.data.len()
-            || shard.index >= p.k + p.m
-        {
+        if p.blocks != shard.blocks || p.frame_len != shard.frame_len || p.shard_len != shard.data.len() {
             return None; // inconsistent with first shard; ignore
         }
-        p.shards.insert(shard.index, shard.data);
-        if p.shards.len() < p.k as usize {
+        let st = p.states.entry(shard.block).or_insert_with(|| BlockState {
+            k: shard.k,
+            m: shard.m,
+            shards: HashMap::new(),
+            done: None,
+        });
+        if st.k != shard.k || st.m != shard.m || st.done.is_some() {
+            return None;
+        }
+        st.shards.insert(shard.index, shard.data);
+        if st.shards.len() >= st.k as usize {
+            st.done = Self::recover_block(st);
+            if st.done.is_some() {
+                st.shards = HashMap::new();
+                p.blocks_done += 1;
+            }
+        }
+        if p.blocks_done < p.blocks as usize {
             return None;
         }
         let p = self.pending.remove(&id)?;
-        let frame = Self::recover(p)?;
+        let mut out = Vec::new();
+        for b in 0..p.blocks {
+            out.extend_from_slice(p.states.get(&b)?.done.as_ref()?);
+        }
+        out.truncate(p.frame_len as usize);
         self.done.push_back(id);
         if self.done.len() > DONE_MEMORY {
             self.done.pop_front();
         }
-        Some(frame)
+        Some(out)
     }
 
-    fn recover(p: Pending) -> Option<Vec<u8>> {
-        let k = p.k as usize;
-        let mut out = Vec::with_capacity(k * p.shard_len);
-        if (0..p.k).all(|i| p.shards.contains_key(&i)) {
-            for i in 0..p.k {
-                out.extend_from_slice(&p.shards[&i]);
+    fn recover_block(st: &BlockState) -> Option<Vec<u8>> {
+        let k = st.k as usize;
+        let mut out = Vec::new();
+        if (0..st.k).all(|i| st.shards.contains_key(&i)) {
+            for i in 0..st.k {
+                out.extend_from_slice(&st.shards[&i]);
             }
         } else {
-            let originals = p.shards.iter().filter(|(i, _)| **i < p.k).map(|(i, d)| (*i as usize, d.as_slice()));
-            let recovery = p
+            let originals = st.shards.iter().filter(|(i, _)| **i < st.k).map(|(i, d)| (*i as usize, d.as_slice()));
+            let recovery = st
                 .shards
                 .iter()
-                .filter(|(i, _)| **i >= p.k)
-                .map(|(i, d)| ((*i - p.k) as usize, d.as_slice()));
-            let restored = reed_solomon_simd::decode(k, p.m as usize, originals, recovery).ok()?;
+                .filter(|(i, _)| **i >= st.k)
+                .map(|(i, d)| ((*i - st.k) as usize, d.as_slice()));
+            let restored = reed_solomon_simd::decode(k, st.m as usize, originals, recovery).ok()?;
             for i in 0..k {
-                match p.shards.get(&(i as u16)) {
+                match st.shards.get(&(i as u16)) {
                     Some(d) => out.extend_from_slice(d),
                     None => out.extend_from_slice(restored.get(&i)?),
                 }
             }
         }
-        out.truncate(p.frame_len as usize);
         Some(out)
     }
 
@@ -311,6 +389,44 @@ mod tests {
         }
         assert_eq!(got, 1);
         assert_eq!(encode_frame(3, &[], 0.0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn large_frame_3mb_5pct_loss() {
+        let f = frame(3 * 1024 * 1024);
+        let shards = encode_frame(11, &f, 0.05).unwrap();
+        assert!(shards[0].blocks > 1);
+        // deterministic pseudo-random 5% loss
+        let mut x: u32 = 12345;
+        let mut r = FrameReassembler::new(Duration::from_secs(1));
+        let now = Instant::now();
+        let mut out = None;
+        let mut dropped = 0;
+        for s in shards {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            if (x >> 8) % 100 < 5 {
+                dropped += 1;
+                continue;
+            }
+            out = r.push(Shard::from_bytes(&s.to_bytes()).unwrap(), now).or(out);
+        }
+        assert!(dropped > 100);
+        assert_eq!(out.unwrap(), f);
+    }
+
+    #[test]
+    fn frame_8mb_and_too_large() {
+        let f = frame(8 * 1024 * 1024);
+        let shards = encode_frame(1, &f, 0.0).unwrap();
+        let mut r = FrameReassembler::new(Duration::from_secs(1));
+        let now = Instant::now();
+        let mut out = None;
+        for s in shards {
+            out = r.push(s, now).or(out);
+        }
+        assert_eq!(out.unwrap(), f);
+        let huge = vec![0u8; MAX_BLOCKS * MAX_BLOCK_DATA_SHARDS * MAX_SHARD_PAYLOAD + 1];
+        assert!(matches!(encode_frame(1, &huge, 0.0), Err(FecError::FrameTooLarge(_))));
     }
 
     #[test]

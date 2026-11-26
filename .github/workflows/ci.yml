@@ -27,7 +27,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets
-      - run: cargo build --release -p rv-signal-relay -p rv-host-win
+      - run: cargo build --release -p rv-signal-relay -p rv-host-win -p rv-win-ui
       - uses: actions/upload-artifact@v4
         with:
           name: binaries-${{ matrix.os }}
@@ -35,6 +35,7 @@ jobs:
             target/release/rv-signal-relay
             target/release/rv-signal-relay.exe
             target/release/rv-host.exe
+            target/release/RemoteView.exe
           if-no-files-found: ignore
 
   android:
@@ -95,6 +96,7 @@ jobs:
           mkdir out
           cp dl/android-debug-apk/*.apk out/RemoteView.apk
           cp dl/binaries-windows-latest/rv-host.exe out/ || true
+          cp dl/binaries-windows-latest/RemoteView.exe out/ || true
           cp dl/binaries-windows-latest/rv-signal-relay.exe out/ || true
           ls -la out
       - uses: softprops/action-gh-release@v2
@@ -106,5 +108,5 @@ jobs:
           body: |
             Bản build tự động từ commit ${{ github.sha }}.
             - RemoteView.apk (đã ký, cài đè được bản trước): cài lên Android (Tab S10+ / S26+)
-            - rv-host.exe: chạy trên Windows
+            - RemoteView.exe + rv-host.exe: app Windows (đặt cùng thư mục, mở RemoteView.exe)
           files: out/*

@@ -2,11 +2,13 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use rv_crypto::{derive_psk, HandshakeKind, Initiator, Keypair, Psk};
-use rv_proto::{codec_flags, AudioPacket, ControlMessage, InputEvent, Packet, VideoPacket};
+use rv_proto::{codec_flags, AudioPacket, ControlMessage, ControlPacket, InputEvent, Packet, VideoPacket};
 use rv_transport::fec::{FrameReassembler, Shard};
 
 use crate::channel::Channel;
-use crate::{hs_packet, hs_parse, DatagramIo, Result, SessionError, PROLOGUE};
+use crate::{
+    hs_packet, hs_parse, DatagramIo, Result, SessionError, IDLE_TIMEOUT, KEEPALIVE_INTERVAL, PROLOGUE,
+};
 
 /// A fully reassembled video frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +26,9 @@ pub enum ClientEvent {
     Frame(Frame),
     Audio(AudioPacket),
     Control(ControlMessage),
+    /// No authenticated packet for [`crate::IDLE_TIMEOUT`] (detected in `tick`),
+    /// or `start()` was called again. Call `start()` to reconnect.
+    Disconnected,
 }
 
 enum State {
@@ -41,6 +46,8 @@ pub struct ClientSession<I: DatagramIo> {
     events: VecDeque<ClientEvent>,
     reasm: FrameReassembler,
     meta: HashMap<u32, (u32, u8)>,
+    last_rx: Instant,
+    last_tx: Instant,
 }
 
 impl<I: DatagramIo> ClientSession<I> {
@@ -53,6 +60,8 @@ impl<I: DatagramIo> ClientSession<I> {
             events: VecDeque::new(),
             reasm: FrameReassembler::new(Duration::from_millis(250)),
             meta: HashMap::new(),
+            last_rx: Instant::now(),
+            last_tx: Instant::now(),
         })
     }
 
@@ -75,6 +84,9 @@ impl<I: DatagramIo> ClientSession<I> {
 
     /// Send handshake message 1 (call again to retransmit).
     pub fn start(&mut self) -> Result<()> {
+        if self.is_established() {
+            self.drop_session();
+        }
         let mut i = Initiator::new(
             HandshakeKind::XxPsk3,
             &self.keypair,
@@ -88,8 +100,26 @@ impl<I: DatagramIo> ClientSession<I> {
         Ok(())
     }
 
-    /// Drop stale partially received frames; call periodically.
+    fn drop_session(&mut self) {
+        self.state = State::Idle;
+        self.reasm = FrameReassembler::new(Duration::from_millis(250));
+        self.meta.clear();
+        self.events.push_back(ClientEvent::Disconnected);
+    }
+
+    /// Drop stale partially received frames, send keepalives and detect a dead
+    /// host ([`ClientEvent::Disconnected`] after [`IDLE_TIMEOUT`] of silence);
+    /// call every ~100 ms.
     pub fn tick(&mut self, now: Instant) {
+        if self.is_established() {
+            if now.saturating_duration_since(self.last_rx) >= IDLE_TIMEOUT {
+                self.drop_session();
+                return;
+            }
+            if now.saturating_duration_since(self.last_tx) >= KEEPALIVE_INTERVAL {
+                let _ = self.send_control(ControlMessage::Keepalive);
+            }
+        }
         self.reasm.evict_expired(now);
         if self.reasm.pending_frames() == 0 {
             self.meta.clear();
@@ -102,13 +132,16 @@ impl<I: DatagramIo> ClientSession<I> {
 
     pub fn handle_datagram_at(&mut self, data: &[u8], now: Instant) -> Result<()> {
         if data.first() == Some(&crate::HS_MAGIC) {
-            return self.handle_handshake(data);
+            return self.handle_handshake(data, now);
         }
         let State::Established(ch) = &mut self.state else {
             return Err(SessionError::NotEstablished);
         };
-        match ch.open(data)? {
+        let pkt = ch.open(data)?;
+        self.last_rx = now;
+        match pkt {
             Packet::Video(vp) => self.on_video(vp, now),
+            Packet::Control(ControlPacket { message: ControlMessage::Keepalive, .. }) => {}
             Packet::Control(c) => self.events.push_back(ClientEvent::Control(c.message)),
             Packet::Audio(a) => self.events.push_back(ClientEvent::Audio(a)),
             _ => {}
@@ -117,8 +150,7 @@ impl<I: DatagramIo> ClientSession<I> {
     }
 
     fn on_video(&mut self, vp: VideoPacket, now: Instant) {
-        let k = u16::from(vp.data_k);
-        let m = u16::from(vp.parity_m);
+        let (k, m) = (vp.data_k, vp.parity_m);
         let (id, ts, flags) = (vp.frame_id, vp.capture_ts_us, vp.codec_flags);
         self.meta.entry(id).or_insert((ts, flags));
         // frame_len = padded size; the real length is the 4-byte prefix.
@@ -126,8 +158,11 @@ impl<I: DatagramIo> ClientSession<I> {
             frame_id: id,
             k,
             m,
-            index: u16::from(vp.shard_idx),
-            frame_len: u32::from(k) * vp.payload.len() as u32,
+            block: vp.block_idx,
+            blocks: vp.block_count,
+            index: vp.shard_idx,
+            // Unknown here: the real length is the 4-byte prefix in the data.
+            frame_len: u32::MAX,
             data: vp.payload,
         };
         if let Some(buf) = self.reasm.push(shard, now) {
@@ -152,7 +187,7 @@ impl<I: DatagramIo> ClientSession<I> {
         }
     }
 
-    fn handle_handshake(&mut self, data: &[u8]) -> Result<()> {
+    fn handle_handshake(&mut self, data: &[u8], now: Instant) -> Result<()> {
         let (step, sid, msg) = hs_parse(data)?;
         if step != 2 {
             return Err(SessionError::Handshake("unexpected step"));
@@ -172,6 +207,8 @@ impl<I: DatagramIo> ClientSession<I> {
             .remote_static()
             .ok_or(SessionError::Handshake("no host key"))?;
         self.state = State::Established(Box::new(Channel::new(session, sid)));
+        self.last_rx = now;
+        self.last_tx = now;
         self.events
             .push_back(ClientEvent::Established { host_static });
         Ok(())
@@ -187,12 +224,14 @@ impl<I: DatagramIo> ClientSession<I> {
     pub fn send_input(&mut self, event: InputEvent) -> Result<()> {
         let dg = self.channel()?.input(event)?;
         self.io.send(&dg);
+        self.last_tx = Instant::now();
         Ok(())
     }
 
     pub fn send_control(&mut self, msg: ControlMessage) -> Result<()> {
         let dg = self.channel()?.control(msg)?;
         self.io.send(&dg);
+        self.last_tx = Instant::now();
         Ok(())
     }
 

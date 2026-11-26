@@ -7,7 +7,7 @@
 //! # Handshake framing
 //! rv-proto has no handshake packet type, so handshake datagrams use their own
 //! tiny framing that cannot collide with data packets (data starts with
-//! `0x1X`, version 1): `[0xA5, step, session_id u32 BE, noise_message...]`.
+//! `0x2X`, version 2): `[0xA5, step, session_id u32 BE, noise_message...]`.
 //! step 1 = initiator msg1 (session_id 0), step 2 = responder msg2 (host picks
 //! the random session id; also carried as the authenticated Noise payload),
 //! step 3 = initiator msg3 (carries the OTP-bound PSK proof).
@@ -36,6 +36,23 @@ pub trait DatagramIo {
 /// Fixed `host_id` (Argon2 salt for the OTP-derived PSK) used on the USB link.
 /// Host and Android client must agree; there is no pre-handshake hello yet.
 pub const USB_HOST_ID: &[u8] = b"rv-host-win-0001";
+
+/// Silence (no authenticated packet) after which a session is declared dead.
+pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Send a `Keepalive` when nothing else was sent for this long (from `tick`).
+pub const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Host accepts at most one new handshake (msg1) per this interval.
+pub const HANDSHAKE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// Peer key used by [`HostSession::handle_datagram`] when the caller has no address.
+pub const PEER_UNKNOWN: u64 = 0;
+
+/// Stable-within-process key for a peer address (per-peer OTP attempt limiting).
+pub fn peer_key(addr: &std::net::SocketAddr) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    addr.hash(&mut h);
+    h.finish() | 1 // never PEER_UNKNOWN
+}
 
 /// First byte of every handshake datagram (data packets start with 0x1X).
 pub const HS_MAGIC: u8 = 0xA5;

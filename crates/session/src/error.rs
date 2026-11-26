@@ -16,8 +16,12 @@ pub enum SessionError {
     SessionId,
     #[error("malformed datagram")]
     Malformed,
-    #[error("frame too large for 255-shard limit ({0} data shards)")]
+    #[error("frame too large ({0} data shards)")]
     FrameTooLarge(usize),
+    #[error("handshake rate limited")]
+    RateLimited,
+    #[error("peer locked out after failed attempts ({0} ms left)")]
+    Locked(u64),
     #[error("nonce space exhausted")]
     NonceExhausted,
     #[error("random source failure")]

@@ -34,7 +34,7 @@ fn outer_roundtrip_and_layout() {
     h.encode(&mut b).unwrap();
     assert_eq!(
         b,
-        [0x15, 0xDE, 0xAD, 0xBE, 0xEF, 0x04, 1, 2, 3, 4, 5, 6]
+        [0x25, 0xDE, 0xAD, 0xBE, 0xEF, 0x04, 1, 2, 3, 4, 5, 6]
     );
     rt(&h, OuterHeader::encode, OuterHeader::decode);
 }
@@ -51,12 +51,12 @@ fn outer_rejections() {
     h.flags = 0;
     h.encode(&mut b).unwrap();
     let mut bad = b.clone();
-    bad[0] = 0x20;
+    bad[0] = 0x30;
     assert_eq!(
         OuterHeader::decode(&bad),
-        Err(ProtoError::UnsupportedVersion(2))
+        Err(ProtoError::UnsupportedVersion(3))
     );
-    bad[0] = 0x10;
+    bad[0] = 0x20;
     bad[5] = 0x7F;
     assert_eq!(
         OuterHeader::decode(&bad),
@@ -69,6 +69,8 @@ fn video(len: usize) -> VideoPacket {
         frame_id: 7,
         capture_ts_us: 123456,
         codec_flags: codec_flags::CODEC_H264 | codec_flags::FLAG_KEYFRAME,
+        block_idx: 1,
+        block_count: 3,
         shard_idx: 3,
         data_k: 4,
         parity_m: 2,
@@ -83,7 +85,18 @@ fn video_roundtrip() {
     let mut b = Vec::new();
     video(10).encode(&mut b).unwrap();
     assert_eq!(b.len(), VIDEO_HEADER_LEN + 10);
-    assert_eq!(&b[12..14], &[0, 10]);
+    assert_eq!(&b[18..20], &[0, 10]);
+}
+
+#[test]
+fn video_wide_fields_roundtrip() {
+    let mut p = video(5);
+    p.block_idx = 254;
+    p.block_count = 255;
+    p.shard_idx = 1000;
+    p.data_k = 900;
+    p.parity_m = 200;
+    rt(&p, VideoPacket::encode, VideoPacket::decode);
 }
 
 #[test]
@@ -100,9 +113,19 @@ fn video_rejections() {
     p.shard_idx = 0;
     p.data_k = 0;
     assert!(p.encode(&mut b).is_err());
+    p.data_k = 4;
+    p.block_idx = 3;
+    assert!(p.encode(&mut b).is_err());
+    p.block_idx = 0;
+    p.block_count = 0;
+    assert!(p.encode(&mut b).is_err());
+    p.block_count = 1;
+    p.data_k = 32768;
+    p.parity_m = 1;
+    assert!(p.encode(&mut b).is_err());
     // oversize on decode
     video(1150).encode(&mut b).unwrap();
-    b[12..14].copy_from_slice(&1151u16.to_be_bytes());
+    b[18..20].copy_from_slice(&1151u16.to_be_bytes());
     b.push(0);
     assert!(matches!(
         VideoPacket::decode(&b),
@@ -190,7 +213,7 @@ fn input_rejections() {
 fn all_controls() -> Vec<ControlMessage> {
     vec![
         ControlMessage::Hello {
-            proto_version: 1,
+            proto_version: 2,
             codecs: codec_mask::H264 | codec_mask::AV1,
             max_w: 3840,
             max_h: 2160,
@@ -207,6 +230,14 @@ fn all_controls() -> Vec<ControlMessage> {
         ControlMessage::PauseVideo(false),
         ControlMessage::FeedbackStats { rtt_us: 12_000, loss_permille: 25, recv_kbps: 20_000, decode_us: 3_500 },
         ControlMessage::Ack { ctrl_seq: 42 },
+        ControlMessage::Keepalive,
+        ControlMessage::StreamConfig {
+            codec: codec_flags::CODEC_H265,
+            width: 2800,
+            height: 1752,
+            fps: 120,
+            bitrate_kbps: 80_000,
+        },
     ]
 }
 

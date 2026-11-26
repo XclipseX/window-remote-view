@@ -5,7 +5,11 @@ use crate::wire::{atomic, check_max, put_u16, put_u32, Reader};
 
 /// Max bytes of one video shard payload (avoids IP fragmentation).
 pub const MAX_SHARD_PAYLOAD: usize = 1150;
-pub const VIDEO_HEADER_LEN: usize = 16;
+/// Protocol v2 video header: frame_id 4, capture_ts 4, codec_flags 1,
+/// block_idx 1, block_count 1, reserved 1, shard_idx 2, data_k 2, parity_m 2, len 2.
+pub const VIDEO_HEADER_LEN: usize = 20;
+/// Max total shards (data + parity) per FEC block (reed-solomon-simd limit).
+pub const MAX_BLOCK_SHARDS: u32 = 32768;
 /// Max opus payload per audio packet.
 pub const MAX_AUDIO_PAYLOAD: usize = 1200;
 pub const AUDIO_HEADER_LEN: usize = 10;
@@ -27,16 +31,21 @@ pub struct VideoPacket {
     pub frame_id: u32,
     pub capture_ts_us: u32,
     pub codec_flags: u8,
-    pub shard_idx: u8,
-    pub data_k: u8,
-    pub parity_m: u8,
+    /// FEC block index within the frame (0..block_count).
+    pub block_idx: u8,
+    /// Number of FEC blocks in the frame (>= 1).
+    pub block_count: u8,
+    /// Shard index within the block: 0..data_k data, then parity.
+    pub shard_idx: u16,
+    pub data_k: u16,
+    pub parity_m: u16,
     pub payload: Vec<u8>,
 }
 
 impl VideoPacket {
     fn validate(&self) -> Result<()> {
         check_max("video payload", self.payload.len(), MAX_SHARD_PAYLOAD)?;
-        validate_shard(self.shard_idx, self.data_k, self.parity_m)
+        validate_shard(self.block_idx, self.block_count, self.shard_idx, self.data_k, self.parity_m)
     }
 
     pub fn encode(&self, buf: &mut Vec<u8>) -> Result<()> {
@@ -44,9 +53,11 @@ impl VideoPacket {
         atomic(buf, |buf| {
             put_u32(buf, self.frame_id);
             put_u32(buf, self.capture_ts_us);
-            buf.extend_from_slice(&[self.codec_flags, self.shard_idx, self.data_k, self.parity_m]);
+            buf.extend_from_slice(&[self.codec_flags, self.block_idx, self.block_count, 0]);
+            put_u16(buf, self.shard_idx);
+            put_u16(buf, self.data_k);
+            put_u16(buf, self.parity_m);
             put_u16(buf, self.payload.len() as u16);
-            put_u16(buf, 0);
             buf.extend_from_slice(&self.payload);
             Ok(())
         })
@@ -57,19 +68,23 @@ impl VideoPacket {
         let frame_id = r.u32()?;
         let capture_ts_us = r.u32()?;
         let codec_flags = r.u8()?;
-        let shard_idx = r.u8()?;
-        let data_k = r.u8()?;
-        let parity_m = r.u8()?;
+        let block_idx = r.u8()?;
+        let block_count = r.u8()?;
+        let _reserved = r.u8()?;
+        let shard_idx = r.u16()?;
+        let data_k = r.u16()?;
+        let parity_m = r.u16()?;
         let len = r.u16()? as usize;
-        let _reserved = r.u16()?;
         check_max("video payload", len, MAX_SHARD_PAYLOAD)?;
-        validate_shard(shard_idx, data_k, parity_m)?;
+        validate_shard(block_idx, block_count, shard_idx, data_k, parity_m)?;
         let payload = r.take(len)?.to_vec();
         Ok((
             Self {
                 frame_id,
                 capture_ts_us,
                 codec_flags,
+                block_idx,
+                block_count,
                 shard_idx,
                 data_k,
                 parity_m,
@@ -80,11 +95,17 @@ impl VideoPacket {
     }
 }
 
-fn validate_shard(idx: u8, k: u8, m: u8) -> Result<()> {
+fn validate_shard(block_idx: u8, block_count: u8, idx: u16, k: u16, m: u16) -> Result<()> {
     if k == 0 {
         return Err(ProtoError::InvalidValue("data_k must be >= 1"));
     }
-    if u16::from(idx) >= u16::from(k) + u16::from(m) {
+    if block_count == 0 || block_idx >= block_count {
+        return Err(ProtoError::InvalidValue("block_idx >= block_count"));
+    }
+    if u32::from(k) + u32::from(m) > MAX_BLOCK_SHARDS {
+        return Err(ProtoError::InvalidValue("data_k + parity_m too large"));
+    }
+    if u32::from(idx) >= u32::from(k) + u32::from(m) {
         return Err(ProtoError::InvalidValue("shard_idx >= data_k + parity_m"));
     }
     Ok(())
