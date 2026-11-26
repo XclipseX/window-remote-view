@@ -2,6 +2,11 @@ name: CI
 permissions:
   contents: write
 
+# Bản push mới hủy bản cũ đang chạy, tránh bản cũ đăng đè APK mới lên Release.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
   pull_request:
