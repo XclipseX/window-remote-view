@@ -63,7 +63,6 @@ fn init_cache(vm: JavaVM) -> jni::errors::Result<JavaCache> {
     let on_send = env.get_static_method_id(&class, "onSendDatagramFromNative", "([B)V")?;
     let on_audio = env.get_static_method_id(&class, "onAudioFromNative", "([BJI)V")?;
     let on_stats = env.get_static_method_id(&class, "onStatsFromNative", "(FIF)V")?;
-    drop(env);
     Ok(JavaCache { vm, class: global, on_video, on_state, on_send, on_audio, on_stats })
 }
 
