@@ -270,7 +270,7 @@ fn open_lan(bind: SocketAddr) -> Result<LanHandle, String> {
                 Ok((io, sock)) => {
                     let peer = io.peer_handle();
                     let _ = ready_tx.send(Ok(io));
-                    let mut buf = vec![0u8; 2048];
+                    let mut buf = vec![0u8; 65536]; // control packets (cursor, Android logs) can exceed one MTU
                     while let Ok((n, from)) = sock.recv_from(&mut buf).await {
                         *peer.lock().unwrap() = Some(from);
                         if tx.send(buf[..n].to_vec()).is_err() {
@@ -667,6 +667,56 @@ fn audio_thread(start: Instant, sh: Arc<Shared>, tx: SyncSender<AudioOut>) {
     }
 }
 
+/// While a client is connected: keep Windows awake (no sleep / display off /
+/// screen saver), nudge the idle timer, and publish whether the desktop is locked.
+fn session_monitor_thread(sh: Arc<Shared>) {
+    let mut awake = false;
+    let mut last_nudge = Instant::now();
+    while !sh.stop.load(Ordering::Relaxed) {
+        let ready = sh.ready.load(Ordering::Relaxed);
+        if ready != awake {
+            awake = ready;
+            crate::session_state::set_keep_awake(awake);
+            info!("power: {}", if awake { "giữ máy và màn hình luôn bật khi đang chia sẻ" } else { "thôi giữ máy thức" });
+        } else if awake && last_nudge.elapsed() >= Duration::from_secs(20) {
+            crate::session_state::set_keep_awake(true); // re-assert
+        }
+        let locked = ready && crate::session_state::desktop_locked();
+        if sh.locked.swap(locked, Ordering::Relaxed) != locked {
+            if locked {
+                warn!("session: màn hình đang khóa / secure desktop; không thể ghi hình hay điều khiển cho tới khi mở khóa");
+            } else {
+                info!("session: đã mở khóa màn hình");
+            }
+        }
+        if awake && !locked && last_nudge.elapsed() >= Duration::from_secs(30) {
+            last_nudge = Instant::now();
+            crate::session_state::nudge_idle();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    crate::session_state::set_keep_awake(false);
+}
+
+/// Polls the mouse cursor and forwards shape / position changes.
+fn cursor_thread(sh: Arc<Shared>, tx: Sender<CursorUpdate>) {
+    let mut tracker = CursorTracker::new();
+    while !sh.stop.load(Ordering::Relaxed) {
+        if !sh.ready.load(Ordering::Relaxed) {
+            tracker.reset(); // the next client gets shape + position again
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        let rect = sh.cap_rect.lock().map(|g| *g).unwrap_or_default();
+        for u in crate::cursor::poll(&mut tracker, rect, Instant::now()) {
+            if tx.send(u).is_err() {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(4));
+    }
+}
+
 // --------------------------------------------------------------------------
 // device list + stdin helpers
 // --------------------------------------------------------------------------
@@ -836,6 +886,7 @@ struct Ctx {
     arx: Receiver<AudioOut>,
     evrx: Receiver<VideoEvent>,
     cmdrx: Receiver<Command>,
+    curx: Receiver<CursorUpdate>,
     active: Option<ActiveEnc>,
     rtt_us: Option<u32>,
     last_video_kbps: u64,
@@ -996,6 +1047,20 @@ impl Drop for LinkGuard {
     }
 }
 
+/// Writes a received Android log to the logs folder and notes it in the log.
+fn save_android_log(done: &crate::logfile::FinishedLog) {
+    match crate::logfile::save_android_log(&crate::logfile::logs_dir(), &done.name, &done.data) {
+        Ok(p) => info!(
+            "đã nhận log Android \"{}\" ({} byte{}) -> {}",
+            done.name,
+            done.data.len(),
+            if done.missing > 0 { format!(", thiếu {} đoạn", done.missing) } else { String::new() },
+            p.display()
+        ),
+        Err(e) => warn!("không lưu được log Android \"{}\": {e}", done.name),
+    }
+}
+
 fn waiting_message(link: &str) -> &'static str {
     match link {
         "usb" | "adb" => "Đang chờ thiết bị Android qua USB...",
@@ -1033,6 +1098,10 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
     let mut last_stats_emit = Instant::now();
     let mut last_stats: Option<(f64, u64, f64)> = None;
     let mut last_rx_peer_key = rv_session::PEER_UNKNOWN;
+    let mut locked_shown = false;
+    let mut logs = LogAssembler::new();
+    let mut input_gate = WarnGate::new();
+    let mut last_log_flush = Instant::now();
 
     loop {
         let (stop, otp_changed) = ctx.poll_commands();
@@ -1169,9 +1238,23 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                     }
                 }
                 HostSessionEvent::Input { event, .. } => {
-                    if let Some(inj) = ctx.injector.as_mut() {
-                        if let Err(e) = inj.inject(&event) {
-                            warn!("input: {e}");
+                    if ctx.sh.locked.load(Ordering::Relaxed) {
+                        // Injection into the lock screen is refused by Windows; say so once, not per event.
+                        if input_gate.should_log("locked") {
+                            warn!("input: bỏ qua thao tác vì màn hình đang khóa");
+                        }
+                    } else if let Some(inj) = ctx.injector.as_mut() {
+                        match inj.inject(&event) {
+                            Ok(()) => {
+                                if let Some(n) = input_gate.recovered() {
+                                    info!("input: hoạt động trở lại (đã ẩn {n} cảnh báo lặp lại)");
+                                }
+                            }
+                            Err(e) => {
+                                if input_gate.should_log(&e.to_string()) {
+                                    warn!("input: {e}");
+                                }
+                            }
                         }
                     }
                 }
@@ -1211,7 +1294,30 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                     ctx.set_status(st, link, Some(name), &msg);
                 }
                 HostSessionEvent::Control(ControlMessage::FeedbackStats { rtt_us, .. }) => ctx.rtt_us = Some(rtt_us),
+                HostSessionEvent::Control(ControlMessage::LogChunk { name, seq, last, data }) => {
+                    if let Some(done) = logs.push(&name, seq, last, &data, Instant::now()) {
+                        save_android_log(&done);
+                    }
+                }
                 HostSessionEvent::Control(_) => {}
+            }
+        }
+
+        // Lock-screen transitions: tell the user (GUI status) what to do.
+        let locked = ctx.sh.locked.load(Ordering::Relaxed);
+        if locked != locked_shown && established {
+            locked_shown = locked;
+            let (st, l, p) = (ctx.state, link, ctx.peer.clone());
+            if locked {
+                ctx.set_status(st, l, p, crate::session_state::LOCKED_MESSAGE);
+            } else {
+                ctx.set_status(st, l, p, if streaming { "Đang truyền màn hình" } else { "Đã kết nối, đang chuẩn bị truyền hình ảnh" });
+            }
+        }
+        if last_log_flush.elapsed() >= Duration::from_secs(1) {
+            last_log_flush = Instant::now();
+            for done in logs.flush_stale(Instant::now(), Duration::from_secs(3)) {
+                save_android_log(&done);
             }
         }
 
@@ -1240,7 +1346,15 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
             // Drop anything queued while nobody was listening.
             while ctx.vrx.try_recv().is_ok() {}
             while ctx.arx.try_recv().is_ok() {}
+            while ctx.curx.try_recv().is_ok() {}
             continue;
+        }
+        while let Ok(u) = ctx.curx.try_recv() {
+            let msg = match u {
+                CursorUpdate::Shape { w, h, hot_x, hot_y, rgba } => ControlMessage::CursorShape { w, h, hot_x, hot_y, rgba },
+                CursorUpdate::Pos { x, y, visible } => ControlMessage::CursorPos { x, y, visible },
+            };
+            let _ = session.send_control(msg);
         }
         if reliable {
             session.set_loss(0.0); // ordered, lossless pipe: FEC parity is wasted bytes
@@ -1254,7 +1368,12 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                     } else if !streaming {
                         streaming = true;
                         let peer = ctx.peer.clone();
-                        ctx.set_status(State::Streaming, link, peer, "Đang truyền màn hình");
+                        let msg = if ctx.sh.locked.load(Ordering::Relaxed) {
+                            crate::session_state::LOCKED_MESSAGE
+                        } else {
+                            "Đang truyền màn hình"
+                        };
+                        ctx.set_status(State::Streaming, link, peer, msg);
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -1296,6 +1415,13 @@ fn run(argv: Vec<String>) -> Result<(), String> {
         }
     };
     control::set_json_mode(a.json);
+    crate::session_state::set_dpi_aware();
+    if !a.json && !a.list {
+        // Under the GUI the GUI owns the log file (it receives these lines as JSON events).
+        if let Some(p) = crate::logfile::init("remoteview-host") {
+            info!("log file: {}", p.display());
+        }
+    }
     let otp = a.otp.clone().unwrap_or_else(control::random_otp);
     let (cmdtx, cmdrx) = mpsc::channel::<Command>();
     let sh = Arc::new(Shared {
@@ -1315,6 +1441,8 @@ fn run(argv: Vec<String>) -> Result<(), String> {
         usb_link_open: AtomicBool::new(false),
         peer_name: Mutex::new(None),
         dev_refresh: AtomicBool::new(false),
+        locked: AtomicBool::new(false),
+        cap_rect: Mutex::new(crate::Rect::default()),
     });
     let link0 = match a.mode {
         Mode::Usb => "usb",
@@ -1326,10 +1454,13 @@ fn run(argv: Vec<String>) -> Result<(), String> {
         control::emit(&control::status_json(State::Starting, link0, None, &otp, "Đang khởi động host..."));
     }
 
+    for line in crate::sysinfo::startup_report("rv-host") {
+        info!("{line}");
+    }
     let outputs = list_outputs().map_err(|e| e.to_string())?;
     if a.list {
         for o in &outputs {
-            println!("adapter {} output {} {} {:?} attached={}", o.adapter_index, o.output_index, o.name, o.desktop_rect, o.attached);
+            println!("adapter {} output {}: {}", o.adapter_index, o.output_index, o.describe());
         }
         let c = aoa::list_candidates(a.scan_all).unwrap_or_default();
         println!("usb android candidates: {c:?}; adb device: {}", adb::device_present());
@@ -1338,8 +1469,14 @@ fn run(argv: Vec<String>) -> Result<(), String> {
 
     // Pick the display to capture.
     let monitor = if a.mirror {
-        // Primary output (not "first enumerated": virtual drivers such as spacedesk can sort first).
-        pick_output(&outputs, None).cloned().ok_or("no attached output")?
+        // The chosen output, else the laptop's own panel (never "first enumerated": virtual
+        // drivers such as spacedesk can sort first and have a different aspect ratio).
+        if let Some(m) = a.monitor.as_deref() {
+            if !outputs.iter().any(|o| o.attached && o.name.eq_ignore_ascii_case(m)) {
+                warn!("monitor {m} không còn kết nối; chọn tự động");
+            }
+        }
+        pick_output(&outputs, a.monitor.as_deref()).cloned().ok_or("no attached output")?
     } else {
         let mut idd = IddCxDisplay;
         match idd.create(a.display_mode) {
@@ -1351,6 +1488,10 @@ fn run(argv: Vec<String>) -> Result<(), String> {
         }
     };
     info!("capturing {} {:?} on '{}'", monitor.name, monitor.desktop_rect, monitor.adapter_name);
+    info!("capture target: {}", monitor.describe());
+    if let Ok(mut g) = sh.cap_rect.lock() {
+        *g = monitor.desktop_rect;
+    }
 
     // Probe capture + input early so we fail before waiting on a cable.
     // A failing probe is not fatal: the video thread re-enumerates, backs off and falls back to GDI.
@@ -1379,6 +1520,7 @@ fn run(argv: Vec<String>) -> Result<(), String> {
     let (vtx, vrx) = mpsc::sync_channel::<VideoOut>(3);
     let (atx, arx) = mpsc::sync_channel::<AudioOut>(64);
     let (evtx, evrx) = mpsc::channel::<VideoEvent>();
+    let (curtx, curx) = mpsc::channel::<CursorUpdate>();
     {
         let sh = sh.clone();
         let (out_name, out_rect) = (monitor.name.clone(), monitor.desktop_rect);
@@ -1388,6 +1530,14 @@ fn run(argv: Vec<String>) -> Result<(), String> {
     {
         let sh = sh.clone();
         std::thread::spawn(move || audio_thread(start, sh, atx));
+    }
+    {
+        let sh = sh.clone();
+        std::thread::spawn(move || session_monitor_thread(sh));
+    }
+    {
+        let sh = sh.clone();
+        std::thread::spawn(move || cursor_thread(sh, curtx));
     }
     {
         let (sh, scan) = (sh.clone(), a.scan_all);
@@ -1412,6 +1562,7 @@ fn run(argv: Vec<String>) -> Result<(), String> {
         arx,
         evrx,
         cmdrx,
+        curx,
         active: None,
         rtt_us: None,
         last_video_kbps: 0,

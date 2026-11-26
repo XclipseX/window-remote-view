@@ -296,9 +296,11 @@ impl Capturer {
                     self.rect = d.desktop_rect();
                     self.prefer = Some(d.device_name().to_string());
                     #[cfg(windows)]
-                    self.gdi_announced = false;
-                    if self.gdi.take().is_some() {
-                        Self::log(Level::Info, "capture: DXGI duplication is back; leaving GDI fallback".into());
+                    {
+                        self.gdi_announced = false;
+                        if self.gdi.take().is_some() {
+                            Self::log(Level::Info, "capture: DXGI duplication is back; leaving GDI fallback".into());
+                        }
                     }
                     self.dup = Some(d);
                     self.fail_since = None;
