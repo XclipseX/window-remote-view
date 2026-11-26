@@ -425,7 +425,7 @@ fn video_thread(
                 }
             }
             if !applied_live {
-                enc = None;
+                drop(enc.take());
                 let cfg = EncoderConfig { width: tw, height: th, fps, bitrate_bps: 0 };
                 let mut log = |m: &str| info!("{m}");
                 match create_encoder(eff_codec, prefs.encoder, cfg, frame, &bitrate_for, &mut log) {

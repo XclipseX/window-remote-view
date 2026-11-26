@@ -81,6 +81,7 @@ fn pack(hi: u32, lo: u32) -> u64 {
 
 struct D3dPath {
     device: ID3D11Device,
+    #[allow(dead_code)]
     ctx: ID3D11DeviceContext,
     vdev: ID3D11VideoDevice,
     vctx: ID3D11VideoContext,
