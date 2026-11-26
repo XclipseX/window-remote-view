@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/proto", "crates/crypto", "crates/transport", "crates/session", "server/signal-relay", "crates/usb-link", "crates/host-win", "crates/android-core"]
+members = ["crates/proto", "crates/crypto", "crates/transport", "crates/session", "server/signal-relay", "crates/usb-link", "crates/host-win", "crates/android-core", "apps/win-ui"]
 
 [workspace.package]
 edition = "2021"
