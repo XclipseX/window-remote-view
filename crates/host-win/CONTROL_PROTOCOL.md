@@ -7,7 +7,7 @@ Either way it runs as a subprocess with `--json-status`:
 
 ```
 rv-host [--usb|--lan|--adb] [--otp N] [--width W --height H] [--fps F] [--quality 1-100]
-        [--codec auto|hevc|h264] [--encoder auto|hw|sw] [--display mirror|extend] [--json-status]
+        [--codec auto|hevc|h264] [--encoder auto|hw|sw] [--display mirror|extend] [--monitor NAME] [--json-status]
 ```
 
 Defaults: link auto (USB if an Android device is attached, else LAN), fps 60, quality 80,
