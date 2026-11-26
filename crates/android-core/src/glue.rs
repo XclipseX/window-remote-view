@@ -18,6 +18,12 @@ pub mod state {
     pub const FAILED: i32 = 3;
     /// Host told us the display config; message = "WxH@fps".
     pub const DISPLAY_CONFIG: i32 = 10;
+    /// Host chose the stream parameters; message = "<codec> WxH@fps <kbps>kbps"
+    /// with codec one of `h264`, `hevc`, `av1` (e.g. "hevc 2800x1752@120 80000kbps").
+    pub const STREAM_CONFIG: i32 = 11;
+    /// Host went silent for 5 s (or restarted). The worker keeps retrying the
+    /// handshake by itself; `ESTABLISHED` follows when the host is back.
+    pub const DISCONNECTED: i32 = 4;
 }
 
 /// Video flag bits understood by `NativeBridge` (`FLAG_KEYFRAME`, `FLAG_CONFIG`).
@@ -33,6 +39,37 @@ pub struct HelloConfig {
     pub width: u16,
     pub height: u16,
     pub refresh_hz: u16,
+    /// `codec_mask` bits from the optional `"codecs": ["hevc","h264","av1"]`
+    /// field; defaults to H.264 only.
+    pub codecs: u16,
+}
+
+/// Parse codec names ("h264"/"avc", "hevc"/"h265", "av1") into a `codec_mask`.
+pub fn parse_codec_mask(v: Option<&serde_json::Value>) -> u16 {
+    let mut mask = 0;
+    if let Some(arr) = v.and_then(|x| x.as_array()) {
+        for c in arr.iter().filter_map(|c| c.as_str()) {
+            mask |= match c.trim().to_ascii_lowercase().as_str() {
+                "h264" | "avc" => codec_mask::H264,
+                "hevc" | "h265" => codec_mask::H265,
+                "av1" => codec_mask::AV1,
+                _ => 0,
+            };
+        }
+    }
+    if mask == 0 {
+        codec_mask::H264
+    } else {
+        mask
+    }
+}
+
+fn codec_name(id: u8) -> &'static str {
+    match id {
+        codec_flags::CODEC_H265 => "hevc",
+        codec_flags::CODEC_AV1 => "av1",
+        _ => "h264",
+    }
 }
 
 impl HelloConfig {
@@ -44,14 +81,15 @@ impl HelloConfig {
             width: num("display_width"),
             height: num("display_height"),
             refresh_hz: num("display_refresh_hz"),
+            codecs: parse_codec_mask(v.get("codecs")),
         })
     }
 
     /// The control Hello sent right after the handshake.
     pub fn hello_message(&self) -> ControlMessage {
         ControlMessage::Hello {
-            proto_version: 1,
-            codecs: codec_mask::H264 | codec_mask::H265,
+            proto_version: rv_proto::PROTOCOL_VERSION,
+            codecs: self.codecs,
             max_w: self.width,
             max_h: self.height,
             max_fps: self.refresh_hz,
@@ -228,7 +266,17 @@ pub fn translate_event(ev: ClientEvent) -> Vec<Outgoing> {
             state: state::DISPLAY_CONFIG,
             message: Some(format!("{w}x{h}@{fps}")),
         }],
+        ClientEvent::Control(ControlMessage::StreamConfig { codec, width, height, fps, bitrate_kbps }) => {
+            vec![Outgoing::State {
+                state: state::STREAM_CONFIG,
+                message: Some(format!("{} {width}x{height}@{fps} {bitrate_kbps}kbps", codec_name(codec))),
+            }]
+        }
         ClientEvent::Control(_) => Vec::new(),
+        ClientEvent::Disconnected => vec![Outgoing::State {
+            state: state::DISCONNECTED,
+            message: None,
+        }],
     }
 }
 
@@ -243,11 +291,25 @@ mod tests {
         let j = r#"{"mode":"usb_display","display_width":2800,"display_height":1752,
             "display_refresh_hz":120,"otp":" 123456 ","touch":{"max_points":10}}"#;
         let c = HelloConfig::parse(j).unwrap();
-        assert_eq!(c, HelloConfig { otp: "123456".into(), width: 2800, height: 1752, refresh_hz: 120 });
+        assert_eq!(
+            c,
+            HelloConfig { otp: "123456".into(), width: 2800, height: 1752, refresh_hz: 120, codecs: codec_mask::H264 }
+        );
         assert_eq!(
             c.hello_message(),
-            ControlMessage::Hello { proto_version: 1, codecs: 3, max_w: 2800, max_h: 1752, max_fps: 120 }
+            ControlMessage::Hello {
+                proto_version: rv_proto::PROTOCOL_VERSION,
+                codecs: codec_mask::H264,
+                max_w: 2800,
+                max_h: 1752,
+                max_fps: 120
+            }
         );
+        let c = HelloConfig::parse(r#"{"otp":"1","codecs":["hevc","H264","bogus"]}"#).unwrap();
+        assert_eq!(c.codecs, codec_mask::H264 | codec_mask::H265);
+        let c = HelloConfig::parse(r#"{"otp":"1","codecs":["av1"]}"#).unwrap();
+        assert_eq!(c.codecs, codec_mask::AV1);
+        assert_eq!(HelloConfig::parse(r#"{"codecs":[]}"#).unwrap().codecs, codec_mask::H264);
         assert!(HelloConfig::parse("nope").is_err());
     }
 
@@ -347,6 +409,20 @@ mod tests {
             vec![Outgoing::State { state: state::DISPLAY_CONFIG, message: Some("2800x1752@120".into()) }]
         );
         assert!(translate_event(ClientEvent::Control(ControlMessage::RequestIdr)).is_empty());
+        assert_eq!(
+            translate_event(ClientEvent::Control(ControlMessage::StreamConfig {
+                codec: codec_flags::CODEC_H265,
+                width: 2800,
+                height: 1752,
+                fps: 120,
+                bitrate_kbps: 80000
+            })),
+            vec![Outgoing::State { state: state::STREAM_CONFIG, message: Some("hevc 2800x1752@120 80000kbps".into()) }]
+        );
+        assert_eq!(
+            translate_event(ClientEvent::Disconnected),
+            vec![Outgoing::State { state: state::DISCONNECTED, message: None }]
+        );
         assert_eq!(
             translate_event(ClientEvent::Established { host_static: [0; 32] }),
             vec![Outgoing::State { state: state::ESTABLISHED, message: None }]

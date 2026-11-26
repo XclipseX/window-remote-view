@@ -22,9 +22,25 @@ pub enum HostEvent {
         event: InputEvent,
     },
     Control(ControlMessage),
+}
+
+/// Superset of [`HostEvent`] including link lifecycle. Use
+/// [`HostSession::poll_session_event`]; the legacy [`HostSession::poll_event`]
+/// returns the same stream minus `Disconnected` (so existing exhaustive
+/// `match`es on `HostEvent` keep compiling).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostSessionEvent {
+    Established {
+        client_static: [u8; 32],
+    },
+    Input {
+        seq: u16,
+        event: InputEvent,
+    },
+    Control(ControlMessage),
     /// The client went silent for [`crate::IDLE_TIMEOUT`] or was replaced by a
     /// new handshake. Stop streaming; a new msg1 is accepted at any time.
-    /// (Emitted from `tick`, so the caller must call `HostSession::tick`.)
+    /// Emitted from `tick`, so the caller must call `HostSession::tick`.
     Disconnected,
 }
 
@@ -49,7 +65,7 @@ pub struct HostSession<I: DatagramIo> {
     session_id: u32,
     state: State,
     pending: Option<Pending>,
-    events: VecDeque<HostEvent>,
+    events: VecDeque<HostSessionEvent>,
     loss: f32,
     codec: u8,
     epoch: Instant,
@@ -104,7 +120,22 @@ impl<I: DatagramIo> HostSession<I> {
         self.loss = loss.clamp(0.0, 1.0);
     }
 
+    /// Legacy event stream (no lifecycle events); see [`HostSessionEvent`].
     pub fn poll_event(&mut self) -> Option<HostEvent> {
+        loop {
+            match self.events.pop_front()? {
+                HostSessionEvent::Established { client_static } => {
+                    return Some(HostEvent::Established { client_static })
+                }
+                HostSessionEvent::Input { seq, event } => return Some(HostEvent::Input { seq, event }),
+                HostSessionEvent::Control(c) => return Some(HostEvent::Control(c)),
+                HostSessionEvent::Disconnected => {} // not representable; use poll_session_event
+            }
+        }
+    }
+
+    /// Full event stream including [`HostSessionEvent::Disconnected`].
+    pub fn poll_session_event(&mut self) -> Option<HostSessionEvent> {
         self.events.pop_front()
     }
 
@@ -130,7 +161,7 @@ impl<I: DatagramIo> HostSession<I> {
         let pkt = ch.open(data)?;
         self.last_rx = now;
         match pkt {
-            Packet::Input(p) => self.events.push_back(HostEvent::Input {
+            Packet::Input(p) => self.events.push_back(HostSessionEvent::Input {
                 seq: p.input_seq,
                 event: p.event,
             }),
@@ -139,7 +170,7 @@ impl<I: DatagramIo> HostSession<I> {
                     self.loss = (f32::from(*loss_permille) / 1000.0).clamp(0.0, 1.0);
                 }
                 if c.message != ControlMessage::Keepalive {
-                    self.events.push_back(HostEvent::Control(c.message));
+                    self.events.push_back(HostSessionEvent::Control(c.message));
                 }
             }
             _ => {}
@@ -154,7 +185,7 @@ impl<I: DatagramIo> HostSession<I> {
         if self.is_established() {
             if now.saturating_duration_since(self.last_rx) >= IDLE_TIMEOUT {
                 self.state = State::Idle;
-                self.events.push_back(HostEvent::Disconnected);
+                self.events.push_back(HostSessionEvent::Disconnected);
             } else if now.saturating_duration_since(self.last_tx) >= KEEPALIVE_INTERVAL {
                 let _ = self.send_control(ControlMessage::Keepalive);
             }
@@ -218,14 +249,14 @@ impl<I: DatagramIo> HostSession<I> {
                     .ok_or(SessionError::Handshake("no client key"))?;
                 self.limiter.record_success(&peer);
                 if self.is_established() {
-                    self.events.push_back(HostEvent::Disconnected);
+                    self.events.push_back(HostSessionEvent::Disconnected);
                 }
                 self.session_id = p.session_id;
                 self.state = State::Established(Box::new(Channel::new(session, p.session_id)));
                 self.last_rx = now;
                 self.last_tx = now;
                 self.events
-                    .push_back(HostEvent::Established { client_static });
+                    .push_back(HostSessionEvent::Established { client_static });
                 Ok(())
             }
             _ => Err(SessionError::Handshake("unexpected step")),

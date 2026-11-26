@@ -122,6 +122,14 @@ fn run<I: DatagramIo, S: EventSink>(
                     log::warn!("hello failed: {e}");
                 }
             }
+            if matches!(ev, rv_session::ClientEvent::Disconnected) {
+                // Host vanished/restarted: go back to handshaking (retried by the tick below).
+                established_at = None;
+                heard_since_established = false;
+                failed = false;
+                last_start = Instant::now();
+                let _ = client.start();
+            }
             for o in translate_event(ev) {
                 deliver(sink, &o);
             }

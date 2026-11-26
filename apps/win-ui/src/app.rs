@@ -84,7 +84,33 @@ fn accent() -> Color32 {
 }
 
 impl App {
+    /// Font mặc định của egui thiếu dấu tiếng Việt: nạp font hệ thống có đủ glyph.
+    fn setup_fonts(ctx: &egui::Context) {
+        const CANDIDATES: &[&str] = &[
+            "C:\\Windows\\Fonts\\segoeui.ttf",
+            "C:\\Windows\\Fonts\\arial.ttf",
+            "C:\\Windows\\Fonts\\tahoma.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+        ];
+        let Some(bytes) = CANDIDATES.iter().find_map(|p| std::fs::read(p).ok()) else {
+            return;
+        };
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "system-vi".to_owned(),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().insert(0, "system-vi".to_owned());
+        }
+        ctx.set_fonts(fonts);
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>, demo: bool) -> Self {
+        Self::setup_fonts(&cc.egui_ctx);
         Self::setup_style(&cc.egui_ctx);
         let (tx, rx) = new_channel();
         let mut app = Self {

@@ -344,8 +344,8 @@ async fn localhost_udp() {
     assert!(saw);
 }
 
-fn events_h(r: &mut Rig) -> Vec<HostEvent> {
-    std::iter::from_fn(|| r.host.poll_event()).collect()
+fn events_h(r: &mut Rig) -> Vec<HostSessionEvent> {
+    std::iter::from_fn(|| r.host.poll_session_event()).collect()
 }
 
 fn events_c(r: &mut Rig) -> Vec<ClientEvent> {
@@ -396,7 +396,7 @@ fn host_times_out_then_accepts_new_handshake() {
     r.host.tick(t0 + Duration::from_secs(6));
     r.advance(Duration::from_secs(6));
     assert!(!r.host.is_established());
-    assert_eq!(events_h(&mut r), vec![HostEvent::Disconnected]);
+    assert_eq!(events_h(&mut r), vec![HostSessionEvent::Disconnected]);
     assert!(r.host.send_video_frame(1, 0, b"x", false).is_err());
 
     // Same client restarts (fresh Noise state) -> new session, no process restart.
@@ -405,7 +405,7 @@ fn host_times_out_then_accepts_new_handshake() {
     r.pump();
     assert!(r.host.is_established() && r.client.is_established());
     assert_ne!(r.host.session_id(), sid_old);
-    assert!(matches!(events_h(&mut r).as_slice(), [HostEvent::Established { .. }]));
+    assert!(matches!(events_h(&mut r).as_slice(), [HostSessionEvent::Established { .. }]));
 }
 
 #[test]
@@ -429,14 +429,14 @@ fn new_handshake_replaces_live_session_only_after_msg3() {
     // Live client still works.
     r.client.send_input(InputEvent::SecureAttention).unwrap();
     r.pump();
-    assert!(matches!(events_h(&mut r).as_slice(), [HostEvent::Input { .. }]));
+    assert!(matches!(events_h(&mut r).as_slice(), [HostSessionEvent::Input { .. }]));
     // The legitimate client reconnecting takes over: Disconnected then Established.
     r.advance(Duration::from_millis(520));
     r.client.start().unwrap();
     r.pump();
     assert!(matches!(
         events_h(&mut r).as_slice(),
-        [HostEvent::Disconnected, HostEvent::Established { .. }]
+        [HostSessionEvent::Disconnected, HostSessionEvent::Established { .. }]
     ));
     assert!(r.host.is_established() && r.client.is_established());
 }
@@ -463,7 +463,7 @@ fn msg1_rate_limited_and_otp_failures_lock_peer() {
     // Wrong-OTP client from peer 9: 3 failures then locked out.
     let mut bad = rig("654321", 0.0);
     // reuse bad's client against r.host
-    let mut now = t0 + Duration::from_secs(1);
+    let mut now = t0 + Duration::from_secs(2);
     for i in 0..3 {
         bad.client.start().unwrap();
         let m1 = drain(&bad.to_host).pop().unwrap();

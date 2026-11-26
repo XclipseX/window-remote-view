@@ -25,7 +25,7 @@ pub mod udp;
 
 pub use client::{ClientEvent, ClientSession, Frame};
 pub use error::{Result, SessionError};
-pub use host::{HostEvent, HostSession};
+pub use host::{HostEvent, HostSession, HostSessionEvent};
 pub use slider::{slider_to_bitrate, slider_to_qp, Codec, DEFAULT_CODEC, DEFAULT_QUALITY};
 
 /// Abstract datagram sink (UDP socket, in-memory pipe, ...). Best effort.

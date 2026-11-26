@@ -192,8 +192,12 @@ impl<I: DatagramIo> ClientSession<I> {
         if step != 2 {
             return Err(SessionError::Handshake("unexpected step"));
         }
-        let State::WaitMsg2(i) = std::mem::replace(&mut self.state, State::Idle) else {
+        // A stray msg2 (e.g. answer to someone else's msg1) must not kill a live session.
+        if !matches!(self.state, State::WaitMsg2(_)) {
             return Err(SessionError::Handshake("unexpected msg2"));
+        }
+        let State::WaitMsg2(i) = std::mem::replace(&mut self.state, State::Idle) else {
+            unreachable!()
         };
         let mut i = *i;
         let payload = i.read_message(msg)?;
