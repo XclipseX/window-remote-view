@@ -85,7 +85,7 @@ class StressRunner(
             } catch (e: ClipException) {
                 finish(failure(e.message ?: "Lỗi tạo clip")); return
             }
-            phase("Đang khởi động ${cfg.instances} bộ giải mã...")
+            phase(if (cfg.instances <= 0) "Đang mở tối đa bộ giải mã..." else "Đang khởi động ${cfg.instances} bộ giải mã...")
             // instances = 0 nghĩa là "Tối đa": mở tới khi máy từ chối (tối đa 32).
             val target = if (cfg.instances <= 0) 32 else cfg.instances
             for (i in 0 until target) {
