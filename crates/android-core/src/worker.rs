@@ -184,7 +184,7 @@ mod tests {
     }
 
     fn cfg(otp: &str) -> HelloConfig {
-        HelloConfig { otp: otp.into(), width: 1280, height: 800, refresh_hz: 60 }
+        HelloConfig { otp: otp.into(), width: 1280, height: 800, refresh_hz: 60, codecs: rv_proto::codec_mask::H264 }
     }
 
     #[test]
