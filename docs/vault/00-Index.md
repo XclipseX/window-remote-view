@@ -9,9 +9,9 @@ updated: 2026-11-26
 ## Architecture
 
 ## Decisions
+- [[decisions/ADR-0002-large-frames]] – protocol v2, FEC theo block
 
 ## Known bugs / gotchas
-- Giới hạn ~290 KB mỗi khung (255 shard)
 - Tab S10+ Android 17 không bật được USB tethering
 
 ## Recent sessions
