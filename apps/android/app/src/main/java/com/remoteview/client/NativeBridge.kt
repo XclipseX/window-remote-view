@@ -6,15 +6,13 @@ import com.remoteview.client.input.InputSink
 import com.remoteview.client.input.MouseButtonId
 import com.remoteview.client.input.RemoteInput
 
-// UNBUILT: chưa biên dịch. Chưa có librv_core.so; toàn bộ là khai báo giao diện JNI.
-
 /**
- * Giao diện JNI tới lõi Rust (`librv_core.so`): mạng, khám phá LAN, ghép gói video, đóng gói input.
- *
- * TODO(rust-core): triển khai các hàm `external` bằng crate JNI (jni-rs) trong thư mục crates/,
- *   build bằng cargo-ndk cho aarch64-linux-android, đặt .so vào apps/android/app/jniLibs/arm64-v8a/.
- *   Tên hàm JNI: Java_com_remoteview_client_NativeBridge_<tên>.
- * TODO(rust-core): đổi frame video sang direct ByteBuffer để tránh sao chép ByteArray.
+ * Giao diện JNI tới lõi Rust (`librv_core.so`, crate `crates/android-core`): phiên Noise/E2EE, ghép gói video (FEC),
+ * đóng gói input. Mỗi hàm `external` khớp một symbol `Java_com_remoteview_client_NativeBridge_<tên>`.
+ * CI build bằng cargo-ndk -> app/src/main/jniLibs/arm64-v8a/librv_core.so.
+ * Mới có đường USB (nativeConnectLink); [nativeConnect] (LAN/server) chưa cài trong lõi (trả 0 + state lỗi).
+ * Opus được giải mã trong Kotlin (AudioPlayer, MediaCodec), lõi Rust chỉ chuyển nguyên gói.
+ * TODO: đổi frame video sang direct ByteBuffer để tránh sao chép ByteArray.
  */
 @Keep
 object NativeBridge {
@@ -36,6 +34,13 @@ object NativeBridge {
 
     const val FLAG_KEYFRAME = 1
     const val FLAG_CONFIG = 2
+
+    /** Mã state của [Callbacks.onConnectionState]. */
+    const val STATE_CONNECTING = 0
+    const val STATE_ESTABLISHED = 1
+    const val STATE_CLOSED = 2
+    const val STATE_FAILED = 3
+    const val STATE_DISPLAY_CONFIG = 10
 
     @Volatile var callbacks: Callbacks? = null
 
@@ -60,7 +65,8 @@ object NativeBridge {
     /**
      * Tạo phiên chạy trên liên kết datagram do Kotlin cấp (thay vì tự mở socket).
      * [helloJson] chứa caps gửi trong Hello (độ phân giải gốc, tần số quét, cảm ứng, âm thanh...).
-     * Gói gửi đi được Rust trả ngược qua [onSendDatagramFromNative]. TODO(rust-core).
+     * [helloJson] cũng mang `"otp"` (PIN ghép đôi với host). Trả 0 nếu lỗi (PIN sai định dạng...).
+     * Gói gửi đi được Rust trả ngược qua [onSendDatagramFromNative].
      */
     external fun nativeConnectLink(helloJson: String): Long
     /** Đẩy một datagram nhận từ liên kết USB vào lõi Rust. */
@@ -90,19 +96,6 @@ object NativeBridge {
      * [com.remoteview.client.input.TouchPhase] ordinal (DOWN, MOVE, UP, CANCEL); pressure 0..1024.
      */
     external fun nativeSendTouch(handle: Long, id: Int, x: Int, y: Int, phase: Int, pressure: Int)
-
-    // --- Âm thanh ---
-    /**
-     * Giải mã một gói Opus -> PCM s16 xen kẽ stereo 48 kHz vào [pcmOut]. Trả về số frame/kênh,
-     * hoặc <= 0 nếu lỗi. TODO(rust-core): triển khai bằng crate opus trong rv_core.
-     */
-    external fun nativeDecodeOpus(packet: ByteArray, pcmOut: ShortArray): Int
-
-    /** Bọc an toàn: no-op (trả -1) khi chưa có librv_core.so hoặc hàm chưa được triển khai. */
-    fun decodeOpus(packet: ByteArray, pcmOut: ShortArray): Int {
-        if (!available) return -1
-        return try { nativeDecodeOpus(packet, pcmOut) } catch (_: UnsatisfiedLinkError) { -1 }
-    }
 
     /** Rust yêu cầu gửi một datagram ra liên kết USB; [datagramSender] do SessionController đặt. */
     @Volatile var datagramSender: ((ByteArray) -> Unit)? = null

@@ -33,6 +33,10 @@ pub trait DatagramIo {
     fn send(&mut self, buf: &[u8]);
 }
 
+/// Fixed `host_id` (Argon2 salt for the OTP-derived PSK) used on the USB link.
+/// Host and Android client must agree; there is no pre-handshake hello yet.
+pub const USB_HOST_ID: &[u8] = b"rv-host-win-0001";
+
 /// First byte of every handshake datagram (data packets start with 0x1X).
 pub const HS_MAGIC: u8 = 0xA5;
 pub(crate) const HS_HEADER_LEN: usize = 6;

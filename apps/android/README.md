@@ -12,15 +12,30 @@ Máy đích: Galaxy S26+ (Exynos 2600, `c2.exynos.*`) và Galaxy Tab S10+ (Dimen
 
 1. Mở thư mục `apps/android/` bằng Android Studio (Ladybug trở lên) hoặc chạy `gradle wrapper` rồi `./gradlew :app:assembleDebug`.
    (Chưa có Gradle wrapper vì không tạo được jar trong container.)
-2. Lõi Rust (`librv_core.so`) chưa có: đặt bản build `aarch64-linux-android` (cargo-ndk) vào
-   `app/jniLibs/arm64-v8a/`. Thiếu thư viện thì `NativeBridge.available == false` và UI vẫn chạy, lệnh native là no-op.
+2. Lõi Rust (`crates/android-core`, thư viện `librv_core.so`) build bằng cargo-ndk, CI làm sẵn:
+   `cargo ndk -t arm64-v8a -o apps/android/app/src/main/jniLibs build --release -p rv-android-core`
+   (cần `rustup target add aarch64-linux-android`, `cargo install cargo-ndk`, `ANDROID_NDK_HOME`). Gradle tự đóng gói
+   `src/main/jniLibs/arm64-v8a/librv_core.so` (thư mục bị .gitignore). Thiếu thư viện thì `NativeBridge.available == false`
+   và UI vẫn chạy, lệnh native là no-op.
 
+### Lõi Rust trong APK (chỉ đường USB)
+
+- `NativeBridge.nativeConnectLink(helloJson)` tạo phiên `rv-session` `ClientSession` chạy ở thread riêng của Rust; datagram từ
+  AOA/ADB đi vào bằng `nativePushDatagram`, gói gửi đi quay về Kotlin qua `onSendDatagramFromNative`. Video (Annex-B, H.264),
+  gói Opus thô, trạng thái, thống kê trả lên qua các hàm `on*FromNative`. `nativeConnect` (LAN/server) **chưa cài** (trả 0).
+- **Ghép đôi:** host in `OTP: dddddd` khi khởi động (hoặc cố định bằng `rv-host --otp 123456`). Người dùng nhập mã này (PIN 6–9 số)
+  ở hộp thoại khi bấm "Màn hình phụ (USB)"; được lưu trong SharedPreferences (`usb_otp`) và gửi cho Rust trong trường `"otp"` của
+  helloJson. Cả hai phía dẫn khóa PSK bằng Argon2id(OTP, `host_id`), `host_id` là hằng cố định `rv_session::USB_HOST_ID`
+  (`rv-host-win-0001`) vì chưa có hello trước bắt tay. Sai PIN: host im lặng, sau ~4 s app báo lỗi và hỏi lại PIN.
+- Hello (độ phân giải gốc + tần số quét) gửi ngay sau bắt tay; host hiện chưa dùng nó (đọc `--mode` từ dòng lệnh).
+- Opus giải mã trong Kotlin bằng `MediaCodec` "audio/opus" (`AudioPlayer`); không build libopus cho Android.
+- Host chỉ nhận một lần bắt tay mỗi lần chạy: nối lại sau khi rút cáp cần khởi động lại `rv-host`.
 ## Cấu trúc (`app/src/main/java/com/remoteview/client/`)
 
 | Đường dẫn | Vai trò |
 |---|---|
 | `MainActivity.kt` | Điều hướng Home / Cài đặt / Phiên; xin quyền; lock Wi-Fi theo vòng đời; PauseVideo ở `onStop`. |
-| `NativeBridge.kt` | Khai báo JNI tới Rust (`external fun`), callback ngược, `NativeInputSink`. Chỉ là giao diện + TODO. |
+| `NativeBridge.kt` | Khai báo JNI tới Rust (`external fun`), callback ngược, `NativeInputSink`. Cài đặt: `crates/android-core`. |
 | `AppSettings.kt` | `StreamSettings` + lưu SharedPreferences. |
 | `decoder/LowLatencyDecoder.kt` | Chọn codec (ưu tiên HEVC; AV1 chỉ khi cờ cho phép, tránh AV1 trên `c2.mtk` ở ≥ 90 fps; loại `unisoc` AV1 giả HW), MediaCodec async, thang fallback theo hãng (mỗi bậc một `MediaFormat` mới, lọc khóa `vendor.*` bằng `getSupportedVendorParameters()` ở API 31+). |
 | `decoder/StallWatchdog.kt` | Input chảy mà 1 s không có output → flush + xin IDR; 5 s → tạo lại codec (leo bậc ladder). |
@@ -50,8 +65,7 @@ Biến máy Android thành màn hình thứ hai của PC qua cáp USB; host tạ
   (không phải chuột); S Pen gửi sự kiện **pen**. Hello caps gồm độ phân giải gốc + tần số quét cao nhất (ví dụ 2800x1752@120)
   để host tạo màn hình ảo tương ứng (`usb/DisplayCaps.kt`; tên trường JSON chưa chốt với giao thức).
 - **Âm thanh đi kèm** (`audio/AudioPlayer.kt`): PCM 48 kHz stereo qua `AudioTrack` `PERFORMANCE_MODE_LOW_LATENCY`, bộ đệm nhỏ,
-  jitter buffer ~30 ms (tối đa 40 ms, bỏ gói cũ nhất khi trễ). Opus giải mã trong lõi Rust qua `NativeBridge.decodeOpus`
-  (TODO(rust-core); thiếu `librv_core.so` thì gói Opus bị bỏ qua, PCM thô vẫn phát). Bật/tắt ở Cài đặt → "Âm thanh".
+  jitter buffer ~30 ms (tối đa 40 ms, bỏ gói cũ nhất khi trễ). Opus giải mã bằng `MediaCodec` "audio/opus" (gói thô do lõi Rust chuyển lên; không tạo được codec thì gói Opus bị bỏ qua). Bật/tắt ở Cài đặt → "Âm thanh".
   Oboe/AAudio qua JNI là việc tương lai.
 
 Chuỗi tiếng Việt: `app/src/main/res/values/strings.xml`.
@@ -82,7 +96,7 @@ Xuất báo cáo: "Sao chép báo cáo", "Chia sẻ", và tự lưu `diagnostics
 ## Việc còn thiếu / điểm cần xác minh trên máy thật
 
 - Toàn bộ mã **chưa biên dịch**; chưa có bài kiểm thử.
-- Lõi Rust (`rv_core`): kết nối, giải mã gói, mDNS, mã hóa, gửi input. Hiện chỉ là khai báo JNI.
+- Lõi Rust (`rv_core`): mới có đường USB; chưa có LAN/server, mDNS. Lõi chưa chạy thử trên máy thật (chỉ có test đơn vị trên Linux).
 - Dấu `tiltX/tiltY` của S Pen và hệ tọa độ pen phía Windows cần kiểm chứng.
 - `ACCESS_LOCAL_NETWORK` (Android 16): tên quyền/cách hoạt động chưa xác minh với SDK 36.
 - Telex trên bàn phím ảo: `setComposingRegion()` trên văn bản đã commit không được hỗ trợ (không giữ văn bản).

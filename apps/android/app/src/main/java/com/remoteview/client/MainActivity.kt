@@ -25,6 +25,7 @@ import com.remoteview.client.usb.Route
 import com.remoteview.client.ui.DiagnosticsScreen
 import com.remoteview.client.ui.HomeScreen
 import com.remoteview.client.ui.LanHost
+import com.remoteview.client.ui.PinPrompt
 import com.remoteview.client.ui.RemoteViewTheme
 import com.remoteview.client.ui.SessionScreen
 import com.remoteview.client.ui.SettingsScreen
@@ -43,6 +44,7 @@ class MainActivity : ComponentActivity() {
     private var screen by mutableStateOf(Screen.HOME)
     private var settings by mutableStateOf(StreamSettings())
     private var usbStarting = false
+    private var pinPrompt by mutableStateOf<PinPrompt?>(null)
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { /* kết quả: bỏ qua, mạng vẫn chạy */ }
@@ -60,7 +62,9 @@ class MainActivity : ComponentActivity() {
             override fun onVideoFrame(data: ByteArray, ptsUs: Long, flags: Int) {
                 session?.submitFrame(data, ptsUs, flags)
             }
-            override fun onConnectionState(state: Int, message: String?) {}
+            override fun onConnectionState(state: Int, message: String?) {
+                session?.onNativeState(state, message)
+            }
             override fun onHostDiscovered(name: String, address: String) {
                 runOnUiThread { if (lanHosts.none { it.address == address }) lanHosts.add(LanHost(name, address)) }
             }
@@ -90,6 +94,10 @@ class MainActivity : ComponentActivity() {
      */
     private fun startUsbDisplay() {
         if (usbStarting || session != null) return
+        if (!StreamSettings.isValidOtp(settings.usbOtp)) {
+            pinPrompt = PinPrompt(null) // cần PIN của rv-host trước khi nối
+            return
+        }
         usbStarting = true
         Thread({
             val route = LinkSelector.select(applicationContext, UsbTetherDetector())
@@ -100,6 +108,14 @@ class MainActivity : ComponentActivity() {
                     is Route.Usb -> {
                         val s = SessionController(this, settings, usbDisplay = true)
                         s.onLinkClosed = { runOnUiThread { if (session === s) { endSession(); screen = Screen.HOME } } }
+                        s.onNativeFailed = { msg ->
+                            runOnUiThread {
+                                if (session === s) {
+                                    endSession(); screen = Screen.HOME
+                                    pinPrompt = PinPrompt(msg ?: "")
+                                }
+                            }
+                        }
                         session = s
                         s.attachLink(route.link)
                         screen = Screen.SESSION
@@ -129,7 +145,15 @@ class MainActivity : ComponentActivity() {
                 lanHosts = lanHosts,
                 onConnect = { target -> connectTo(target) },
                 onOpenSettings = { screen = Screen.SETTINGS },
-                onUsbDisplay = { startUsbDisplay() },
+                usbOtp = settings.usbOtp,
+                pinPrompt = pinPrompt,
+                onUsbDisplay = { pinPrompt = PinPrompt(null) },
+                onPinSubmit = { otp ->
+                    pinPrompt = null
+                    settings = settings.copy(usbOtp = otp).also { repo.save(it) }
+                    startUsbDisplay()
+                },
+                onPinDismiss = { pinPrompt = null },
                 onDiagnostics = { screen = Screen.DIAG },
             )
             Screen.DIAG -> {

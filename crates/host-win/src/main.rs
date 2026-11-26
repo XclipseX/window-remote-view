@@ -367,8 +367,8 @@ fn run() -> Result<(), String> {
     let otp = a.otp.clone().unwrap_or_else(random_otp);
     let kp = Keypair::generate().map_err(|e| e.to_string())?;
     println!("OTP: {otp}   host key fingerprint: {}", kp.fingerprint());
-    let host_id = b"rv-host-win-0001"; // TODO: persistent per-install id
-    let mut session = HostSession::new(transport, kp, &otp, host_id).map_err(|e| e.to_string())?;
+    // Fixed id shared with the Android client (USB mode has no pre-handshake hello).
+    let mut session = HostSession::new(transport, kp, &otp, rv_session::USB_HOST_ID).map_err(|e| e.to_string())?;
     session.set_codec(rv_proto::codec_flags::CODEC_H264);
 
     let start = Instant::now();

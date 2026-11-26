@@ -45,6 +45,12 @@
     <string name="session_exit">Thoát phiên</string>
 
     <!-- Màn hình phụ (USB) -->
+    <string name="usb_pin_title">PIN ghép đôi với PC</string>
+    <string name="usb_pin_hint">Nhập mã 6–9 chữ số mà rv-host in ra khi khởi động (dòng "OTP: ..."), hoặc chạy host với --otp để cố định mã.</string>
+    <string name="usb_pin_label">PIN</string>
+    <string name="usb_pin_connect">Kết nối</string>
+    <string name="usb_pin_cancel">Hủy</string>
+    <string name="usb_pin_error">Kết nối thất bại: %1$s</string>
     <string name="usb_waiting">Đang chờ kết nối USB…</string>
     <string name="usb_connected_aoa">Đã kết nối qua USB (Open Accessory)</string>
     <string name="usb_connected_adb">Đã kết nối qua USB (ADB reverse)</string>

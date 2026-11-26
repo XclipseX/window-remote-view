@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use rv_crypto::{derive_psk, HandshakeKind, Initiator, Keypair, Psk};
-use rv_proto::{codec_flags, ControlMessage, InputEvent, Packet, VideoPacket};
+use rv_proto::{codec_flags, AudioPacket, ControlMessage, InputEvent, Packet, VideoPacket};
 use rv_transport::fec::{FrameReassembler, Shard};
 
 use crate::channel::Channel;
@@ -22,6 +22,7 @@ pub struct Frame {
 pub enum ClientEvent {
     Established { host_static: [u8; 32] },
     Frame(Frame),
+    Audio(AudioPacket),
     Control(ControlMessage),
 }
 
@@ -109,6 +110,7 @@ impl<I: DatagramIo> ClientSession<I> {
         match ch.open(data)? {
             Packet::Video(vp) => self.on_video(vp, now),
             Packet::Control(c) => self.events.push_back(ClientEvent::Control(c.message)),
+            Packet::Audio(a) => self.events.push_back(ClientEvent::Audio(a)),
             _ => {}
         }
         Ok(())

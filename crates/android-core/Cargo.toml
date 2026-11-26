@@ -1,0 +1,24 @@
+[package]
+name = "rv-android-core"
+description = "JNI glue embedding the Remote View client session (rv-session) in the Android app"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+name = "rv_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rv-proto = { path = "../proto" }
+rv-crypto = { path = "../crypto" }
+rv-session = { path = "../session" }
+jni = "0.21"
+serde_json = "1"
+log = "0.4"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"
+
+[dev-dependencies]
+rv-session = { path = "../session" }

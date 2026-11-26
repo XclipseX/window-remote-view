@@ -54,6 +54,8 @@ class SessionController(
     private var link: DatagramLink? = null
     /** Liên kết USB đóng (rút cáp...): MainActivity kết thúc phiên. Gọi từ thread nền. */
     var onLinkClosed: ((String?) -> Unit)? = null
+    /** Lõi Rust báo phiên lỗi (sai PIN, host không trả lời...). Gọi từ thread nền. */
+    var onNativeFailed: ((String?) -> Unit)? = null
 
     private var view: RemoteSurfaceView? = null
     private var capture: PointerCaptureController? = null
@@ -105,7 +107,8 @@ class SessionController(
         val keyFrame = { if (NativeBridge.available && nativeHandle != 0L) NativeBridge.nativeRequestKeyFrame(nativeHandle) }
         val dec = LowLatencyDecoder(
             w, h, effectiveFps,
-            DecoderPolicy(settings.codec, settings.allowAv1, settings.hardwareDecode),
+            // rv-host hiện chỉ gửi H.264 (OpenH264) ở chế độ USB.
+            DecoderPolicy(if (usbDisplay) CodecPreference.H264 else settings.codec, settings.allowAv1, settings.hardwareDecode),
             object : LowLatencyDecoder.Listener {
                 override fun onKeyFrameNeeded() = keyFrame()
                 override fun onFatal(reason: String) {
@@ -152,10 +155,15 @@ class SessionController(
         NativeBridge.callbacks = object : NativeBridge.Callbacks {
             override fun onVideoFrame(data: ByteArray, ptsUs: Long, flags: Int) = submitFrame(data, ptsUs, flags)
             override fun onAudioPacket(data: ByteArray, ptsUs: Long, codec: Int) { audio?.submit(data, codec) }
-            override fun onConnectionState(state: Int, message: String?) {}
+            override fun onConnectionState(state: Int, message: String?) = onNativeState(state, message)
             override fun onHostDiscovered(name: String, address: String) {}
             override fun onStats(rttMs: Float, bitrateKbps: Int, lossPercent: Float) {}
         }
+    }
+
+    /** Trạng thái từ lõi Rust: 0 đang nối, 1 đã bắt tay, 2 đóng, 3 lỗi, 10 cấu hình màn hình "WxH@fps". */
+    fun onNativeState(state: Int, message: String?) {
+        if (state == NativeBridge.STATE_FAILED) onNativeFailed?.invoke(message)
     }
 
     fun submitFrame(data: ByteArray, ptsUs: Long, flags: Int) {

@@ -10,6 +10,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -29,6 +31,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.remoteview.client.R
 
@@ -36,18 +39,52 @@ import com.remoteview.client.R
 
 data class LanHost(val name: String, val address: String)
 
+/** Hộp thoại PIN ghép đôi USB; [error] != null: lần trước lỗi (sai PIN / host không trả lời). */
+data class PinPrompt(val error: String?)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(
     lanHosts: List<LanHost>,
     onConnect: (target: String) -> Unit,
     onOpenSettings: () -> Unit,
+    usbOtp: String = "",
+    pinPrompt: PinPrompt? = null,
     onUsbDisplay: () -> Unit = {},
+    onPinSubmit: (String) -> Unit = {},
+    onPinDismiss: () -> Unit = {},
     onDiagnostics: () -> Unit = {},
 ) {
     var id by rememberSaveable { mutableStateOf("") }
     val context = LocalContext.current
     val qrTodo = stringResource(R.string.home_qr_todo)
+
+    if (pinPrompt != null) {
+        var pin by rememberSaveable { mutableStateOf(usbOtp) }
+        val valid = pin.length in 6..9 && pin.all { it in '0'..'9' }
+        AlertDialog(
+            onDismissRequest = onPinDismiss,
+            title = { Text(stringResource(R.string.usb_pin_title)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(stringResource(R.string.usb_pin_hint), style = MaterialTheme.typography.bodyMedium)
+                    OutlinedTextField(
+                        value = pin,
+                        onValueChange = { pin = it.filter { c -> c in '0'..'9' }.take(9) },
+                        label = { Text(stringResource(R.string.usb_pin_label)) },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        isError = pinPrompt.error != null,
+                        supportingText = pinPrompt.error?.let { e -> { Text(stringResource(R.string.usb_pin_error, e)) } },
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { onPinSubmit(pin) }, enabled = valid) { Text(stringResource(R.string.usb_pin_connect)) }
+            },
+            dismissButton = { TextButton(onClick = onPinDismiss) { Text(stringResource(R.string.usb_pin_cancel)) } },
+        )
+    }
 
     Scaffold(
         topBar = {

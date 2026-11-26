@@ -23,12 +23,15 @@ data class StreamSettings(
     val audioEnabled: Boolean = true,
     /** Hiện thanh phím ở chế độ Màn hình phụ (USB); mặc định ẩn. */
     val usbShowModifierBar: Boolean = false,
+    /** PIN/OTP 6-9 chữ số của rv-host (in ra khi host khởi động, hoặc cố định bằng `--otp`). */
+    val usbOtp: String = "",
 ) {
     /** Placeholder: 5..120 Mbps tuyến tính theo chất lượng (mặc định LAN 60–120 Mbps). */
     fun targetBitrateKbps(): Int = 5_000 + ((qualityPercent.coerceIn(1, 100) - 1) / 99f * 115_000).toInt()
 
     companion object {
         val FPS_OPTIONS = listOf(30, 60, 90, 120)
+        fun isValidOtp(s: String) = s.length in 6..9 && s.all { it in '0'..'9' }
     }
 }
 
@@ -51,6 +54,7 @@ class SettingsRepository(context: Context) {
                 .getOrDefault(d.touchMode),
             audioEnabled = prefs.getBoolean("audio", d.audioEnabled),
             usbShowModifierBar = prefs.getBoolean("usb_mod_bar", d.usbShowModifierBar),
+            usbOtp = prefs.getString("usb_otp", d.usbOtp) ?: d.usbOtp,
         )
     }
 
@@ -67,6 +71,7 @@ class SettingsRepository(context: Context) {
             .putString("touch", s.touchMode.name)
             .putBoolean("audio", s.audioEnabled)
             .putBoolean("usb_mod_bar", s.usbShowModifierBar)
+            .putString("usb_otp", s.usbOtp)
             .apply()
     }
 }

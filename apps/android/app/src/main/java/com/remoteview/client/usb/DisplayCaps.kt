@@ -34,7 +34,7 @@ object DisplayCaps {
     /**
      * JSON caps cho Hello. Ở chế độ [usbDisplay], host dùng display_width/height/refresh để tạo
      * màn hình ảo khớp (IDD) thay vì chụp màn hình có sẵn.
-     * TODO(rust-core): chốt tên trường với giao thức Hello.
+     * Lõi Rust đọc display_width/height/refresh_hz (-> ControlMessage::Hello) và "otp" (PIN ghép đôi với host).
      */
     fun helloJson(activity: Activity, settings: StreamSettings, usbDisplay: Boolean): String {
         val nd = nativeDisplay(activity)
@@ -47,6 +47,7 @@ object DisplayCaps {
             put("display_refresh_hz", if (usbDisplay) nd.refreshHz else settings.fps)
             put("create_virtual_display", usbDisplay)
             put("touch", JSONObject().put("max_points", 10).put("absolute_max", 65535))
+            put("otp", settings.usbOtp)
             put("pen", true)
             put("audio", JSONObject().apply {
                 put("enabled", settings.audioEnabled)

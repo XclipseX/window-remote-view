@@ -38,8 +38,8 @@ android {
 
     buildFeatures { compose = true }
 
-    // librv_core.so (Rust) sẽ được đặt vào app/jniLibs/arm64-v8a/ (cargo-ndk).
-    sourceSets["main"].jniLibs.srcDir("jniLibs")
+    // librv_core.so (Rust, crates/android-core) do cargo-ndk đặt vào src/main/jniLibs/arm64-v8a/ (thư mục jniLibs mặc định,
+    // tự được đóng gói vào APK). Thư mục này bị .gitignore.
 }
 
 kotlin {
