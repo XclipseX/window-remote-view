@@ -7,6 +7,7 @@ mod control;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod driver;
 mod host;
+mod update;
 mod util;
 
 fn main() -> eframe::Result {
@@ -17,6 +18,7 @@ fn main() -> eframe::Result {
         let code = rv_host_win::engine::run_cli(args.collect());
         std::process::exit(code);
     }
+    update::cleanup_old();
     let demo = std::env::args().any(|a| a == "--demo");
     let viewport = eframe::egui::ViewportBuilder::default()
         .with_title("RemoteView")

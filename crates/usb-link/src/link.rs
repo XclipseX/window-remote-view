@@ -10,6 +10,9 @@ use rv_session::DatagramIo;
 use crate::framing::{encode_record, RecordDecoder};
 use crate::{LinkError, Result};
 
+/// Size of the bulk read buffer (large so a whole record can arrive in one transfer).
+const READ_BUF: usize = 64 * 1024;
+
 /// Live counters of a [`UsbDatagramLink`], shared so a monitor thread can
 /// read them while the link is owned by a session (black-screen debugging).
 #[derive(Debug, Default)]
@@ -23,6 +26,10 @@ pub struct LinkStats {
     pub write_errors: AtomicU64,
     /// Why the reader thread ended / last write error, if any.
     pub last_error: Mutex<Option<String>>,
+    /// Opened accessory (bus/address/interface/endpoints); default for TCP.
+    pub location: Mutex<crate::aoa::DeviceLocation>,
+    /// Hex of the first bytes ever read (diagnostics), e.g. the client msg1.
+    pub first_bytes: Mutex<Option<String>>,
 }
 
 impl LinkStats {
@@ -30,6 +37,12 @@ impl LinkStats {
         if let Ok(mut g) = self.last_error.lock() {
             *g = Some(m);
         }
+    }
+    pub fn location(&self) -> crate::aoa::DeviceLocation {
+        self.location.lock().map(|g| *g).unwrap_or_default()
+    }
+    pub fn first_bytes(&self) -> Option<String> {
+        self.first_bytes.lock().ok().and_then(|g| g.clone())
     }
     pub fn last_error(&self) -> Option<String> {
         self.last_error.lock().ok().and_then(|g| g.clone())
@@ -68,7 +81,7 @@ impl UsbDatagramLink {
             .name("rv-usb-read".into())
             .spawn(move || {
                 let mut dec = RecordDecoder::new();
-                let mut buf = vec![0u8; 64 * 1024];
+                let mut buf = vec![0u8; READ_BUF];
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => {
@@ -76,7 +89,12 @@ impl UsbDatagramLink {
                             return;
                         }
                         Ok(n) => {
-                            st.raw_in_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                            if st.raw_in_bytes.fetch_add(n as u64, Ordering::Relaxed) == 0 {
+                                let hex: String = buf[..n.min(16)].iter().map(|b| format!("{b:02x}")).collect();
+                                if let Ok(mut g) = st.first_bytes.lock() {
+                                    *g = Some(format!("{n}B:{hex}"));
+                                }
+                            }
                             dec.push(&buf[..n]);
                             loop {
                                 match dec.next_record() {
@@ -132,8 +150,13 @@ impl UsbDatagramLink {
 
     /// USB link over an opened AOA accessory.
     pub fn from_aoa(dev: crate::aoa::AoaDevice) -> Self {
+        let loc = dev.location();
         let (r, w) = dev.into_halves();
-        Self::from_stream(r, w)
+        let l = Self::from_stream(r, w);
+        if let Ok(mut g) = l.stats.location.lock() {
+            *g = loc;
+        }
+        l
     }
 
     /// Blocking send with error reporting (`DatagramIo::send` swallows errors).
@@ -204,5 +227,48 @@ mod tests {
         a.send(&vec![1u8; 60000]);
         assert_eq!(b.recv_timeout(Duration::from_secs(2)).unwrap().unwrap(), b"ping");
         assert_eq!(b.recv_timeout(Duration::from_secs(2)).unwrap().unwrap().len(), 60000);
+    }
+
+    /// Reader that hands out the wire bytes in fixed small chunks, with
+    /// timeouts in between (like a bulk pipe).
+    struct Chunked {
+        data: Vec<u8>,
+        pos: usize,
+        chunk: usize,
+        tick: bool,
+    }
+    impl Read for Chunked {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.tick = !self.tick;
+            if self.tick {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            if self.pos >= self.data.len() {
+                std::thread::sleep(Duration::from_millis(20));
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            let n = self.chunk.min(buf.len()).min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn split_chunks_over_mock_stream() {
+        let mut wire = Vec::new();
+        let recs: Vec<Vec<u8>> = vec![vec![1; 54], vec![], vec![9; 20_000], b"x".to_vec()];
+        for r in &recs {
+            encode_record(r, &mut wire).unwrap();
+        }
+        let total = wire.len() as u64;
+        let l = UsbDatagramLink::from_stream(Chunked { data: wire, pos: 0, chunk: 7, tick: false }, std::io::sink());
+        for r in &recs {
+            assert_eq!(&l.recv_timeout(Duration::from_secs(10)).unwrap().unwrap(), r);
+        }
+        let st = l.stats();
+        assert_eq!(st.raw_in_bytes.load(Ordering::Relaxed), total);
+        assert_eq!(st.dg_in.load(Ordering::Relaxed), 4);
+        assert!(st.first_bytes().unwrap().starts_with("7B:"));
     }
 }

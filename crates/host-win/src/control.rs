@@ -199,6 +199,42 @@ pub fn random_token() -> String {
     format!("{:08}", u64::from_le_bytes(b) % 100_000_000)
 }
 
+fn token_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+    Some(base.join("RemoteView").join("usb_token"))
+}
+
+fn valid_token(t: &str) -> bool {
+    t.len() == 8 && t.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Persistent per-user 8-digit USB pairing token (`%APPDATA%\RemoteView\usb_token`),
+/// generated once. An accessory left in accessory mode by an earlier run keeps
+/// the same AOA serial, so it still matches the session OTP. Falls back to a
+/// random in-memory token if the file cannot be written.
+pub fn persistent_token() -> String {
+    let path = token_path();
+    if let Some(p) = &path {
+        if let Ok(s) = std::fs::read_to_string(p) {
+            let t = s.trim();
+            if valid_token(t) {
+                return t.to_string();
+            }
+        }
+    }
+    let t = random_token();
+    if let Some(p) = &path {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(p, &t);
+    }
+    t
+}
+
 /// Windows computer name (shown to the tablet as the accessory description).
 pub fn computer_name() -> String {
     for k in ["COMPUTERNAME", "HOSTNAME"] {

@@ -277,11 +277,13 @@ fn open_lan(bind: SocketAddr) -> Result<LanHandle, String> {
     Ok(LanHandle { io: Arc::new(Mutex::new(io)), rx: Arc::new(Mutex::new(rx)), peer })
 }
 
-fn open_usb(a: &Args, token: &str, reuse_existing: bool) -> Result<(Transport, &'static str), String> {
+fn open_usb(a: &Args, token: &str) -> Result<(Transport, &'static str), String> {
     if a.mode != Mode::Adb {
         let info = aoa::AccessoryInfo::new(&control::computer_name(), token);
-        match aoa::AoaDevice::connect(&info, a.scan_all, Duration::from_secs(8), reuse_existing) {
+        match aoa::AoaDevice::connect(&info, a.scan_all, Duration::from_secs(8)) {
             Ok(dev) => {
+                let loc = dev.location();
+                info!("USB: AOA accessory open bus={} addr={} iface={} ep_in=0x{:02x} ep_out=0x{:02x}", loc.bus, loc.address, loc.iface, loc.ep_in, loc.ep_out);
                 info!("USB: AOA accessory open (identity {}/{} v{}, description \"{}\")", info.manufacturer, info.model, info.version, info.description);
                 return Ok((Transport::stream(UsbDatagramLink::from_aoa(dev)), "usb"));
             }
@@ -651,9 +653,9 @@ fn candidate_name(c: &aoa::Candidate) -> String {
 
 /// `last_name` remembers the last normal-mode device name so the same device
 /// keeps it after it re-enumerates as an accessory (18D1:2D00).
-fn list_devices_with(scan_all: bool, link_open: bool, peer_name: Option<&str>, last_name: &mut Option<String>) -> Vec<DeviceItem> {
+fn list_devices_with(scan_all: bool, link_open: bool, probe_accessory: bool, peer_name: Option<&str>, last_name: &mut Option<String>) -> Vec<DeviceItem> {
     let mut v = Vec::new();
-    for c in aoa::list_candidates_opts(scan_all, !link_open).unwrap_or_default() {
+    for c in aoa::list_candidates_opts(scan_all, probe_accessory).unwrap_or_default() {
         let acc = c.is_accessory();
         let name = if acc {
             peer_name.map(str::to_string).or_else(|| last_name.clone()).unwrap_or_else(|| "Thiết bị Android".to_string())
@@ -681,14 +683,16 @@ fn list_devices_with(scan_all: bool, link_open: bool, peer_name: Option<&str>, l
     v
 }
 
-/// One-shot device scan for the GUI while no host engine is running.
+/// One-shot device scan for the GUI. The GUI process must call this ONLY while
+/// no host worker runs (it opens devices to read strings / test the driver);
+/// while the worker runs the GUI uses the worker's `devices` events instead.
 pub fn scan_devices(last_name: &mut Option<String>) -> Vec<DeviceItem> {
-    list_devices_with(false, false, None, last_name)
+    list_devices_with(false, false, true, None, last_name)
 }
 
 fn list_devices(scan_all: bool, sh: &Shared, last_name: &mut Option<String>) -> Vec<DeviceItem> {
     let peer_name = sh.peer_name.lock().unwrap().clone();
-    list_devices_with(scan_all, sh.usb_link_open.load(Ordering::Relaxed), peer_name.as_deref(), last_name)
+    list_devices_with(scan_all, sh.usb_link_open.load(Ordering::Relaxed), false, peer_name.as_deref(), last_name)
 }
 
 fn devices_thread(scan_all: bool, sh: Arc<Shared>) {
@@ -754,10 +758,8 @@ struct Ctx {
     kp: Keypair,
     /// LAN PIN (shown to the user).
     otp: String,
-    /// Random 8-digit pairing token for USB: AOA serial and session OTP. New on every host start.
+    /// Persistent per-user 8-digit pairing token for USB: AOA serial and session OTP.
     usb_token: String,
-    /// This process already switched the tablet to accessory mode with `usb_token`.
-    usb_switched: bool,
     lan: Option<LanHandle>,
     injector: Option<WinInjector>,
     vrx: Receiver<VideoOut>,
@@ -899,11 +901,8 @@ impl Ctx {
             }
         };
         if want_usb {
-            match open_usb(&self.args, &self.usb_token, self.usb_switched) {
-                Ok(t) => {
-                    self.usb_switched = t.1 == "usb";
-                    return Ok(t);
-                }
+            match open_usb(&self.args, &self.usb_token) {
+                Ok(t) => return Ok(t),
                 Err(e) if self.args.mode == Mode::Auto => {
                     warn!("{e}; falling back to LAN for a while");
                     self.usb_backoff_until = Instant::now() + Duration::from_secs(30);
@@ -1044,8 +1043,14 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
             let raw = usb_stats
                 .as_ref()
                 .map(|u| {
+                    let loc = u.location();
                     format!(
-                        " usb_raw_in={}B usb_raw_out={}B write_errors={} pipe_err={:?}",
+                        " usb_ep_in=0x{:02x} usb_ep_out=0x{:02x} usb_dev={}-{} usb_first_in={:?} usb_raw_in={}B usb_raw_out={}B write_errors={} pipe_err={:?}",
+                        loc.ep_in,
+                        loc.ep_out,
+                        loc.bus,
+                        loc.address,
+                        u.first_bytes().unwrap_or_default(),
                         u.raw_in_bytes.load(Ordering::Relaxed),
                         u.raw_out_bytes.load(Ordering::Relaxed),
                         u.write_errors.load(Ordering::Relaxed),
@@ -1324,8 +1329,7 @@ fn run(argv: Vec<String>) -> Result<(), String> {
         sh,
         kp,
         otp,
-        usb_token: control::random_token(),
-        usb_switched: false,
+        usb_token: control::persistent_token(),
         lan: None,
         injector,
         vrx,

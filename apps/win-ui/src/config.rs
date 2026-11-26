@@ -94,6 +94,8 @@ pub struct Config {
     pub display: Display,
     pub autostart: bool,
     pub minimize_to_tray: bool,
+    /// Check GitHub for a newer build on startup.
+    pub auto_update_check: bool,
     /// Optional explicit path to rv-host executable.
     pub host_path: Option<String>,
 }
@@ -110,6 +112,7 @@ impl Default for Config {
             display: Display::Mirror,
             autostart: false,
             minimize_to_tray: false,
+            auto_update_check: true,
             host_path: None,
         }
     }

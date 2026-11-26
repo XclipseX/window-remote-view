@@ -116,6 +116,7 @@ pub fn list_candidates(scan_all: bool) -> Result<Vec<Candidate>> {
 /// accessory mode are not opened (they may be in use by a live link; a second
 /// open could fail or disturb it) and are reported with `can_open = true`.
 pub fn list_candidates_opts(scan_all: bool, probe_accessory: bool) -> Result<Vec<Candidate>> {
+    let _g = usb_lock();
     let ctx = Context::new()?;
     let mut out = Vec::new();
     for d in ctx.devices()?.iter() {
@@ -145,6 +146,13 @@ pub fn list_candidates_opts(scan_all: bool, probe_accessory: bool) -> Result<Vec
         }
     }
     Ok(out)
+}
+
+static USB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serialises device opens inside this process (scanner thread vs. connect).
+fn usb_lock() -> std::sync::MutexGuard<'static, ()> {
+    USB_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn get_protocol(h: &DeviceHandle<Context>) -> Result<u16> {
@@ -182,41 +190,38 @@ pub struct AoaDevice {
     ep_in: u8,
     ep_out: u8,
     iface: u8,
+    bus: u8,
+    address: u8,
+}
+
+/// Where an opened accessory lives (for link-stats diagnostics).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeviceLocation {
+    pub bus: u8,
+    pub address: u8,
+    pub iface: u8,
+    pub ep_in: u8,
+    pub ep_out: u8,
 }
 
 impl AoaDevice {
+    pub fn location(&self) -> DeviceLocation {
+        DeviceLocation { bus: self.bus, address: self.address, iface: self.iface, ep_in: self.ep_in, ep_out: self.ep_out }
+    }
+
     /// Finds an Android device, switches it to accessory mode if needed and
     /// opens it. Returns `NoDevice` when nothing suitable is attached.
     ///
-    /// `reuse_existing`: a device already in accessory mode was switched by
-    /// this very process (same identification strings / token), so keep it.
-    /// Otherwise it is a leftover from an earlier run whose serial (= pairing
-    /// token) we cannot know: reset it back to normal mode and switch again
-    /// with the current strings; if that is impossible, fall back to using it.
-    pub fn connect(info: &AccessoryInfo, scan_all: bool, timeout: Duration, reuse_existing: bool) -> Result<Self> {
+    /// A device already in accessory mode is simply opened: the pairing token
+    /// (AOA serial) is persistent per Windows user, so an accessory left from
+    /// an earlier run still matches. There is deliberately NO reset/re-switch
+    /// logic: it could make the host read from a different device instance
+    /// than the one Android opened.
+    pub fn connect(info: &AccessoryInfo, scan_all: bool, timeout: Duration) -> Result<Self> {
+        let _g = usb_lock();
         let ctx = Context::new()?;
         if let Some(dev) = find_accessory(&ctx)? {
-            if reuse_existing {
-                return Self::open(dev);
-            }
-            let reset_ok = dev.open().and_then(|h| h.reset()).is_ok();
-            if reset_ok {
-                // Wait for the stale accessory to drop off the bus.
-                let gone = Instant::now() + Duration::from_secs(3);
-                while Instant::now() < gone && find_accessory(&ctx)?.is_some() {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            if find_accessory(&ctx)?.is_some() || !reset_ok {
-                return match Self::switch_normal_device(&ctx, info, scan_all, timeout) {
-                    Ok(d) => Ok(d),
-                    Err(_) => match find_accessory(&ctx)? {
-                        Some(dev) => Self::open(dev),
-                        None => Err(LinkError::NoDevice),
-                    },
-                };
-            }
+            return Self::open(dev, Some(&info.serial));
         }
         Self::switch_normal_device(&ctx, info, scan_all, timeout)
     }
@@ -253,19 +258,19 @@ impl AoaDevice {
                 continue;
             }
             drop(h);
-            return Self::wait_reenumerate(ctx, timeout);
+            return Self::wait_reenumerate(ctx, timeout, &info.serial);
         }
         Err(last_err)
     }
 
-    fn wait_reenumerate(ctx: &Context, timeout: Duration) -> Result<Self> {
+    fn wait_reenumerate(ctx: &Context, timeout: Duration, token: &str) -> Result<Self> {
         let deadline = Instant::now() + timeout;
         // Give the device a moment to detach before polling.
         std::thread::sleep(Duration::from_millis(500));
         loop {
             if let Some(dev) = find_accessory(ctx)? {
                 // Retry open briefly: node may exist before it is usable.
-                match Self::open(dev) {
+                match Self::open(dev, Some(token)) {
                     Ok(d) => return Ok(d),
                     Err(e) if Instant::now() >= deadline => return Err(e),
                     Err(_) => {}
@@ -278,7 +283,7 @@ impl AoaDevice {
         }
     }
 
-    fn open(dev: Device<Context>) -> Result<Self> {
+    fn open(dev: Device<Context>, token: Option<&str>) -> Result<Self> {
         let cfg = dev.active_config_descriptor()?;
         let mut found = None;
         'outer: for iface in cfg.interfaces() {
@@ -308,11 +313,23 @@ impl AoaDevice {
         let handle = dev.open()?;
         let _ = handle.set_auto_detach_kernel_driver(true); // unsupported on Windows
         handle.claim_interface(iface)?;
+        // Clear any stale halt/toggle state left by an earlier session.
+        let _ = handle.clear_halt(ep_in);
+        let _ = handle.clear_halt(ep_out);
+        let (bus, address) = (dev.bus_number(), dev.address());
+        if let (Some(t), Ok(desc)) = (token, dev.device_descriptor()) {
+            let serial = handle.read_serial_number_string_ascii(&desc).ok();
+            if serial.as_deref().is_some_and(|s| s != t) {
+                eprintln!("rv-usb: accessory serial {serial:?} differs from our pairing token (left over from an older build?); unplug/replug the tablet if pairing fails");
+            }
+        }
         Ok(Self {
             handle: Arc::new(handle),
             ep_in,
             ep_out,
             iface,
+            bus,
+            address,
         })
     }
 

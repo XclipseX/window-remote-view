@@ -103,6 +103,8 @@ jobs:
           path: apps/win-ui/assets
       - name: Build RemoteView.exe
         shell: pwsh
+        env:
+          RV_BUILD_SHA: ${{ github.sha }}
         run: |
           if (Test-Path apps/win-ui/assets/wdi-simple.exe) {
             Write-Host "Embedding wdi-simple.exe"
@@ -176,6 +178,14 @@ jobs:
           cp dl/RemoteView-windows/RemoteView.exe out/RemoteView.exe
           cp dl/binaries-windows-latest/rv-signal-relay.exe out/ || true
           ls -la out
+      # softprops cannot delete assets: drop stale ones from older releases.
+      - name: Remove stale release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for a in rv-host.exe RemoteView-debug.apk; do
+            gh release delete-asset latest-build "$a" -y --repo "${{ github.repository }}" || true
+          done
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: latest-build

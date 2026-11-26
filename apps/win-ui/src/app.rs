@@ -57,6 +57,9 @@ pub struct App {
     pin: Option<String>,
     /// GUI-side device scanner runs only while no host engine is running.
     scan_on: Arc<AtomicBool>,
+    /// Held by the scanner while it touches USB; `start()` waits on it so the
+    /// GUI never has a device open when the host worker begins.
+    scan_lock: Arc<std::sync::Mutex<()>>,
     /// (vid, pid) of the driver install in progress.
     driver_busy: Option<(u16, u16)>,
     driver_tried: std::collections::HashSet<(u16, u16)>,
@@ -68,6 +71,21 @@ pub struct App {
     autostart_msg: Option<String>,
     ctx: egui::Context,
     quit: bool,
+    upd_tx: std::sync::mpsc::Sender<crate::update::UpdateMsg>,
+    upd_rx: Receiver<crate::update::UpdateMsg>,
+    upd: UpdateState,
+}
+
+#[derive(Default)]
+enum UpdateState {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    Available(crate::update::UpdateInfo),
+    Downloading(u64, u64),
+    Inaccessible,
+    Error(String),
 }
 
 fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
@@ -123,6 +141,7 @@ impl App {
         Self::setup_fonts(&cc.egui_ctx);
         Self::setup_style(&cc.egui_ctx);
         let (tx, rx) = new_channel();
+        let (upd_tx, upd_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             cfg: Config::load(),
             page: Page::Home,
@@ -139,6 +158,7 @@ impl App {
             t0: Instant::now(),
             pin: None,
             scan_on: Arc::new(AtomicBool::new(!demo)),
+            scan_lock: Arc::new(std::sync::Mutex::new(())),
             driver_busy: None,
             driver_tried: Default::default(),
             driver_note: None,
@@ -148,7 +168,13 @@ impl App {
             autostart_msg: None,
             ctx: cc.egui_ctx.clone(),
             quit: false,
+            upd_tx,
+            upd_rx,
+            upd: UpdateState::Idle,
         };
+        if !demo && app.cfg.auto_update_check {
+            app.check_update(false);
+        }
         if !demo {
             app.spawn_scanner();
         }
@@ -163,13 +189,20 @@ impl App {
     /// Lists attached devices every 2 s while no host engine is running, so the
     /// home screen shows device cards before the user presses anything.
     fn spawn_scanner(&self) {
-        let (tx, on, ctx) = (self.tx.clone(), self.scan_on.clone(), self.ctx.clone());
+        let (tx, on, ctx, lock) = (self.tx.clone(), self.scan_on.clone(), self.ctx.clone(), self.scan_lock.clone());
         std::thread::spawn(move || {
             let (mut last, mut last_name): (Option<Vec<DeviceItem>>, Option<String>) = (None, None);
             loop {
                 if on.load(Ordering::Relaxed) {
+                    let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    if !on.load(Ordering::Relaxed) {
+                        drop(guard);
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
                     let items: Vec<DeviceItem> =
                         rv_host_win::engine::scan_devices(&mut last_name).into_iter().map(Into::into).collect();
+                    drop(guard);
                     if on.load(Ordering::Relaxed) && last.as_ref() != Some(&items) {
                         last = Some(items.clone());
                         if tx.send(UiMsg::Scan(items)).is_err() {
@@ -227,6 +260,8 @@ impl App {
         let (exe, mut args) = host_command(self.cfg.host_path.as_deref());
         args.extend(self.cfg.host_args());
         self.scan_on.store(false, Ordering::Relaxed);
+        // Wait for an in-flight GUI scan to release its USB handles.
+        drop(self.scan_lock.lock());
         let ctx = self.ctx.clone();
         self.host = Some(HostProcess::start(exe, args, self.tx.clone(), move || {
             ctx.request_repaint()
@@ -291,7 +326,84 @@ impl App {
         }
     }
 
+    fn check_update(&mut self, manual: bool) {
+        self.upd = UpdateState::Checking;
+        crate::update::spawn_check(self.upd_tx.clone(), manual, self.ctx.clone());
+    }
+
+    fn poll_update(&mut self) {
+        use crate::update::{CheckResult, UpdateMsg};
+        while let Ok(m) = self.upd_rx.try_recv() {
+            match m {
+                UpdateMsg::Checked { manual, result } => {
+                    self.upd = match result {
+                        CheckResult::Available(i) => UpdateState::Available(i),
+                        CheckResult::UpToDate => UpdateState::UpToDate,
+                        CheckResult::Inaccessible => UpdateState::Inaccessible,
+                        // Silent on startup when offline; shown only for manual checks.
+                        CheckResult::Failed(e) if manual => UpdateState::Error(e),
+                        CheckResult::Failed(_) => UpdateState::Idle,
+                    };
+                }
+                UpdateMsg::Progress { done, total } => self.upd = UpdateState::Downloading(done, total),
+                UpdateMsg::Failed(e) => self.upd = UpdateState::Error(e),
+                UpdateMsg::Downloaded(path) => match crate::update::replace_self(&path) {
+                    Ok(exe) => {
+                        self.host = None; // stop the worker before restarting
+                        match crate::update::relaunch(&exe) {
+                            Ok(()) => std::process::exit(0),
+                            Err(e) => self.upd = UpdateState::Error(format!("không mở lại được: {e}")),
+                        }
+                    }
+                    Err(e) => self.upd = UpdateState::Error(e),
+                },
+            }
+        }
+    }
+
+    /// Banner + status line for updates (home banner when `banner`, else About card).
+    fn update_ui(&mut self, ui: &mut egui::Ui, banner: bool) {
+        let mut act = None;
+        match &self.upd {
+            UpdateState::Available(i) => {
+                ui.horizontal(|ui| {
+                    ui.colored_label(accent(), RichText::new(format!("Có bản cập nhật ({})", &i.sha[..i.sha.len().min(7)])).strong());
+                    if ui.button("Tải và cập nhật").clicked() {
+                        act = Some(i.clone());
+                    }
+                });
+            }
+            UpdateState::Downloading(d, t) => {
+                let f = if *t > 0 { *d as f32 / *t as f32 } else { 0.0 };
+                ui.add(egui::ProgressBar::new(f).show_percentage().text(format!("Đang tải {:.1} / {:.1} MB", *d as f64 / 1e6, *t as f64 / 1e6)));
+            }
+            UpdateState::Inaccessible => {
+                ui.horizontal(|ui| {
+                    ui.colored_label(Color32::from_rgb(230, 160, 40), "Không truy cập được trang phát hành");
+                    if ui.button("Mở trang tải").clicked() {
+                        util::open_url(crate::update::RELEASE_URL);
+                    }
+                });
+            }
+            UpdateState::Error(e) if !banner => {
+                ui.colored_label(Color32::from_rgb(230, 70, 70), format!("Lỗi cập nhật: {e}"));
+            }
+            UpdateState::Checking if !banner => {
+                ui.weak("Đang kiểm tra...");
+            }
+            UpdateState::UpToDate if !banner => {
+                ui.weak("Bạn đang dùng bản mới nhất.");
+            }
+            _ => {}
+        }
+        if let Some(info) = act {
+            self.upd = UpdateState::Downloading(0, info.size);
+            crate::update::spawn_download(info, self.upd_tx.clone(), self.ctx.clone());
+        }
+    }
+
     fn poll(&mut self) {
+        self.poll_update();
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 UiMsg::Event(e) => self.handle_event(e),
@@ -775,6 +887,9 @@ impl App {
 
     fn page_home(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
+            if matches!(self.upd, UpdateState::Available(_) | UpdateState::Downloading(..) | UpdateState::Inaccessible) {
+                card(ui, |ui| self.update_ui(ui, true));
+            }
             self.status_card(ui);
             let big = if self.running {
                 egui::Button::new(RichText::new("Dừng").size(20.0).strong().color(Color32::WHITE)).fill(Color32::from_rgb(214, 62, 62))
@@ -868,6 +983,7 @@ impl App {
                     ui.colored_label(Color32::from_rgb(230, 70, 70), m);
                 }
                 ui.checkbox(&mut self.cfg.minimize_to_tray, "Thu nhỏ xuống thanh tác vụ khi đóng cửa sổ");
+                ui.checkbox(&mut self.cfg.auto_update_check, "Tự kiểm tra cập nhật khi mở ứng dụng");
                 ui.horizontal(|ui| {
                     ui.label("Đường dẫn rv-host (gỡ lỗi)");
                     let mut p = self.cfg.host_path.clone().unwrap_or_default();
@@ -875,6 +991,15 @@ impl App {
                         self.cfg.host_path = if p.trim().is_empty() { None } else { Some(p) };
                     }
                 });
+            });
+            card(ui, |ui| {
+                ui.label(RichText::new("Giới thiệu").strong());
+                ui.label(format!("RemoteView {} (build {})", crate::update::VERSION, crate::update::short_sha()));
+                let busy = matches!(self.upd, UpdateState::Checking | UpdateState::Downloading(..));
+                if ui.add_enabled(!busy, egui::Button::new("Kiểm tra cập nhật")).clicked() {
+                    self.check_update(true);
+                }
+                self.update_ui(ui, false);
             });
         });
         if self.cfg != before {
