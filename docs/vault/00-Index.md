@@ -15,4 +15,4 @@ updated: 2026-11-26
 - Tab S10+ Android 17 không bật được USB tethering
 
 ## Recent sessions
-- [[sessions/2026-11-26]]
+- [[sessions/2026-11-26]] (USB auto-pair, single exe)

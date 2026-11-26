@@ -1,0 +1,8 @@
+RemoteView third-party notices
+
+libwdi / wdi-simple (https://github.com/pbatard/libwdi)
+  Copyright (c) Pete Batard and contributors. Licensed under the GNU LGPL v3.
+  RemoteView.exe release builds embed an unmodified wdi-simple.exe built from libwdi
+  (the library behind Zadig) and run it, elevated, as a separate process to install the
+  Microsoft WinUSB driver for Android devices. Source: the repository above; you may replace the
+  embedded file by placing your own wdi-simple.exe next to a build without the `embed-wdi` feature.

@@ -12,9 +12,6 @@ use std::path::PathBuf;
 #[cfg(feature = "embed-wdi")]
 static WDI_SIMPLE: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/wdi-simple.exe"));
 
-pub const ACCESSORY_VID: u16 = 0x18D1;
-pub const ACCESSORY_PIDS: [u16; 2] = [0x2D00, 0x2D01];
-
 /// Result of one install attempt, delivered to the UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverResult {

@@ -21,6 +21,10 @@ pub enum UiMsg {
     Exited { code: Option<i32>, restart_in: Option<Duration> },
     SpawnFailed(String),
     Stopped,
+    /// Device scan done by the GUI itself while no host engine is running.
+    Scan(Vec<crate::control::DeviceItem>),
+    /// A WinUSB install attempt finished.
+    Driver { vid: u16, pid: u16, result: crate::driver::DriverResult },
 }
 
 /// The `--host-worker` marker: everything after it is `rv-host` arguments.
@@ -229,7 +233,7 @@ mod tests {
     fn host_command_is_self_worker() {
         let (exe, pre) = host_command(None);
         assert_eq!(pre, vec![WORKER_FLAG.to_string()]);
-        assert!(exe.is_absolute() || exe.as_os_str().len() > 0);
+        assert!(!exe.as_os_str().is_empty());
         let (exe, pre) = host_command(Some("C:/x/rv-host.exe"));
         assert_eq!(exe, PathBuf::from("C:/x/rv-host.exe"));
         assert!(pre.is_empty());

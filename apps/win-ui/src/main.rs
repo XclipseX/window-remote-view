@@ -4,6 +4,7 @@
 mod app;
 mod config;
 mod control;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod driver;
 mod host;
 mod util;

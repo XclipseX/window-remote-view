@@ -2633,8 +2633,10 @@ dependencies = [
  "dirs",
  "eframe",
  "qrcode",
+ "rv-host-win",
  "serde",
  "serde_json",
+ "windows",
  "winreg",
 ]
 

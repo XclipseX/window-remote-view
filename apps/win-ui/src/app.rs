@@ -2,15 +2,17 @@
 
 use crate::config::*;
 use crate::control::*;
-use crate::host::{find_host_exe, new_channel, HostProcess, UiMsg};
+use crate::driver::{self, DriverResult};
+use crate::host::{host_command, new_channel, HostProcess, UiMsg};
 use crate::util;
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, StrokeKind, Vec2};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const RELEASE_URL: &str = "https://github.com/XclipseX/window-remote-view/releases/tag/latest-build";
-const ZADIG_URL: &str = "https://zadig.akeo.ie/";
 const MAX_LOGS: usize = 2000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,6 +55,14 @@ pub struct App {
     logs: VecDeque<(Duration, LogLevel, String)>,
     t0: Instant,
     pin: Option<String>,
+    /// GUI-side device scanner runs only while no host engine is running.
+    scan_on: Arc<AtomicBool>,
+    /// (vid, pid) of the driver install in progress.
+    driver_busy: Option<(u16, u16)>,
+    driver_tried: std::collections::HashSet<(u16, u16)>,
+    driver_note: Option<(bool, String)>,
+    /// Connect to this device as soon as its driver install succeeds.
+    connect_after_driver: Option<DeviceItem>,
     local_ip: String,
     demo: Option<Demo>,
     autostart_msg: Option<String>,
@@ -128,18 +138,51 @@ impl App {
             logs: VecDeque::new(),
             t0: Instant::now(),
             pin: None,
+            scan_on: Arc::new(AtomicBool::new(!demo)),
+            driver_busy: None,
+            driver_tried: Default::default(),
+            driver_note: None,
+            connect_after_driver: None,
             local_ip: util::local_ip(),
             demo: None,
             autostart_msg: None,
             ctx: cc.egui_ctx.clone(),
             quit: false,
         };
+        if !demo {
+            app.spawn_scanner();
+        }
         if demo {
             app.cfg = Config::default();
             app.start();
             app.demo.as_mut().unwrap().started -= Duration::from_secs(5);
         }
         app
+    }
+
+    /// Lists attached devices every 2 s while no host engine is running, so the
+    /// home screen shows device cards before the user presses anything.
+    fn spawn_scanner(&self) {
+        let (tx, on, ctx) = (self.tx.clone(), self.scan_on.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let (mut last, mut last_name): (Option<Vec<DeviceItem>>, Option<String>) = (None, None);
+            loop {
+                if on.load(Ordering::Relaxed) {
+                    let items: Vec<DeviceItem> =
+                        rv_host_win::engine::scan_devices(&mut last_name).into_iter().map(Into::into).collect();
+                    if on.load(Ordering::Relaxed) && last.as_ref() != Some(&items) {
+                        last = Some(items.clone());
+                        if tx.send(UiMsg::Scan(items)).is_err() {
+                            return;
+                        }
+                        ctx.request_repaint();
+                    }
+                } else {
+                    last = None;
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
     }
 
     fn setup_style(ctx: &egui::Context) {
@@ -181,9 +224,11 @@ impl App {
             self.demo = Some(Demo { started: Instant::now(), last_stats: Instant::now(), tick: 0 });
             return;
         }
-        let exe = find_host_exe(self.cfg.host_path.as_deref());
+        let (exe, mut args) = host_command(self.cfg.host_path.as_deref());
+        args.extend(self.cfg.host_args());
+        self.scan_on.store(false, Ordering::Relaxed);
         let ctx = self.ctx.clone();
-        self.host = Some(HostProcess::start(exe, self.cfg.host_args(), self.tx.clone(), move || {
+        self.host = Some(HostProcess::start(exe, args, self.tx.clone(), move || {
             ctx.request_repaint()
         }));
     }
@@ -197,6 +242,7 @@ impl App {
         }
         self.demo = None;
         self.running = false;
+        self.scan_on.store(true, Ordering::Relaxed);
         self.status = None;
         self.pin = None;
         self.devices.clear();
@@ -240,7 +286,7 @@ impl App {
                 }
                 self.stats = s;
             }
-            HostEvent::Devices { items } => self.devices = items,
+            HostEvent::Devices { items } => self.set_devices(items),
             HostEvent::Log { level, msg } => self.log(level, msg),
         }
     }
@@ -251,7 +297,7 @@ impl App {
                 UiMsg::Event(e) => self.handle_event(e),
                 UiMsg::Exited { code, restart_in } => {
                     let msg = format!(
-                        "Tiến trình rv-host dừng (mã {}){}",
+                        "Tiến trình host dừng (mã {}){}",
                         code.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
                         restart_in.map(|d| format!(", tự khởi động lại sau {}s", d.as_secs())).unwrap_or_default()
                     );
@@ -267,16 +313,131 @@ impl App {
                     self.stats = StatsEvent::default();
                 }
                 UiMsg::SpawnFailed(e) => {
-                    let msg = format!("Không chạy được rv-host: {e}");
+                    let msg = format!("Không chạy được tiến trình host: {e}");
                     self.log(LogLevel::Error, msg.clone());
                     self.host = None;
                     self.running = false;
                     self.error = Some(msg);
                 }
                 UiMsg::Stopped => {}
+                UiMsg::Scan(items) => {
+                    if !self.running {
+                        self.set_devices(items);
+                    }
+                }
+                UiMsg::Driver { vid, pid, result } => self.driver_done(vid, pid, result),
             }
         }
         self.tick_demo();
+    }
+
+    // ---- devices + automatic driver setup ----
+
+    fn set_devices(&mut self, items: Vec<DeviceItem>) {
+        self.devices = items;
+        // Devices that went away may be retried after replugging.
+        let present: Vec<(u16, u16)> = self.devices.iter().map(|d| (d.vid, d.pid)).collect();
+        self.driver_tried.retain(|k| present.contains(k));
+        self.auto_driver();
+    }
+
+    /// Accessory-mode devices (18D1:2D00/2D01) libusb cannot open get WinUSB
+    /// automatically; other Android devices only once the user pressed
+    /// "Kết nối" (their driver is replaced, so that needs consent).
+    fn auto_driver(&mut self) {
+        if !cfg!(windows) || self.driver_busy.is_some() || self.demo.is_some() {
+            return;
+        }
+        let cand = self.devices.iter().find(|d| {
+            d.kind == "usb"
+                && !d.driver_ok
+                && (d.vid, d.pid) != (0, 0)
+                && !self.driver_tried.contains(&(d.vid, d.pid))
+                && (d.accessory || self.running)
+        });
+        if let Some(d) = cand.cloned() {
+            self.install_driver(&d);
+        }
+    }
+
+    fn install_driver(&mut self, d: &DeviceItem) {
+        let (vid, pid) = (d.vid, d.pid);
+        self.driver_busy = Some((vid, pid));
+        self.driver_tried.insert((vid, pid));
+        self.driver_note = None;
+        self.log(LogLevel::Info, format!("Đang cài driver USB (WinUSB) cho {vid:04X}:{pid:04X}"));
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let result = driver::install_winusb(vid, pid);
+            let _ = tx.send(UiMsg::Driver { vid, pid, result });
+            ctx.request_repaint();
+        });
+    }
+
+    fn driver_done(&mut self, vid: u16, pid: u16, result: DriverResult) {
+        self.driver_busy = None;
+        match result {
+            DriverResult::Installed => {
+                self.log(LogLevel::Info, format!("Đã cài driver USB cho {vid:04X}:{pid:04X}"));
+                self.driver_note = Some((true, "Đã cài driver USB xong.".into()));
+                if let Some(d) = self.connect_after_driver.take() {
+                    self.connect_device(&d);
+                } else {
+                    self.send(HostCmd::Connect { serial: String::new() });
+                }
+            }
+            DriverResult::Cancelled => {
+                self.log(LogLevel::Warn, "Bạn đã từ chối quyền quản trị, chưa cài được driver USB".into());
+                self.driver_note = Some((false, "Chưa cài driver USB vì bạn từ chối quyền quản trị. Nhấn \"Kết nối\" để thử lại.".into()));
+                self.connect_after_driver = None;
+            }
+            DriverResult::Failed(e) => {
+                self.log(LogLevel::Error, format!("Cài driver USB thất bại: {e}"));
+                self.driver_note = Some((false, format!("Cài driver USB thất bại: {e}")));
+                self.connect_after_driver = None;
+            }
+        }
+    }
+
+    /// "Kết nối" on a device card.
+    fn connect_device(&mut self, d: &DeviceItem) {
+        if d.kind == "usb" && !d.driver_ok && cfg!(windows) {
+            if self.driver_busy.is_none() {
+                self.connect_after_driver = Some(DeviceItem { driver_ok: true, ..d.clone() });
+                self.install_driver(d);
+            }
+            return;
+        }
+        if !self.running {
+            let want = if d.kind == "adb" { Mode::Adb } else { Mode::Usb };
+            if self.cfg.mode == Mode::Lan || self.cfg.mode != want {
+                self.cfg.mode = want;
+                self.cfg.save();
+            }
+            self.start();
+        }
+        self.send(HostCmd::Connect { serial: d.serial.clone() });
+    }
+
+    fn device_status(&self, d: &DeviceItem) -> (Color32, String) {
+        let streaming = self.view() == View::Streaming;
+        if self.driver_busy == Some((d.vid, d.pid)) {
+            return (Color32::from_rgb(235, 170, 40), "Đang cài driver USB (cần quyền quản trị)…".into());
+        }
+        if d.connected && streaming {
+            return (Color32::from_rgb(40, 190, 110), "đang truyền màn hình".into());
+        }
+        if d.connected {
+            return (Color32::from_rgb(235, 170, 40), "đã kết nối, đang chuẩn bị…".into());
+        }
+        if !d.driver_ok && cfg!(windows) {
+            return (Color32::from_rgb(235, 170, 40), "đã cắm USB, cần cài driver (tự động khi nhấn Kết nối)".into());
+        }
+        if d.accessory {
+            return (Color32::from_rgb(235, 170, 40), "đang ghép nối qua USB…".into());
+        }
+        let how = if d.kind == "adb" { "ADB" } else { "USB" };
+        (accent(), format!("đã cắm {how}"))
     }
 
     fn tick_demo(&mut self) {
@@ -302,7 +463,16 @@ impl App {
                 message: Some("Đang chờ thiết bị".into()),
             }));
             evs.push(HostEvent::Devices {
-                items: vec![DeviceItem { kind: "usb".into(), name: "Samsung Galaxy Tab S10+".into(), serial: "R52W90ABCDE".into() }],
+                items: vec![DeviceItem {
+                    kind: "usb".into(),
+                    name: "Galaxy Tab S10+ (SM-X826B)".into(),
+                    serial: "1-5".into(),
+                    vid: 0x04E8,
+                    pid: 0x6860,
+                    accessory: false,
+                    driver_ok: true,
+                    connected: false,
+                }],
             });
         }
         if d.tick == 1 && el > 2.0 {
@@ -391,7 +561,15 @@ impl App {
         let (color, title, sub) = match v {
             View::Idle => (Color32::from_rgb(130, 135, 150), "Chưa chia sẻ", "Nhấn \"Bắt đầu chia sẻ\" để bắt đầu".to_string()),
             View::Starting => (Color32::from_rgb(235, 170, 40), "Đang khởi động", "Đang chạy tiến trình host...".into()),
-            View::Waiting => (Color32::from_rgb(52, 120, 246), "Chờ kết nối", "Mở ứng dụng trên thiết bị nhận và nhập mã PIN".into()),
+            View::Waiting => (
+                Color32::from_rgb(52, 120, 246),
+                "Chờ kết nối",
+                if self.cfg.mode == Mode::Usb {
+                    "Cắm cáp USB; thiết bị tự được nhận diện, không cần nhập mã".into()
+                } else {
+                    "Mở ứng dụng trên thiết bị nhận và nhập mã PIN".into()
+                },
+            ),
             View::Connecting => (Color32::from_rgb(235, 170, 40), "Đang kết nối", "Đang thiết lập kết nối an toàn...".into()),
             View::Streaming => (
                 Color32::from_rgb(40, 190, 110),
@@ -465,7 +643,7 @@ impl App {
                 });
             });
             let hint = match self.cfg.mode {
-                Mode::Usb => "Cắm cáp USB, độ trễ thấp nhất (cần cài WinUSB lần đầu - xem tab Hướng dẫn USB)",
+                Mode::Usb => "Cắm cáp USB, độ trễ thấp nhất. Thiết bị tự được nhận diện, không cần nhập mã; driver USB tự cài ở lần đầu.",
                 Mode::Lan => "Cùng mạng Wi-Fi/LAN với thiết bị nhận",
                 Mode::Adb => "Qua adb reverse, cần bật Gỡ lỗi USB trên thiết bị",
             };
@@ -514,20 +692,42 @@ impl App {
             if self.devices.is_empty() {
                 ui.weak("Chưa thấy thiết bị nào. Hãy cắm cáp USB hoặc mở ứng dụng trên thiết bị nhận.");
             }
-            for d in &self.devices {
-                ui.horizontal(|ui| {
-                    let kind = match d.kind.as_str() {
-                        "usb" => "USB",
-                        "lan" => "LAN",
-                        "adb" => "ADB",
-                        k => k,
-                    };
-                    ui.label(RichText::new(kind).strong().color(accent()));
-                    ui.label(&d.name);
-                    if !d.serial.is_empty() {
-                        ui.weak(&d.serial);
-                    }
-                });
+            if let Some((ok, m)) = &self.driver_note {
+                let c = if *ok { Color32::from_rgb(40, 190, 110) } else { Color32::from_rgb(230, 160, 40) };
+                ui.colored_label(c, m);
+            }
+            let mut clicked: Option<DeviceItem> = None;
+            let devices = self.devices.clone();
+            for d in &devices {
+                let (color, status) = self.device_status(d);
+                let busy = self.driver_busy.is_some();
+                egui::Frame::new()
+                    .fill(ui.visuals().extreme_bg_color)
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.painter().circle_filled(ui.cursor().left_center() + Vec2::new(6.0, 0.0), 6.0, color);
+                            ui.add_space(18.0);
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&d.name).size(17.0).strong());
+                                ui.label(RichText::new(status).color(color));
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let label = if d.connected { "Đã kết nối" } else { "Kết nối" };
+                                let b = egui::Button::new(RichText::new(label).strong().color(Color32::WHITE))
+                                    .fill(accent())
+                                    .min_size(Vec2::new(110.0, 36.0));
+                                if ui.add_enabled(!d.connected && !busy, b).clicked() {
+                                    clicked = Some(d.clone());
+                                }
+                            });
+                        });
+                    });
+            }
+            if let Some(d) = clicked {
+                self.connect_device(&d);
             }
         });
     }
@@ -591,9 +791,12 @@ impl App {
             if self.view() == View::Streaming {
                 self.stats_strip(ui);
             }
-            self.mode_selector(ui);
-            self.pin_card(ui);
             self.devices_card(ui);
+            self.mode_selector(ui);
+            // USB pairs automatically; the PIN is only for LAN / adb.
+            if self.cfg.mode != Mode::Usb {
+                self.pin_card(ui);
+            }
         });
     }
 
@@ -666,9 +869,9 @@ impl App {
                 }
                 ui.checkbox(&mut self.cfg.minimize_to_tray, "Thu nhỏ xuống thanh tác vụ khi đóng cửa sổ");
                 ui.horizontal(|ui| {
-                    ui.label("Đường dẫn rv-host");
+                    ui.label("Đường dẫn rv-host (gỡ lỗi)");
                     let mut p = self.cfg.host_path.clone().unwrap_or_default();
-                    if ui.add(egui::TextEdit::singleline(&mut p).hint_text("(mặc định: cùng thư mục)").desired_width(320.0)).changed() {
+                    if ui.add(egui::TextEdit::singleline(&mut p).hint_text("(mặc định: chính RemoteView.exe)").desired_width(320.0)).changed() {
                         self.cfg.host_path = if p.trim().is_empty() { None } else { Some(p) };
                     }
                 });
@@ -696,12 +899,11 @@ impl App {
     fn page_guide(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             heading(ui, "Kết nối USB lần đầu");
-            let steps: [(&str, &str); 5] = [
+            let steps: [(&str, &str); 4] = [
                 ("Cài ứng dụng RemoteView trên thiết bị Android", "Tải file APK từ trang phát hành và cài lên máy tính bảng/điện thoại."),
-                ("Cắm cáp USB", "Dùng cáp dữ liệu tốt, cắm thiết bị nhận vào máy tính này."),
-                ("Cài driver WinUSB bằng Zadig", "Mở Zadig, chọn Options > List All Devices. Chọn thiết bị Android ở chế độ phụ kiện (ID 18D1:2D00 hoặc 18D1:2D01), driver đích WinUSB, rồi Install Driver."),
-                ("Mở ứng dụng và nhập mã PIN", "Trên thiết bị nhận, mở RemoteView rồi nhập mã PIN hiển thị ở Trang chính."),
-                ("Nhấn \"Bắt đầu chia sẻ\"", "Chọn kiểu USB, nhấn bắt đầu; màn hình sẽ được truyền sang thiết bị."),
+                ("Cắm cáp USB", "Dùng cáp dữ liệu tốt, cắm thiết bị nhận vào máy tính này. Thiết bị hiện ngay ở Trang chính với tên của nó."),
+                ("Nhấn \"Kết nối\" trên thiết bị", "Lần đầu, RemoteView tự cài driver USB (WinUSB) và hỏi quyền quản trị một lần; không cần Zadig. Không phải nhập mã PIN: máy tính và thiết bị tự ghép nối qua cáp."),
+                ("Mở RemoteView trên thiết bị nhận", "Nếu thiết bị hỏi quyền truy cập phụ kiện USB, chọn Đồng ý (có thể tích \"Luôn mở\"). Màn hình sẽ được truyền sang thiết bị."),
             ];
             for (i, (t, d)) in steps.iter().enumerate() {
                 card(ui, |ui| {
@@ -715,9 +917,6 @@ impl App {
                             if i == 0 && ui.button("Mở trang tải APK").clicked() {
                                 util::open_url(RELEASE_URL);
                             }
-                            if i == 2 && ui.button("Mở trang tải Zadig").clicked() {
-                                util::open_url(ZADIG_URL);
-                            }
                         });
                     });
                 });
@@ -730,7 +929,7 @@ impl App {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(RichText::new("Cảnh báo").strong().color(Color32::from_rgb(230, 160, 40)));
-                    ui.label("Chỉ thay driver cho thiết bị 18D1:2D00 / 18D1:2D01. KHÔNG thay driver của thiết bị Samsung (04E8), nếu không Samsung sẽ không nhận được kết nối bình thường (MTP/ADB).");
+                    ui.label("RemoteView chỉ cài driver WinUSB cho đúng thiết bị bạn bấm \"Kết nối\" (và chế độ phụ kiện 18D1:2D00 / 2D01). Với thiết bị đó, Windows sẽ không dùng nó làm ổ MTP/ADB nữa cho tới khi bạn gỡ driver trong Device Manager.");
                 });
         });
     }

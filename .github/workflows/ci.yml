@@ -27,16 +27,94 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets
-      - run: cargo build --release -p rv-signal-relay -p rv-host-win -p rv-win-ui
+      - run: cargo build --release -p rv-signal-relay
       - uses: actions/upload-artifact@v4
         with:
           name: binaries-${{ matrix.os }}
           path: |
             target/release/rv-signal-relay
             target/release/rv-signal-relay.exe
-            target/release/rv-host.exe
-            target/release/RemoteView.exe
           if-no-files-found: ignore
+
+  # wdi-simple.exe from libwdi (LGPL-3, the library behind Zadig): installs WinUSB
+  # automatically at runtime. Best-effort: if this job fails, RemoteView.exe is
+  # still built, just without the embedded installer (the app then reports
+  # "thiếu wdi-simple.exe" instead of installing the driver).
+  wdi:
+    runs-on: windows-latest
+    continue-on-error: true
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: mingw64
+          update: true
+          install: >-
+            mingw-w64-x86_64-toolchain
+            base-devel
+            autotools
+            git
+      - uses: actions/checkout@v4
+        with:
+          repository: pbatard/libwdi
+          path: libwdi
+          fetch-depth: 1
+          submodules: recursive
+      - name: Download WDK redistributables (WinUSB co-installers)
+        shell: cmd
+        run: |
+          curl -L "https://go.microsoft.com/fwlink/p/?LinkID=253170" -o wdk-redist.msi
+          msiexec /a wdk-redist.msi /qn TARGETDIR=%CD%\libwdi\wdk
+      - name: Build wdi-simple.exe
+        working-directory: libwdi
+        run: |
+          ./bootstrap.sh
+          ./configure --build=x86_64-w64-mingw32 --host=x86_64-w64-mingw32 \
+            --disable-32bit --disable-debug --disable-shared --enable-examples-build \
+            --with-wdkdir="wdk/Windows Kits/8.0" --with-wdfver=1011 LDFLAGS="-static"
+          make
+          ls -la examples/*.exe
+          mkdir -p ../out
+          cp examples/wdi-simple.exe ../out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wdi-simple
+          path: out/wdi-simple.exe
+          if-no-files-found: error
+
+  # The single Windows app: RemoteView.exe contains the host engine (run as
+  # `RemoteView.exe --host-worker`) and, when available, the embedded WinUSB installer.
+  windows-app:
+    needs: [wdi]
+    if: ${{ !cancelled() }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-app
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: wdi-simple
+          path: apps/win-ui/assets
+      - name: Build RemoteView.exe
+        shell: pwsh
+        run: |
+          if (Test-Path apps/win-ui/assets/wdi-simple.exe) {
+            Write-Host "Embedding wdi-simple.exe"
+            cargo build --release -p rv-win-ui --features embed-wdi
+          } else {
+            Write-Host "::warning::wdi-simple.exe missing; building without the embedded driver installer"
+            cargo build --release -p rv-win-ui
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RemoteView-windows
+          path: target/release/RemoteView.exe
 
   android:
     runs-on: ubuntu-latest
@@ -84,7 +162,7 @@ jobs:
           path: apps/android/app/build/outputs/apk/debug/*.apk
 
   publish:
-    needs: [rust, android]
+    needs: [rust, android, windows-app]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
@@ -95,8 +173,7 @@ jobs:
         run: |
           mkdir out
           cp dl/android-debug-apk/*.apk out/RemoteView.apk
-          cp dl/binaries-windows-latest/rv-host.exe out/ || true
-          cp dl/binaries-windows-latest/RemoteView.exe out/ || true
+          cp dl/RemoteView-windows/RemoteView.exe out/RemoteView.exe
           cp dl/binaries-windows-latest/rv-signal-relay.exe out/ || true
           ls -la out
       - uses: softprops/action-gh-release@v2
@@ -108,5 +185,6 @@ jobs:
           body: |
             Bản build tự động từ commit ${{ github.sha }}.
             - RemoteView.apk (đã ký, cài đè được bản trước): cài lên Android (Tab S10+ / S26+)
-            - RemoteView.exe + rv-host.exe: app Windows (đặt cùng thư mục, mở RemoteView.exe)
+            - RemoteView.exe: app Windows duy nhất (một file, không cần file phụ). Cắm cáp USB, nhấn "Kết nối"; driver USB tự cài, không cần Zadig, không cần nhập PIN.
+            - Giấy phép: trình cài driver nhúng là wdi-simple của libwdi (LGPL-3), xem NOTICE.
           files: out/*

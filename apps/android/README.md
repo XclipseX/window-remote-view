@@ -43,7 +43,7 @@ Máy đích: Galaxy S26+ (Exynos 2600, `c2.exynos.*`) và Galaxy Tab S10+ (Dimen
   không xin keyframe -> màn hình đen; (7) `nativeConnectLink` trả 0 / ném lỗi bị nuốt im lặng.
 - Hello (độ phân giải gốc + tần số quét) gửi ngay sau bắt tay; host hiện chưa dùng nó (đọc `--mode` từ dòng lệnh).
 - Opus giải mã trong Kotlin bằng `MediaCodec` "audio/opus" (`AudioPlayer`); không build libopus cho Android.
-- Host chỉ nhận một lần bắt tay mỗi lần chạy: nối lại sau khi rút cáp cần khởi động lại `rv-host`.
+- Host chỉ nhận một lần bắt tay mỗi lần chạy: nối lại sau khi rút cáp cần khởi động lại `RemoteView.exe`.
 ## Cấu trúc (`app/src/main/java/com/remoteview/client/`)
 
 | Đường dẫn | Vai trò |
