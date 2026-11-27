@@ -99,7 +99,12 @@ class FramePresenter(
     fun stop() {
         clear()
         main.removeCallbacksAndMessages(null)
-        Choreographer.getInstance().removeFrameCallback(this)
+        // Choreographer.getInstance() cần Looper: nếu stop() bị gọi từ thread không phải main thì đẩy lên main.
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            Choreographer.getInstance().removeFrameCallback(this)
+        } else {
+            main.post { Choreographer.getInstance().removeFrameCallback(this) }
+        }
     }
 
     companion object {

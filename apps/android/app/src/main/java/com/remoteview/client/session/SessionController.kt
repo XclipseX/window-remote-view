@@ -3,6 +3,8 @@ package com.remoteview.client.session
 import android.app.Activity
 import android.content.Context
 import android.graphics.Bitmap
+import android.os.Handler
+import android.os.Looper
 import android.os.Process
 import android.os.SystemClock
 import android.util.DisplayMetrics
@@ -84,8 +86,12 @@ class SessionController(
             val px = IntArray(w * h)
             for (i in px.indices) {
                 val o = i * 4
-                px[i] = ((rgba[o + 3].toInt() and 0xFF) shl 24) or ((rgba[o].toInt() and 0xFF) shl 16) or
-                    ((rgba[o + 1].toInt() and 0xFF) shl 8) or (rgba[o + 2].toInt() and 0xFF)
+                // Host gửi RGBA alpha thẳng; Bitmap ARGB_8888 của Android là premultiplied -> nhân sẵn để không viền trắng.
+                val a = rgba[o + 3].toInt() and 0xFF
+                val r = ((rgba[o].toInt() and 0xFF) * a + 127) / 255
+                val g = ((rgba[o + 1].toInt() and 0xFF) * a + 127) / 255
+                val b = ((rgba[o + 2].toInt() and 0xFF) * a + 127) / 255
+                px[i] = (a shl 24) or (r shl 16) or (g shl 8) or b
             }
             val bmp = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
             _cursor.value = _cursor.value.copy(bitmap = bmp, hotX = hotX, hotY = hotY)
@@ -118,6 +124,18 @@ class SessionController(
     private data class StreamConfig(val mime: String, val width: Int, val height: Int, val fps: Int)
     @Volatile private var streamConfig: StreamConfig? = null
     private val videoLock = Any()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile private var released = false
+    /** true khi decoder hiện tại đã start() thành công (để StreamConfig cùng cấu hình vẫn dựng lại nếu lần trước hỏng). */
+    @Volatile private var videoStarted = false
+    /** Dự phòng cho host cũ không gửi StreamConfig: sau ESTABLISHED chờ tối đa [CONFIG_WAIT_MS] rồi dựng decoder mặc định. */
+    private val configFallback = Runnable {
+        val sf = surface
+        if (!released && sf != null && streamConfig == null && !videoStarted) {
+            RvLog.w("không có StreamConfig sau ${CONFIG_WAIT_MS}ms -> dựng decoder mặc định (host cũ)")
+            startVideo(sf)
+        }
+    }
 
     private var view: RemoteSurfaceView? = null
     private var capture: PointerCaptureController? = null
@@ -237,7 +255,8 @@ class SessionController(
         DisplayLock.lockHighestRefresh(activity)
         DisplayLock.applyFrameRate(s, effectiveFps.toFloat())
 
-        startVideo(s)
+        // Chỉ dựng decoder khi đã biết cấu hình luồng; chưa có thì chờ STATE_STREAM_CONFIG (hoặc dự phòng).
+        if (streamConfig != null) startVideo(s) else armConfigFallback()
 
         adpf = AdpfSession(activity, intArrayOf(Process.myTid()), effectiveFps)
         thermal = ThermalGovernor(activity, object : ThermalGovernor.Listener {
@@ -256,6 +275,13 @@ class SessionController(
         }).also { it.start() }
 
         if (settings.audioEnabled && audio == null) audio = AudioPlayer().also { it.start() }
+    }
+
+    private fun armConfigFallback() {
+        mainHandler.removeCallbacks(configFallback)
+        if (dbgState == NativeBridge.STATE_ESTABLISHED && surface != null && streamConfig == null) {
+            mainHandler.postDelayed(configFallback, CONFIG_WAIT_MS)
+        }
     }
 
     /** Dựng decoder + presenter + watchdog theo [streamConfig] (nếu có) hoặc kích thước màn hình. */
@@ -286,6 +312,7 @@ class SessionController(
         decoder = dec
         presenter = pres
         val started = dec.start(s)
+        videoStarted = started
         RvLog.i("decoder start=$started name=${dec.info?.codecName} ${w}x$h@$fps")
         if (!started) dbgLastError = "decoder không khởi động được"
         if (started) {
@@ -304,6 +331,7 @@ class SessionController(
 
     private fun stopVideo() {
       synchronized(videoLock) {
+        videoStarted = false
         watchdog?.stop(); watchdog = null
         presenter?.stop(); presenter = null
         decoder?.stop(); decoder = null
@@ -325,7 +353,19 @@ class SessionController(
         return StreamConfig(mime, w, h, fps)
     }
 
+    /**
+     * Callback từ thread "rv-session" của Rust (không có Looper): mọi thứ đụng decoder/presenter/UI
+     * phải chạy trên main thread (Choreographer cần Looper), nên chuyển sang main và giữ nguyên thứ tự.
+     */
     fun onNativeState(state: Int, message: String?) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            handleNativeState(state, message)
+        } else {
+            mainHandler.post { if (!released) handleNativeState(state, message) }
+        }
+    }
+
+    private fun handleNativeState(state: Int, message: String?) {
         RvLog.i("native state=$state msg=${message ?: ""}")
         dbgState = state
         dbgMessage = message ?: ""
@@ -341,6 +381,7 @@ class SessionController(
             NativeBridge.STATE_DISCONNECTED -> _reconnecting.value = true
             NativeBridge.STATE_ESTABLISHED -> {
                 if (NativeBridge.available && nativeHandle != 0L) NativeBridge.nativeRequestKeyFrame(nativeHandle)
+                armConfigFallback()
                 val was = _reconnecting.value
                 _reconnecting.value = false
                 if (was) {
@@ -364,8 +405,8 @@ class SessionController(
                 streamConfig = cfg
                 _streamSize.value = cfg.width to cfg.height
                 val s = surface ?: return
-                val cur = decoder
-                val same = old != null && cur != null && old.mime == cfg.mime &&
+                mainHandler.removeCallbacks(configFallback)
+                val same = old != null && videoStarted && old.mime == cfg.mime &&
                     old.width == cfg.width && old.height == cfg.height && old.fps == cfg.fps
                 if (!same) startVideo(s) // mime/kích thước/fps đổi (hoặc decoder chưa đúng cấu hình): dựng lại
             }
@@ -382,7 +423,20 @@ class SessionController(
         adpf?.report(SystemClock.elapsedRealtimeNanos() - start)
     }
 
+    /** Activity ra nền (onStop): dừng âm thanh (surface bị hủy -> video cũng dừng). */
+    fun onAppBackground() {
+        audio?.stop(); audio = null
+    }
+
+    /** Activity trở lại (onStart): mở lại âm thanh nếu đã có surface; nếu chưa thì onSurfaceReady sẽ mở. */
+    fun onAppForeground() {
+        if (!released && surface != null && settings.audioEnabled && audio == null) {
+            audio = AudioPlayer().also { it.start() }
+        }
+    }
+
     fun onSurfaceDestroyed() {
+        mainHandler.removeCallbacks(configFallback)
         thermal?.stop(); thermal = null
         stopVideo()
         adpf?.close(); adpf = null
@@ -390,6 +444,8 @@ class SessionController(
     }
 
     fun release() {
+        released = true
+        mainHandler.removeCallbacksAndMessages(null)
         onSurfaceDestroyed()
         audio?.stop(); audio = null
         link?.let { it.listener = null; it.close() }
@@ -411,4 +467,8 @@ class SessionController(
 
     @Suppress("unused")
     private fun ctx(): Context = activity
+
+    private companion object {
+        const val CONFIG_WAIT_MS = 1500L
+    }
 }

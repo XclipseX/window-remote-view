@@ -89,7 +89,7 @@ fn optional_method(env: &mut JNIEnv, class: &JClass, name: &str, sig: &str) -> O
 impl JavaCache {
     /// Attach (idempotent, permanent) and run `f` inside a local reference
     /// frame so a long-lived worker thread never leaks local refs.
-    fn call<F>(&self, f: F)
+    fn call<F>(&self, name: &'static str, f: F)
     where
         F: FnOnce(&mut JNIEnv, &JClass) -> jni::errors::Result<()>,
     {
@@ -99,6 +99,7 @@ impl JavaCache {
         let cls = unsafe { JClass::from_raw(self.class.as_obj().as_raw() as jclass) };
         let r = env.with_local_frame(8, |env| f(env, &cls));
         if env.exception_check().unwrap_or(false) {
+            log::warn!("Java exception in JNI callback `{name}` (cleared; see logcat)");
             let _ = env.exception_describe();
             let _ = env.exception_clear();
         }
@@ -124,7 +125,7 @@ pub struct JniIo(&'static JavaCache);
 impl DatagramIo for JniIo {
     fn send(&mut self, buf: &[u8]) {
         let c = self.0;
-        c.call(|env, cls| {
+        c.call("send", |env, cls| {
             let arr = env.byte_array_from_slice(buf)?;
             JavaCache::void(env, cls, c.on_send, &[JValue::Object(&arr).as_jni()])
         });
@@ -137,7 +138,7 @@ pub struct JniSink(&'static JavaCache);
 impl EventSink for JniSink {
     fn video(&mut self, data: &[u8], pts_us: i64, flags: i32) {
         let c = self.0;
-        c.call(|env, cls| {
+        c.call("video", |env, cls| {
             let arr = env.byte_array_from_slice(data)?;
             JavaCache::void(
                 env,
@@ -150,7 +151,7 @@ impl EventSink for JniSink {
 
     fn audio(&mut self, data: &[u8], pts_us: i64, codec: i32) {
         let c = self.0;
-        c.call(|env, cls| {
+        c.call("audio", |env, cls| {
             let arr = env.byte_array_from_slice(data)?;
             JavaCache::void(
                 env,
@@ -163,7 +164,7 @@ impl EventSink for JniSink {
 
     fn state(&mut self, st: i32, message: Option<&str>) {
         let c = self.0;
-        c.call(|env, cls| {
+        c.call("state", |env, cls| {
             let msg: JObject = match message {
                 Some(m) => env.new_string(m)?.into(),
                 None => JObject::null(),
@@ -175,7 +176,7 @@ impl EventSink for JniSink {
     fn cursor_shape(&mut self, w: i32, h: i32, hot_x: i32, hot_y: i32, rgba: &[u8]) {
         let c = self.0;
         let Some(id) = c.on_cursor_shape else { return };
-        c.call(|env, cls| {
+        c.call("cursor_shape", |env, cls| {
             let arr = env.byte_array_from_slice(rgba)?;
             JavaCache::void(
                 env,
@@ -195,7 +196,7 @@ impl EventSink for JniSink {
     fn cursor_pos(&mut self, x: i32, y: i32, visible: bool) {
         let c = self.0;
         let Some(id) = c.on_cursor_pos else { return };
-        c.call(|env, cls| {
+        c.call("cursor_pos", |env, cls| {
             JavaCache::void(
                 env,
                 cls,
@@ -207,7 +208,7 @@ impl EventSink for JniSink {
 
     fn stats(&mut self, rtt_ms: f32, bitrate_kbps: i32, loss_percent: f32) {
         let c = self.0;
-        c.call(|env, cls| {
+        c.call("stats", |env, cls| {
             JavaCache::void(
                 env,
                 cls,

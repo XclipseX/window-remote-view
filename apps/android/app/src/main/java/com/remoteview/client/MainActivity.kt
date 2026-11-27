@@ -12,6 +12,7 @@ import com.remoteview.client.ui.UsbHostInfo
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -77,6 +78,8 @@ class MainActivity : ComponentActivity() {
     }
     private var detachRegistered = false
     private var pinPrompt by mutableStateOf<PinPrompt?>(null)
+    /** Giữ CPU thức khi phiên đang chạy dù Activity ở nền (cần quyền WAKE_LOCK). */
+    private var sessionWake: PowerManager.WakeLock? = null
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { /* kết quả: bỏ qua, mạng vẫn chạy */ }
@@ -99,6 +102,7 @@ class MainActivity : ComponentActivity() {
                 session?.submitFrame(data, ptsUs, flags)
             }
             override fun onConnectionState(state: Int, message: String?) {
+                // SessionController tự chuyển sang main thread (callback này chạy trên thread Rust không có Looper).
                 session?.onNativeState(state, message)
             }
             override fun onHostDiscovered(name: String, address: String) {
@@ -217,6 +221,7 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                         session = s
+                        acquireSessionWake()
                         s.attachLink(route.link)
                         screen = Screen.SESSION
                     }
@@ -231,6 +236,7 @@ class MainActivity : ComponentActivity() {
     private fun connectTo(target: String, usbDisplay: Boolean = false) {
         val s = SessionController(this, settings, usbDisplay)
         session = s
+        acquireSessionWake()
         if (NativeBridge.available) {
             // TODO(rust-core): cấu hình JSON theo thỏa thuận giao thức; caps nằm trong helloJson.
             s.nativeHandle = NativeBridge.nativeConnect(target, s.helloJson)
@@ -343,6 +349,31 @@ class MainActivity : ComponentActivity() {
             it.release()
         }
         session = null
+        releaseSessionWake()
+    }
+
+    private fun acquireSessionWake() {
+        try {
+            var wl = sessionWake
+            if (wl == null) {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "rv:session")
+                wl.setReferenceCounted(false)
+                sessionWake = wl
+            }
+            if (!wl.isHeld) wl.acquire()
+        } catch (e: Exception) {
+            RvLog.w("không lấy được WAKE_LOCK", e)
+        }
+    }
+
+    private fun releaseSessionWake() {
+        try {
+            val wl = sessionWake
+            if (wl != null && wl.isHeld) wl.release()
+        } catch (e: Exception) {
+            RvLog.w("nhả WAKE_LOCK lỗi", e)
+        }
     }
 
     override fun onStart() {
@@ -360,9 +391,12 @@ class MainActivity : ComponentActivity() {
             NativeBridge.nativeStartDiscovery()
             session?.let { if (it.nativeHandle != 0L) NativeBridge.nativePauseVideo(it.nativeHandle, false) }
         }
+        session?.onAppForeground()
     }
 
     override fun onStop() {
+        // Âm thanh dừng khi ra nền (WAKE_LOCK vẫn giữ để phiên không bị ngắt).
+        session?.onAppBackground()
         // Gửi PauseVideo để host dừng chụp/mã hóa khi app ra nền.
         if (NativeBridge.available) {
             session?.let { if (it.nativeHandle != 0L) NativeBridge.nativePauseVideo(it.nativeHandle, true) }

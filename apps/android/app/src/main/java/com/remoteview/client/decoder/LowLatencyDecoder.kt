@@ -99,7 +99,9 @@ object CodecSelector {
                     info.supportedTypes.any { it.equals(mime, ignoreCase = true) } &&
                     !isFakeHardwareAv1(info.name, mime) &&
                     // Tránh AV1 trên c2.mtk ở >= 90 fps (D9300+ ~18-25 ms/khung).
-                    !(mime == MimeTypes.AV1 && Vendor.fromCodecName(info.name) == Vendor.MTK && fps >= 90)
+                    // Trừ khi người dùng chọn rõ AV1.
+                    !(mime == MimeTypes.AV1 && Vendor.fromCodecName(info.name) == Vendor.MTK && fps >= 90 &&
+                        policy.preference != CodecPreference.AV1)
             }
             if (cands.isEmpty()) continue
             val sorted = cands.sortedWith(
@@ -116,9 +118,10 @@ object CodecSelector {
     }
 
     /** Có bộ giải mã phần cứng cho [mime] (dùng để quảng bá codec trong Hello). */
-    fun hasHardwareDecoder(mime: String): Boolean = runCatching {
+    fun hasHardwareDecoder(mime: String, excludeMtk: Boolean = false): Boolean = runCatching {
         MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { info ->
             !info.isEncoder && isHardware(info) &&
+                !(excludeMtk && Vendor.fromCodecName(info.name) == Vendor.MTK) &&
                 info.supportedTypes.any { it.equals(mime, ignoreCase = true) } &&
                 !isFakeHardwareAv1(info.name, mime)
         }

@@ -41,8 +41,10 @@ object DisplayCaps {
      */
     fun advertisedCodecs(settings: StreamSettings): List<String> {
         val hevc = CodecSelector.hasHardwareDecoder(MimeTypes.HEVC)
-        val av1 = (settings.allowAv1 || settings.codec == CodecPreference.AV1) &&
-            CodecSelector.hasHardwareDecoder(MimeTypes.AV1)
+        // MediaTek (c2.mtk.*) giải AV1 chậm (~18-25 ms/khung): chỉ quảng bá khi người dùng CHỌN RÕ codec AV1.
+        val explicitAv1 = settings.codec == CodecPreference.AV1
+        val av1 = (settings.allowAv1 || explicitAv1) &&
+            CodecSelector.hasHardwareDecoder(MimeTypes.AV1, excludeMtk = !explicitAv1)
         val out = ArrayList<String>()
         when (settings.codec) {
             CodecPreference.H264 -> {}
