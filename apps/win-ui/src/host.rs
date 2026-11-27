@@ -181,8 +181,8 @@ fn connect_service(worker_args: &[String]) -> Option<Link> {
 
 /// Starts the engine: through the service when this is the self-worker and the service answers,
 /// otherwise as a child process. Returns the link and a log line naming the transport.
-fn open_link(exe: &PathBuf, args: &[String]) -> std::io::Result<(Link, &'static str)> {
-    if is_self_worker(args) {
+fn open_link(exe: &PathBuf, args: &[String], allow_service: bool) -> std::io::Result<(Link, &'static str)> {
+    if allow_service && is_self_worker(args) {
         if let Some(l) = connect_service(&args[1..]) {
             return Ok((l, "host: dịch vụ RemoteView (SYSTEM) qua pipe — hiển thị được cả màn hình khóa"));
         }
@@ -210,9 +210,13 @@ fn supervise(
         repaint();
     };
     let mut backoff = Duration::from_secs(1);
+    // The service path is new and untested on many machines: if it dies quickly twice in a row,
+    // fall back to the plain child process for the rest of this run so sharing still works.
+    let mut svc_quick_fails = 0u32;
+    let mut allow_service = true;
     while !stop.load(Ordering::SeqCst) {
         let started = Instant::now();
-        let (mut link, transport) = match open_link(&exe, &args) {
+        let (mut link, transport) = match open_link(&exe, &args, allow_service) {
             Ok(l) => l,
             Err(e) => {
                 send(UiMsg::SpawnFailed(format!("{}: {e}", exe.display())));
@@ -282,6 +286,16 @@ fn supervise(
         }
         if started.elapsed() > Duration::from_secs(15) {
             backoff = Duration::from_secs(1);
+            svc_quick_fails = 0;
+        } else if allow_service && matches!(link.end, LinkEnd::Pipe { .. }) {
+            svc_quick_fails += 1;
+            if svc_quick_fails >= 2 {
+                allow_service = false;
+                send(UiMsg::Event(HostEvent::Log {
+                    level: LogLevel::Warn,
+                    msg: "host: dịch vụ RemoteView lỗi liên tục, chuyển sang chạy tiến trình con (không xem được màn hình khóa)".into(),
+                }));
+            }
         }
         send(UiMsg::Exited { code, restart_in: Some(backoff) });
         // interruptible sleep
