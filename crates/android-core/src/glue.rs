@@ -235,7 +235,7 @@ fn chunk_text(s: &str) -> Vec<String> {
 /// Data bytes per `LogChunk`: one datagram (no IP fragmentation on Wi-Fi), well under `MAX_LOG_CHUNK`.
 pub const LOG_CHUNK_BYTES: usize = 1024;
 /// Largest log uploaded; a bigger one is cut to its newest bytes.
-pub const MAX_UPLOAD_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
 
 /// Splits a log into `LogChunk` control messages (`nativeUploadLog`). Names are
 /// cut to `MAX_LOG_NAME` bytes on a char boundary; oversized logs keep their tail.

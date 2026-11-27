@@ -207,11 +207,12 @@ fun SessionScreen(controller: SessionController, showModifierBar: Boolean = true
                 )
             }
         }
-        // Nhấn giữ góc trên-phải để bật/tắt lớp phủ (góc này không chuyển cảm ứng cho host).
+        // Nhấn giữ góc trên-phải để bật/tắt lớp phủ. Vùng chạm chỉ 16dp (sát mép) để không nuốt chạm
+        // vào nút đóng cửa sổ của máy từ xa (Compose không chuyển chạm xuống View bên dưới).
         Box(
             Modifier
                 .align(Alignment.TopEnd)
-                .size(64.dp)
+                .size(16.dp)
                 .pointerInput(overlayVisible) {
                     detectTapGestures(onLongPress = { manual = !overlayVisible })
                 },

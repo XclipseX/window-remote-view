@@ -138,7 +138,7 @@ object RvLog {
     }
 
     /** Nội dung file log hiện tại (UTF-8), tối đa [maxBytes] byte cuối; rỗng nếu chưa có file. */
-    fun currentFileBytes(maxBytes: Int = 4 * 1024 * 1024): ByteArray {
+    fun currentFileBytes(maxBytes: Int = 2 * 1024 * 1024): ByteArray {
         flush()
         val f = currentFile ?: return text().toByteArray(Charsets.UTF_8)
         return try {

@@ -29,6 +29,8 @@ const LOG_CHUNKS_PER_PASS: usize = 8;
 /// means the host rejected msg3 (wrong PIN) or went away.
 const POST_HANDSHAKE_SILENCE: Duration = Duration::from_secs(4);
 const TICK: Duration = Duration::from_millis(100);
+/// Upper bound on flushing queued log chunks when the session is shutting down.
+const LOG_FLUSH_ON_SHUTDOWN: Duration = Duration::from_millis(2500);
 
 pub struct WorkerHandle {
     tx: Sender<Command>,
@@ -176,6 +178,20 @@ fn run<I: DatagramIo, S: EventSink>(
             rx_bytes = 0;
             sink.stats(0.0, kbps, 0.0);
         }
+    }
+
+    // Shutdown must not cut a log upload short: flush what is still queued (bounded wait, lightly paced).
+    let deadline = Instant::now() + LOG_FLUSH_ON_SHUTDOWN;
+    while !upload.is_empty() && Instant::now() < deadline {
+        for _ in 0..LOG_CHUNKS_PER_PASS {
+            let Some(c) = upload.pop_front() else { break };
+            if let Err(e) = client.send_control(c) {
+                log::warn!("log flush aborted: {e}");
+                upload.clear();
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
