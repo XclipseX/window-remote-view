@@ -79,11 +79,14 @@ abstract class FramedStreamLink(override val name: String) : DatagramLink {
     /** Chạy ở thread nền khi stream đã sẵn sàng. */
     protected fun runStreams(input: InputStream, output: OutputStream) {
         opened = true
-        RvLog.i("[$name] stream mở, bắt đầu thread đọc/ghi")
-        // Thread đọc/ghi phải chạy TRƯỚC khi báo onOpen: onOpen tạo phiên native và Rust gửi Hello ngay.
+        RvLog.i("[$name] stream mở, bắt đầu thread ghi và tạo phiên")
+        // Thread ghi phải chạy TRƯỚC onOpen (onOpen tạo phiên native và gửi Hello ngay);
+        // thread đọc chạy SAU onOpen để nativeHandle đã sẵn sàng, tránh bão gói rác (handle=0).
         writer = Thread({ writeLoop(output) }, "rv-$name-w").also { it.isDaemon = true; it.start() }
-        reader = Thread({ readLoop(input) }, "rv-$name-r").also { it.isDaemon = true; it.start() }
         listener?.onOpen()
+        if (!closed.get()) {
+            reader = Thread({ readLoop(input) }, "rv-$name-r").also { it.isDaemon = true; it.start() }
+        }
     }
 
     /**

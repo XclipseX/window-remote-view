@@ -32,9 +32,9 @@ object DisplayLock {
         }
     }
 
-    /** Màn hình Windows đứng yên: hạ nhịp (LTPO tiết kiệm pin); đứng yên xong thì trả về [fps]. */
+    /** Màn hình Windows đứng yên: hạ nhịp xuống 60 Hz (tránh giật khi LTPO tăng tốc từ 10 Hz lên 120 Hz). */
     fun setIdle(surface: Surface, idle: Boolean, fps: Float) {
-        applyFrameRate(surface, if (idle) 10f else fps)
+        applyFrameRate(surface, if (idle) minOf(fps, 60f) else fps)
     }
 
     /**

@@ -92,10 +92,49 @@ pub struct App {
     pending_log_export: Option<Instant>,
     /// Last time a concise `stats:` summary line was appended to the log file.
     last_stats_log: Option<Instant>,
+    /// Coalesces rapid quality-slider drags into one `SetQuality` command.
+    quality_debounce: QualityDebounce,
     /// Start sharing automatically once the driver/service auto-install is out of the way.
     pending_auto_share: bool,
     /// Launched with `--minimized` (autostart): minimize the window on the first frame.
     minimize_first_frame: bool,
+}
+
+/// Coalesces rapid quality-slider drags into a single `SetQuality` command
+/// after `DEBOUNCE` (or immediately when the user releases the drag).
+#[derive(Debug, Default)]
+struct QualityDebounce {
+    pending: Option<(Instant, u8)>,
+}
+
+impl QualityDebounce {
+    const DEBOUNCE: Duration = Duration::from_millis(150);
+
+    fn schedule(&mut self, now: Instant, quality: u8) -> Duration {
+        self.pending = Some((now + Self::DEBOUNCE, quality));
+        Self::DEBOUNCE
+    }
+
+    fn clear(&mut self) {
+        self.pending = None;
+    }
+
+    fn flush_now(&mut self) -> Option<u8> {
+        self.pending.take().map(|(_, q)| q)
+    }
+
+    /// Returns `(Some(quality), None)` when due, or `(None, Some(remaining))` while waiting.
+    fn poll(&mut self, now: Instant) -> (Option<u8>, Option<Duration>) {
+        let Some((due, q)) = self.pending else {
+            return (None, None);
+        };
+        if now >= due {
+            self.pending = None;
+            (Some(q), None)
+        } else {
+            (None, Some(due - now))
+        }
+    }
 }
 
 #[derive(Default)]
@@ -225,6 +264,7 @@ impl App {
             export_note: None,
             pending_log_export: None,
             last_stats_log: None,
+            quality_debounce: QualityDebounce::default(),
             pending_auto_share,
             minimize_first_frame: minimized && !demo,
         };
@@ -682,6 +722,13 @@ impl App {
             } else {
                 self.ctx.request_repaint_after(due - now);
             }
+        }
+        let (due_q, wait_q) = self.quality_debounce.poll(Instant::now());
+        if let Some(q) = due_q {
+            self.cfg.save();
+            self.send(HostCmd::SetQuality { quality: q });
+        } else if let Some(wait) = wait_q {
+            self.ctx.request_repaint_after(wait);
         }
         while let Ok(m) = self.rx.try_recv() {
             match m {
@@ -1270,6 +1317,8 @@ impl App {
 
     fn page_settings(&mut self, ui: &mut egui::Ui) {
         let before = self.cfg.clone();
+        let mut quality_dragged = false;
+        let mut quality_drag_stopped = false;
         egui::ScrollArea::vertical().show(ui, |ui| {
             heading(ui, "Cài đặt");
             card(ui, |ui| {
@@ -1297,7 +1346,9 @@ impl App {
                     ui.end_row();
 
                     ui.label("Chất lượng");
-                    ui.add(egui::Slider::new(&mut self.cfg.quality, 1..=100).suffix("%"));
+                    let q_resp = ui.add(egui::Slider::new(&mut self.cfg.quality, 1..=100).suffix("%"));
+                    quality_dragged = q_resp.dragged();
+                    quality_drag_stopped = q_resp.drag_stopped();
                     ui.end_row();
 
                     ui.label("Codec");
@@ -1415,8 +1466,26 @@ impl App {
                 self.update_ui(ui, false);
             });
         });
-        if self.cfg != before {
+        let quality_changed = self.cfg.quality != before.quality;
+        if quality_changed && quality_dragged {
+            let wait = self.quality_debounce.schedule(Instant::now(), self.cfg.quality);
+            self.ctx.request_repaint_after(wait);
+            // Still apply any other config fields that changed in the same frame, without sending SetQuality yet.
+            let mut before_other = before.clone();
+            before_other.quality = self.cfg.quality;
+            if self.cfg != before_other {
+                self.on_cfg_changed(&before_other);
+            }
+        } else if self.cfg != before {
+            if quality_changed {
+                self.quality_debounce.clear();
+            }
             self.on_cfg_changed(&before);
+        } else if quality_drag_stopped {
+            if let Some(q) = self.quality_debounce.flush_now() {
+                self.cfg.save();
+                self.send(HostCmd::SetQuality { quality: q });
+            }
         }
     }
 
@@ -1427,6 +1496,7 @@ impl App {
             self.autostart_msg = util::set_autostart(self.cfg.autostart).err().filter(|_| util::autostart_supported());
         }
         if self.cfg.quality != before.quality {
+            self.quality_debounce.clear();
             self.send(HostCmd::SetQuality { quality: self.cfg.quality });
         }
         if self.cfg.fps != before.fps {
@@ -1599,5 +1669,25 @@ mod tests {
         assert_eq!(effective_target_fps(120, "openh264"), 60.0);
         assert_eq!(effective_target_fps(120, "mf-hevc-hw"), 120.0);
         assert_eq!(effective_target_fps(30, "openh264"), 30.0);
+    }
+
+    #[test]
+    fn quality_debounce_coalesces_and_flushes() {
+        let mut d = QualityDebounce::default();
+        let t0 = Instant::now();
+        assert_eq!(d.poll(t0), (None, None));
+        d.schedule(t0, 60);
+        d.schedule(t0 + Duration::from_millis(50), 40);
+        // Not due yet at +100 ms (rescheduled to +200 ms)
+        let (due, rem) = d.poll(t0 + Duration::from_millis(100));
+        assert_eq!(due, None);
+        assert!(rem.is_some());
+        // Fires latest value at +200 ms
+        assert_eq!(d.poll(t0 + Duration::from_millis(200)), (Some(40), None));
+        assert_eq!(d.poll(t0 + Duration::from_millis(250)), (None, None));
+        // Drag release flushes immediately
+        d.schedule(t0, 75);
+        assert_eq!(d.flush_now(), Some(75));
+        assert_eq!(d.flush_now(), None);
     }
 }

@@ -207,6 +207,14 @@ private fun CategoryContent(
             SwitchRow(R.string.settings_hw_decode, R.string.settings_hw_decode_hint, settings.hardwareDecode) {
                 onChange(settings.copy(hardwareDecode = it))
             }
+            if (!settings.hardwareDecode) {
+                Text(
+                    stringResource(R.string.settings_hw_decode_off_warning),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(horizontal = Spacing.m, vertical = Spacing.xs),
+                )
+            }
             SwitchRow(R.string.settings_allow_av1, null, settings.allowAv1) { onChange(settings.copy(allowAv1 = it)) }
             SwitchRow(R.string.settings_direct_present, R.string.settings_direct_present_hint, settings.directPresent) {
                 onChange(settings.copy(directPresent = it))

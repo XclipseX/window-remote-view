@@ -1259,6 +1259,8 @@ mod win_loader {
 
     /// `LOAD_LIBRARY_SEARCH_SYSTEM32` — prevents DLL planting from cwd / app dir.
     pub const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+    /// `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` — safe fallback for DCH DriverStore dependencies.
+    pub const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -1269,6 +1271,7 @@ mod win_loader {
         ) -> *mut c_void;
         pub fn GetProcAddress(h_module: *mut c_void, lp_proc_name: *const u8) -> *const c_void;
         pub fn FreeLibrary(h_module: *mut c_void) -> i32;
+        pub fn GetLastError() -> u32;
     }
 }
 
@@ -1306,15 +1309,24 @@ impl AmfLibrary {
     fn load_internal() -> std::result::Result<Self, String> {
         unsafe {
             let dll = wide_nul("amfrt64.dll");
-            let module = win_loader::LoadLibraryExW(
+            let mut module = win_loader::LoadLibraryExW(
                 dll.as_ptr(),
                 std::ptr::null_mut(),
                 win_loader::LOAD_LIBRARY_SEARCH_SYSTEM32,
             );
             if module.is_null() {
-                return Err(
-                    "amfrt64.dll not found in System32 (AMD Radeon driver not installed)".into(),
+                let err1 = win_loader::GetLastError();
+                module = win_loader::LoadLibraryExW(
+                    dll.as_ptr(),
+                    std::ptr::null_mut(),
+                    win_loader::LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
                 );
+                if module.is_null() {
+                    let err2 = win_loader::GetLastError();
+                    return Err(format!(
+                        "amfrt64.dll load failed (system32 err={err1}, default_dirs err={err2})"
+                    ));
+                }
             }
 
             let qv_sym = win_loader::GetProcAddress(module, c"AMFQueryVersion".as_ptr().cast());

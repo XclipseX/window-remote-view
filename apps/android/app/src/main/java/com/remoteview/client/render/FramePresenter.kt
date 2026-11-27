@@ -2,6 +2,7 @@ package com.remoteview.client.render
 
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.Choreographer
 import com.remoteview.client.decoder.FrameReleaser
 import java.util.concurrent.atomic.AtomicLong
@@ -35,12 +36,22 @@ class FramePresenter(
     private val lock = Any()
     private val pending = ArrayList<Int>(4)
     private var scheduled = false
-    private var idle = false
+    @Volatile private var lastFrameMs: Long = 0L
+    @Volatile private var idle = false
+    @Volatile private var idleWatchArmed = false
 
-    private val idleRunnable = Runnable {
-        if (!idle) {
-            idle = true
-            onIdleChanged?.invoke(true)
+    private val idleRunnable: Runnable = object : Runnable {
+        override fun run() {
+            val elapsed = SystemClock.elapsedRealtime() - lastFrameMs
+            if (elapsed >= IDLE_MS) {
+                idleWatchArmed = false
+                if (!idle) {
+                    idle = true
+                    onIdleChanged?.invoke(true)
+                }
+            } else {
+                main.postDelayed(this, (IDLE_MS - elapsed).coerceAtLeast(100L))
+            }
         }
     }
 
@@ -83,14 +94,15 @@ class FramePresenter(
     }
 
     private fun noteFrame() {
-        main.removeCallbacks(idleRunnable)
-        main.post {
-            if (idle) {
-                idle = false
-                onIdleChanged?.invoke(false)
-            }
+        lastFrameMs = SystemClock.elapsedRealtime()
+        if (idle) {
+            idle = false
+            main.post { onIdleChanged?.invoke(false) }
         }
-        main.postDelayed(idleRunnable, IDLE_MS)
+        if (!idleWatchArmed) {
+            idleWatchArmed = true
+            main.postDelayed(idleRunnable, IDLE_MS)
+        }
     }
 
     /** Trả hết khung đang chờ (gọi trước flush/recreate/stop). */
@@ -105,6 +117,8 @@ class FramePresenter(
 
     fun stop() {
         clear()
+        idleWatchArmed = false
+        idle = false
         main.removeCallbacksAndMessages(null)
         // Choreographer.getInstance() cần Looper: nếu stop() bị gọi từ thread không phải main thì đẩy lên main.
         if (Looper.myLooper() == Looper.getMainLooper()) {
@@ -115,6 +129,6 @@ class FramePresenter(
     }
 
     companion object {
-        const val IDLE_MS = 500L
+        const val IDLE_MS = 3000L
     }
 }

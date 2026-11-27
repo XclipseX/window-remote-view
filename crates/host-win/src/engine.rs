@@ -241,12 +241,83 @@ impl DatagramIo for Transport {
     }
 }
 
+/// Keeps Windows system timer resolution at 1 ms for the host engine's lifetime
+/// (without this, `sleep` / `recv_timeout` / `AcquireNextFrame` quantize to 15.625 ms,
+/// capping streaming at ~58-64 FPS).
+struct HighResTimerGuard {
+    #[cfg(windows)]
+    active: bool,
+}
+
+impl HighResTimerGuard {
+    fn new() -> Self {
+        #[cfg(windows)]
+        {
+            let r = unsafe { windows::Win32::Media::timeBeginPeriod(1) };
+            if r == 0 {
+                info!("timer: Windows timeBeginPeriod(1) enabled");
+                Self { active: true }
+            } else {
+                warn!("timer: timeBeginPeriod(1) returned {r}");
+                Self { active: false }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            Self {}
+        }
+    }
+}
+
+impl Drop for HighResTimerGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if self.active {
+            unsafe {
+                let _ = windows::Win32::Media::timeEndPeriod(1);
+            }
+        }
+    }
+}
+
+fn boost_thread_priority(name: &str) {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST};
+        if let Err(e) = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) {
+            warn!("priority: SetThreadPriority({name}) failed: {e}");
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = name;
+}
+
 impl Transport {
     fn stream(l: UsbDatagramLink) -> Self {
         Self { kind: TransportKind::Stream(l), io: Arc::default() }
     }
     fn lan(h: LanHandle) -> Self {
         Self { kind: TransportKind::Lan(h), io: Arc::default() }
+    }
+    fn try_recv(&mut self) -> Result<Option<Vec<u8>>, String> {
+        let r = match &mut self.kind {
+            TransportKind::Stream(l) => {
+                if l.is_broken() {
+                    return Err(format!("link write failed ({})", l.stats().last_error().unwrap_or_default()));
+                }
+                l.try_recv().map_err(|e| format!("{e} ({})", l.stats().last_error().unwrap_or_default()))
+            }
+            TransportKind::Lan(h) => match h.rx.lock().unwrap().try_recv() {
+                Ok(v) => Ok(Some(v)),
+                Err(TryRecvError::Empty) => Ok(None),
+                Err(TryRecvError::Disconnected) => Err("udp receiver stopped".into()),
+            },
+        };
+        if let Ok(Some(v)) = &r {
+            self.io.dg_in.fetch_add(1, Ordering::Relaxed);
+            self.io.bytes_in.fetch_add(v.len() as u64, Ordering::Relaxed);
+        }
+        r
     }
     fn recv(&mut self, t: Duration) -> Result<Option<Vec<u8>>, String> {
         let r = match &mut self.kind {
@@ -473,6 +544,7 @@ struct ActiveEnc {
 
 enum VideoEvent {
     Active(ActiveEnc),
+    Bitrate(u32),
     Stats { fps: f64, kbps: u64, encode_ms: f64 },
     Fatal(String),
 }
@@ -502,9 +574,19 @@ fn hw_gave_up(kind: EncoderKind, uses_d3d: bool, hevc_ok: bool, reason: &str) {
 /// Encode size for a capture of `nw x nh` when the client / GUI asked for at
 /// most `rw x rh` (0 = no limit): the capture's own aspect ratio is kept (the
 /// client letterboxes), the picture is never stretched or enlarged.
+/// Near-identical aspect ratios (< 1% difference, e.g. 2800x1752 -> 2560x1600)
+/// snap to the exact requested dimensions so hardware decoders receive clean
+/// 16-px aligned resolutions instead of odd sizes like 2556x1600.
 fn fit_size(nw: u32, nh: u32, rw: u32, rh: u32) -> (u32, u32) {
     if rw == 0 || rh == 0 || nw == 0 || nh == 0 || (rw >= nw && rh >= nh) {
         return (nw, nh);
+    }
+    if rw <= nw && rh <= nh {
+        let ar_cap = f64::from(nw) / f64::from(nh);
+        let ar_req = f64::from(rw) / f64::from(rh);
+        if (ar_req / ar_cap - 1.0).abs() < 0.01 {
+            return (rw, rh);
+        }
     }
     let k = (f64::from(rw) / f64::from(nw)).min(f64::from(rh) / f64::from(nh));
     (((f64::from(nw) * k).round() as u32).max(2), ((f64::from(nh) * k).round() as u32).max(2))
@@ -519,6 +601,7 @@ fn video_thread(
     tx: SyncSender<VideoOut>,
     ev: Sender<VideoEvent>,
 ) {
+    boost_thread_priority("video");
     let mut cap = Capturer::new(Some(out_name), out_rect);
     let thread_start = Instant::now();
     let mut sup = HwSupervisor::new();
@@ -542,13 +625,28 @@ fn video_thread(
             std::thread::sleep(Duration::from_millis(5));
             continue;
         }
+        // Compute target cadence before acquire so wait timeout matches the target FPS.
+        let sw_mode = force_sw
+            || prefs.encoder == EncoderPref::Sw
+            || hw_exhausted(sh.client_hevc.load(Ordering::Relaxed) && prefs.codec != CodecPref::H264);
+        let mut fps = sh.fps.load(Ordering::Relaxed).max(1);
+        let client_max_fps = sh.client_max_fps.load(Ordering::Relaxed);
+        if client_max_fps > 0 {
+            fps = fps.min(client_max_fps);
+        }
+        let fps = if sw_mode { fps.min(crate::encode::SW_MAX_FPS) } else { fps };
+        let min_interval = Duration::from_micros(1_000_000 / fps as u64);
+
         let locked = sh.locked.load(Ordering::Relaxed);
         let acquired = if locked {
             // Lock screen / secure desktop: nothing can be captured. Keep the last frame flowing.
             std::thread::sleep(Duration::from_millis(8));
             None
         } else {
-            cap.acquire(8).unwrap_or(None)
+            // If we already have an unencoded dirty frame, poll non-blockingly for an even fresher one;
+            // otherwise wait up to one frame interval (clamped to 2..=8 ms) for DWM to present.
+            let wait_ms = if dirty { 0 } else { (1000 / fps).clamp(2, 8) };
+            cap.acquire(wait_ms).unwrap_or(None)
         };
         if let Some(f) = acquired {
             last_frame = Some(f);
@@ -568,21 +666,18 @@ fn video_thread(
         }
         let Some(frame) = last_frame.as_ref() else { continue };
 
-        // Software path (forced, or every hardware encoder blocked): <=1920x1080, <=60 fps.
-        let sw_mode = force_sw
-            || prefs.encoder == EncoderPref::Sw
-            || hw_exhausted(sh.client_hevc.load(Ordering::Relaxed) && prefs.codec != CodecPref::H264);
-        let mut fps = sh.fps.load(Ordering::Relaxed).max(1);
-        let client_max_fps = sh.client_max_fps.load(Ordering::Relaxed);
-        if client_max_fps > 0 {
-            fps = fps.min(client_max_fps);
-        }
-        let fps = if sw_mode { fps.min(crate::encode::SW_MAX_FPS) } else { fps };
-        let min_interval = Duration::from_micros(1_000_000 / fps as u64);
         let want_idr = sh.idr.load(Ordering::Relaxed);
-        let due = dirty && last_encode.elapsed() + Duration::from_micros(500) >= min_interval;
+        let tol = (min_interval / 4).min(Duration::from_millis(2));
+        let elapsed = last_encode.elapsed();
+        let due = dirty && elapsed + tol >= min_interval;
         let keepalive = last_sent.elapsed() > Duration::from_secs(1);
         if !(due || want_idr || keepalive) {
+            if dirty {
+                let rem = min_interval.saturating_sub(elapsed).min(Duration::from_millis(2));
+                if !rem.is_zero() {
+                    std::thread::sleep(rem);
+                }
+            }
             continue;
         }
 
@@ -629,7 +724,7 @@ fn video_thread(
                         a.bitrate_bps = b;
                         applied_live = true;
                         info!("encoder: bitrate -> {} kbps (live)", b / 1000);
-                        let _ = ev.send(VideoEvent::Active(*a));
+                        let _ = ev.send(VideoEvent::Bitrate(b));
                     }
                 }
             }
@@ -1141,13 +1236,8 @@ impl Ctx {
         (stop, otp)
     }
 
-    fn send_stream_config<I: DatagramIo>(&self, session: &mut HostSession<I>) {
+    fn send_stream_config_only<I: DatagramIo>(&self, session: &mut HostSession<I>) {
         let Some(a) = self.active else { return };
-        let _ = session.send_control(ControlMessage::DisplayConfigChange {
-            w: a.width.min(u16::MAX as u32) as u16,
-            h: a.height.min(u16::MAX as u32) as u16,
-            fps: a.fps as u16,
-        });
         let _ = session.send_control(ControlMessage::StreamConfig {
             codec: a.kind.codec_flag(),
             width: a.width.min(u16::MAX as u32) as u16,
@@ -1155,6 +1245,16 @@ impl Ctx {
             fps: a.fps as u16,
             bitrate_kbps: a.bitrate_bps / 1000,
         });
+    }
+
+    fn send_stream_config<I: DatagramIo>(&self, session: &mut HostSession<I>) {
+        let Some(a) = self.active else { return };
+        let _ = session.send_control(ControlMessage::DisplayConfigChange {
+            w: a.width.min(u16::MAX as u32) as u16,
+            h: a.height.min(u16::MAX as u32) as u16,
+            fps: a.fps as u16,
+        });
+        self.send_stream_config_only(session);
     }
 
     /// Sleep that keeps servicing GUI commands. Returns true on stop.
@@ -1235,6 +1335,7 @@ fn waiting_message(link: &str) -> &'static str {
 }
 
 fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Result<End, String> {
+    boost_thread_priority("session");
     let reliable = transport.reliable();
     let io_stats = transport.io.clone();
     let usb_stats = transport.usb_stats();
@@ -1273,6 +1374,7 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
     // windows or hooks, so SetThreadDesktop works here (no dedicated injection thread needed).
     let mut input_follow = crate::session_state::DesktopFollower::new("input", Duration::from_millis(50), false);
     let mut last_log_flush = Instant::now();
+    let mut pending_video: Option<VideoOut> = None;
 
     loop {
         let (stop, otp_changed) = ctx.poll_commands();
@@ -1294,43 +1396,53 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
             return Ok(End::Reopen);
         }
 
-        match session.io_mut().recv(Duration::from_millis(2)) {
-            Ok(Some(dg)) => {
-                if let Some(p) = &lan_peer {
-                    if let Some(addr) = *p.lock().unwrap() {
-                        last_rx_peer_key = rv_session::peer_key(&addr);
-                    }
-                }
-                if !established && !connecting {
-                    connecting = true;
-                    let peer = lan_peer.as_ref().and_then(|p| p.lock().unwrap().map(|a| a.to_string()));
-                    ctx.set_status(State::Connecting, link, peer, "Đang bắt tay bảo mật với thiết bị...");
-                }
-                if let Err(e) = session.handle_datagram_from(last_rx_peer_key, &dg, Instant::now()) {
-                    match e {
-                        rv_session::SessionError::RateLimited => {
-                            warn!("handshake rate limited");
+        let mut got_rx = false;
+        let max_rx_batch = if established { 64 } else { 1 };
+        for _ in 0..max_rx_batch {
+            let rx_res = if established {
+                session.io_mut().try_recv()
+            } else {
+                session.io_mut().recv(Duration::from_millis(2))
+            };
+            match rx_res {
+                Ok(Some(dg)) => {
+                    got_rx = true;
+                    if let Some(p) = &lan_peer {
+                        if let Some(addr) = *p.lock().unwrap() {
+                            last_rx_peer_key = rv_session::peer_key(&addr);
                         }
-                        rv_session::SessionError::Locked(ms) => {
-                            warn!("peer locked out after wrong OTP ({ms} ms left)");
-                            if !established {
-                                let msg = format!("Sai mã OTP nhiều lần, thiết bị bị khóa tạm thời ({} giây)", ms / 1000 + 1);
-                                let (l, p) = (link, ctx.peer.clone());
-                                ctx.set_status(State::Waiting, l, p, &msg);
+                    }
+                    if !established && !connecting {
+                        connecting = true;
+                        let peer = lan_peer.as_ref().and_then(|p| p.lock().unwrap().map(|a| a.to_string()));
+                        ctx.set_status(State::Connecting, link, peer, "Đang bắt tay bảo mật với thiết bị...");
+                    }
+                    if let Err(e) = session.handle_datagram_from(last_rx_peer_key, &dg, Instant::now()) {
+                        match e {
+                            rv_session::SessionError::RateLimited => {
+                                warn!("handshake rate limited");
+                            }
+                            rv_session::SessionError::Locked(ms) => {
+                                warn!("peer locked out after wrong OTP ({ms} ms left)");
+                                if !established {
+                                    let msg = format!("Sai mã OTP nhiều lần, thiết bị bị khóa tạm thời ({} giây)", ms / 1000 + 1);
+                                    let (l, p) = (link, ctx.peer.clone());
+                                    ctx.set_status(State::Waiting, l, p, &msg);
+                                }
+                            }
+                            e => {
+                                last_session_err = e.to_string();
+                                warn!("session: {e}");
                             }
                         }
-                        e => {
-                            last_session_err = e.to_string();
-                            warn!("session: {e}");
-                        }
                     }
                 }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!("link lost: {e}");
-                ctx.sh.ready.store(false, Ordering::Relaxed);
-                return Ok(End::Reopen);
+                Ok(None) => break,
+                Err(e) => {
+                    warn!("link lost: {e}");
+                    ctx.sh.ready.store(false, Ordering::Relaxed);
+                    return Ok(End::Reopen);
+                }
             }
         }
         if last_tick.elapsed() >= Duration::from_millis(100) {
@@ -1536,6 +1648,14 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                         ctx.send_stream_config(&mut session);
                     }
                 }
+                Ok(VideoEvent::Bitrate(bps)) => {
+                    if let Some(a) = ctx.active.as_mut() {
+                        a.bitrate_bps = bps;
+                        if established {
+                            ctx.send_stream_config_only(&mut session);
+                        }
+                    }
+                }
                 Ok(VideoEvent::Stats { fps, kbps, encode_ms }) => {
                     ctx.last_video_kbps = kbps;
                     last_stats = Some((fps, kbps, encode_ms));
@@ -1550,6 +1670,7 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
 
         if !established {
             // Drop anything queued while nobody was listening.
+            pending_video = None;
             while ctx.vrx.try_recv().is_ok() {}
             while ctx.arx.try_recv().is_ok() {}
             while ctx.curx.try_recv().is_ok() {}
@@ -1559,7 +1680,9 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
             let _ = session.send_control(ControlMessage::RequestLog);
             info!("đã gửi yêu cầu lấy log từ thiết bị Android");
         }
+        let mut did_work = got_rx;
         while let Ok(u) = ctx.curx.try_recv() {
+            did_work = true;
             let msg = match u {
                 CursorUpdate::Shape { w, h, hot_x, hot_y, rgba } => ControlMessage::CursorShape { w, h, hot_x, hot_y, rgba },
                 CursorUpdate::Pos { x, y, visible } => ControlMessage::CursorPos { x, y, visible },
@@ -1570,8 +1693,14 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
             session.set_loss(0.0); // ordered, lossless pipe: FEC parity is wasted bytes
         }
         loop {
-            match ctx.vrx.try_recv() {
+            let next = if let Some(v) = pending_video.take() {
+                Ok(v)
+            } else {
+                ctx.vrx.try_recv()
+            };
+            match next {
                 Ok(v) => {
+                    did_work = true;
                     if let Err(e) = session.send_video_frame(v.frame_id, v.ts_us, &v.data, v.key) {
                         warn!("video send ({} B, key={}): {e}", v.data.len(), v.key);
                         ctx.sh.idr.store(true, Ordering::Relaxed);
@@ -1594,6 +1723,7 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
             }
         }
         while let Ok(au) = ctx.arx.try_recv() {
+            did_work = true;
             let _ = session.send_audio(au.seq, au.ts_us, FRAME_MS, CHANNELS_RATE, au.payload);
         }
 
@@ -1615,6 +1745,16 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                 }
             }
         }
+
+        // Wait up to 1 ms for the next encoded video frame so video dispatch has ~0 ms latency
+        // instead of stalling on an unrelated receive timeout.
+        if !did_work {
+            match ctx.vrx.recv_timeout(Duration::from_millis(1)) {
+                Ok(v) => pending_video = Some(v),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err("video thread stopped".into()),
+            }
+        }
     }
 }
 
@@ -1630,6 +1770,7 @@ fn run(argv: Vec<String>) -> Result<(), String> {
         }
     };
     control::set_json_mode(a.json);
+    let _timer = HighResTimerGuard::new();
     let dpi_line = crate::session_state::set_dpi_aware();
     if crate::session_state::running_as_system() {
         info!("service: chạy dưới LocalSystem — theo dõi được desktop khóa/Winlogon (ghi hình + điều khiển khi khóa máy)");
@@ -1760,7 +1901,7 @@ fn run(argv: Vec<String>) -> Result<(), String> {
     }
 
     let start = Instant::now();
-    let (vtx, vrx) = mpsc::sync_channel::<VideoOut>(3);
+    let (vtx, vrx) = mpsc::sync_channel::<VideoOut>(4);
     let (atx, arx) = mpsc::sync_channel::<AudioOut>(64);
     let (evtx, evrx) = mpsc::channel::<VideoEvent>();
     let (curtx, curx) = mpsc::channel::<CursorUpdate>();
@@ -1898,10 +2039,12 @@ mod tests {
         assert_eq!(fit_size(1920, 1080, 2800, 1752), (1920, 1080));
         // 16:10 panel into a 16:9 request: scaled by the tighter side, not stretched
         assert_eq!(fit_size(2880, 1800, 1920, 1080), (1728, 1080));
-        // tablet 2800x1752 vs panel 2880x1800: 16:10 stays ~16:10
+        // tablet 2800x1752 vs panel 2880x1800: 16:10 stays ~16:10 (snaps cleanly to 2800x1752)
         let (w, h) = fit_size(2880, 1800, 2800, 1752);
         assert!(w <= 2800 && h <= 1752);
         assert!(((w as f64 / h as f64) - 1.6).abs() < 0.002);
+        // 2800x1752 (~1.598) into 2560x1600 (1.600) snaps to 2560x1600 instead of odd 2556x1600
+        assert_eq!(fit_size(2800, 1752, 2560, 1600), (2560, 1600));
         // only one side limited
         assert_eq!(fit_size(2000, 1000, 1000, 5000), (1000, 500));
     }

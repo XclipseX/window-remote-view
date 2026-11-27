@@ -280,7 +280,85 @@ mod imp {
                 return Err("SudoVDA đã thêm màn hình nhưng Windows chưa bật nó sau 10 giây".into());
             }
             info!("sudovda: monitor is {} after {} ms", me.gdi_name, t0.elapsed().as_millis());
+            ensure_display_mode(&me.gdi_name, mode);
             Ok(me)
+        }
+    }
+
+    /// Ensures `gdi_name` is actually running at `mode` (especially refresh rate, e.g. 120 Hz,
+    /// since Windows sometimes defaults newly attached virtual monitors to 60 Hz).
+    fn ensure_display_mode(gdi_name: &str, mode: DisplayMode) {
+        let wname = wide(gdi_name);
+        // SAFETY: standard EnumDisplaySettingsW / ChangeDisplaySettingsExW with sized DEVMODEW.
+        unsafe {
+            let mut cur = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
+            if !EnumDisplaySettingsW(PCWSTR(wname.as_ptr()), ENUM_CURRENT_SETTINGS, &mut cur).as_bool() {
+                warn!("sudovda: EnumDisplaySettingsW({gdi_name}, CURRENT) failed");
+                return;
+            }
+            info!(
+                "sudovda: {gdi_name} active mode {}x{}@{}Hz (requested {}x{}@{}Hz)",
+                cur.dmPelsWidth, cur.dmPelsHeight, cur.dmDisplayFrequency, mode.width, mode.height, mode.refresh_hz
+            );
+            if cur.dmPelsWidth == mode.width
+                && cur.dmPelsHeight == mode.height
+                && cur.dmDisplayFrequency == mode.refresh_hz
+            {
+                return;
+            }
+            let mut best: Option<DEVMODEW> = None;
+            let mut i = 0u32;
+            loop {
+                let mut dm = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
+                if !EnumDisplaySettingsW(PCWSTR(wname.as_ptr()), ENUM_DISPLAY_SETTINGS_MODE(i), &mut dm).as_bool() {
+                    break;
+                }
+                i += 1;
+                if dm.dmPelsWidth == mode.width && dm.dmPelsHeight == mode.height {
+                    if dm.dmDisplayFrequency == mode.refresh_hz {
+                        best = Some(dm);
+                        break;
+                    }
+                    let better = match best {
+                        None => true,
+                        Some(b) => {
+                            let dm_ok = dm.dmDisplayFrequency <= mode.refresh_hz;
+                            let b_ok = b.dmDisplayFrequency <= mode.refresh_hz;
+                            match (dm_ok, b_ok) {
+                                (true, false) => true,
+                                (false, true) => false,
+                                _ => dm.dmDisplayFrequency > b.dmDisplayFrequency,
+                            }
+                        }
+                    };
+                    if better {
+                        best = Some(dm);
+                    }
+                }
+            }
+            let Some(mut target) = best else {
+                warn!(
+                    "sudovda: {gdi_name} has no enumerated mode matching {}x{} (staying at {}x{}@{}Hz)",
+                    mode.width, mode.height, cur.dmPelsWidth, cur.dmPelsHeight, cur.dmDisplayFrequency
+                );
+                return;
+            };
+            target.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+            let r = ChangeDisplaySettingsExW(PCWSTR(wname.as_ptr()), Some(&target), None, CDS_UPDATEREGISTRY, None);
+            if r != DISP_CHANGE_SUCCESSFUL {
+                warn!(
+                    "sudovda: ChangeDisplaySettingsExW({gdi_name}, {}x{}@{}Hz) returned {}",
+                    target.dmPelsWidth, target.dmPelsHeight, target.dmDisplayFrequency, r.0
+                );
+                return;
+            }
+            let mut after = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
+            if EnumDisplaySettingsW(PCWSTR(wname.as_ptr()), ENUM_CURRENT_SETTINGS, &mut after).as_bool() {
+                info!(
+                    "sudovda: {gdi_name} mode applied -> {}x{}@{}Hz",
+                    after.dmPelsWidth, after.dmPelsHeight, after.dmDisplayFrequency
+                );
+            }
         }
     }
 

@@ -760,7 +760,15 @@ impl AmfEncoder {
         match codec {
             AmfCodec::Hevc => {
                 // CRITICAL: HevcUsage MUST be set FIRST because AMF resets dependent presets on Usage change.
-                set_req(HEVC_USAGE, AMFVariantStruct::from_i64(HEVC_USAGE_ULTRA_LOW_LATENCY))?;
+                if encoder.set_property(HEVC_USAGE, AMFVariantStruct::from_i64(HEVC_USAGE_ULTRA_LOW_LATENCY))
+                    != AMF_OK
+                {
+                    log(
+                        crate::control::Level::Warn,
+                        "amf: HevcUsage ULTRA_LOW_LATENCY rejected; falling back to LOW_LATENCY",
+                    );
+                    set_req(HEVC_USAGE, AMFVariantStruct::from_i64(HEVC_USAGE_LOW_LATENCY))?;
+                }
                 set_opt(HEVC_LOW_LATENCY_MODE, AMFVariantStruct::from_bool(true));
                 set_opt(HEVC_QUALITY_PRESET, AMFVariantStruct::from_i64(HEVC_QUALITY_PRESET_SPEED));
                 set_req(HEVC_RATE_CONTROL_METHOD, AMFVariantStruct::from_i64(HEVC_RC_CBR))?;
@@ -768,7 +776,7 @@ impl AmfEncoder {
                 set_opt(HEVC_PEAK_BITRATE, AMFVariantStruct::from_i64(peak_bps));
                 set_opt(HEVC_VBV_BUFFER_SIZE, AMFVariantStruct::from_i64(vbv_bits));
                 set_req(HEVC_FRAME_RATE, AMFVariantStruct::from_rate(fps, 1))?;
-                set_req(HEVC_FRAME_SIZE, AMFVariantStruct::from_size(w, h))?;
+                set_opt(HEVC_FRAME_SIZE, AMFVariantStruct::from_size(w, h));
                 set_opt(HEVC_PROFILE, AMFVariantStruct::from_i64(HEVC_PROFILE_MAIN));
                 set_opt(
                     HEVC_HEADER_INSERTION_MODE,
@@ -777,18 +785,26 @@ impl AmfEncoder {
                 set_opt(HEVC_GOP_SIZE, AMFVariantStruct::from_i64(gop));
                 set_opt(HEVC_GOPS_PER_IDR, AMFVariantStruct::from_i64(1));
                 set_opt(HEVC_FILLER_DATA_ENABLE, AMFVariantStruct::from_bool(false));
+                set_opt("HevcRateControlSkipFrameEnable", AMFVariantStruct::from_bool(false));
                 set_opt(HEVC_RATE_CONTROL_PREANALYSIS_ENABLE, AMFVariantStruct::from_bool(false));
                 set_opt(HEVC_PRE_ANALYSIS_ENABLE, AMFVariantStruct::from_bool(false));
                 set_opt(HEVC_ENABLE_VBAQ, AMFVariantStruct::from_bool(false));
                 set_opt(HEVC_QUERY_TIMEOUT, AMFVariantStruct::from_i64(QUERY_TIMEOUT_MS));
-                set_opt(HEVC_ENGINE_TYPE, AMFVariantStruct::from_i64(AMF_MEMORY_DX11 as i64));
                 if surface_fmt == AMF_SURFACE_NV12 {
                     set_opt(HEVC_NOMINAL_RANGE, AMFVariantStruct::from_i64(HEVC_NOMINAL_RANGE_STUDIO));
                 }
             }
             AmfCodec::H264 => {
                 // CRITICAL: Usage MUST be set FIRST because AMF resets dependent presets on Usage change.
-                set_req(AVC_USAGE, AMFVariantStruct::from_i64(AVC_USAGE_ULTRA_LOW_LATENCY))?;
+                if encoder.set_property(AVC_USAGE, AMFVariantStruct::from_i64(AVC_USAGE_ULTRA_LOW_LATENCY))
+                    != AMF_OK
+                {
+                    log(
+                        crate::control::Level::Warn,
+                        "amf: AVC Usage ULTRA_LOW_LATENCY rejected; falling back to LOW_LATENCY",
+                    );
+                    set_req(AVC_USAGE, AMFVariantStruct::from_i64(AVC_USAGE_LOW_LATENCY))?;
+                }
                 set_opt(AVC_LOW_LATENCY_MODE, AMFVariantStruct::from_bool(true));
                 set_opt(AVC_QUALITY_PRESET, AMFVariantStruct::from_i64(AVC_QUALITY_PRESET_SPEED));
                 set_req(AVC_RATE_CONTROL_METHOD, AMFVariantStruct::from_i64(AVC_RC_CBR))?;
@@ -796,12 +812,13 @@ impl AmfEncoder {
                 set_opt(AVC_PEAK_BITRATE, AMFVariantStruct::from_i64(peak_bps));
                 set_opt(AVC_VBV_BUFFER_SIZE, AMFVariantStruct::from_i64(vbv_bits));
                 set_req(AVC_FRAME_RATE, AMFVariantStruct::from_rate(fps, 1))?;
-                set_req(AVC_FRAME_SIZE, AMFVariantStruct::from_size(w, h))?;
+                set_opt(AVC_FRAME_SIZE, AMFVariantStruct::from_size(w, h));
                 set_opt(AVC_PROFILE, AMFVariantStruct::from_i64(AVC_PROFILE_HIGH));
                 set_opt(AVC_MAX_CONSECUTIVE_BPICTURES, AMFVariantStruct::from_i64(0));
                 set_opt(AVC_B_PICTURES_PATTERN, AMFVariantStruct::from_i64(0));
                 set_opt(AVC_IDR_PERIOD, AMFVariantStruct::from_i64(gop));
                 set_opt(AVC_FILLER_DATA_ENABLE, AMFVariantStruct::from_bool(false));
+                set_opt("RateControlSkipFrameEnable", AMFVariantStruct::from_bool(false));
                 // Upstream VideoEncoderVCE.h defines RateControlPreanalysisEnable as amf_int64 (0=disabled);
                 // fall back to bool(false) if an older runtime expects bool.
                 if encoder.set_property(
@@ -820,16 +837,32 @@ impl AmfEncoder {
         Ok(())
     }
 
-    fn drain_one_output(&self) -> Result<Option<Vec<u8>>> {
-        let (res, maybe_data) = self.encoder.query_output();
-        match (res, maybe_data) {
-            (AMF_OK, Some(data)) => {
-                let buf = data.query_buffer()?;
-                Ok(Some(buf.copy_bytes()))
+    /// Polls `QueryOutput` up to `max_wait` when the driver returns `AMF_REPEAT`
+    /// (some Radeon drivers do not block inside `QueryOutput` even when QueryTimeout is set).
+    fn drain_one_output_wait(&self, max_wait: std::time::Duration) -> Result<Option<Vec<u8>>> {
+        let start = std::time::Instant::now();
+        let mut spins = 0u32;
+        loop {
+            let (res, maybe_data) = self.encoder.query_output();
+            match (res, maybe_data) {
+                (AMF_OK, Some(data)) => {
+                    let buf = data.query_buffer()?;
+                    return Ok(Some(buf.copy_bytes()));
+                }
+                (AMF_REPEAT, _) => {
+                    if start.elapsed() >= max_wait {
+                        return Ok(None);
+                    }
+                    spins += 1;
+                    if spins <= 3 {
+                        std::thread::yield_now();
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_micros(300));
+                    }
+                }
+                (AMF_EOF, _) | (AMF_OK, None) => return Ok(None),
+                (other, _) => return Err(amf_err("Component::QueryOutput", other)),
             }
-            (AMF_REPEAT, _) | (AMF_EOF, _) => Ok(None),
-            (AMF_OK, None) => Ok(None),
-            (other, _) => Err(amf_err("Component::QueryOutput", other)),
         }
     }
 
@@ -873,7 +906,7 @@ impl AmfEncoder {
         let mut drained: Option<Vec<u8>> = None;
         let mut submit_res = self.encoder.submit_input(surface.as_data_ptr());
         if submit_res == AMF_INPUT_FULL {
-            drained = self.drain_one_output()?;
+            drained = self.drain_one_output_wait(std::time::Duration::from_millis(10))?;
             submit_res = self.encoder.submit_input(surface.as_data_ptr());
         }
         // Release our wrapper ref immediately; AMF retains its own ref until HW encode completes.
@@ -890,7 +923,12 @@ impl AmfEncoder {
             other => return Err(amf_err("Component::SubmitInput", other)),
         }
 
-        match self.drain_one_output()? {
+        let wait = if self.frame_no <= 3 {
+            std::time::Duration::from_millis(100)
+        } else {
+            std::time::Duration::from_millis(25)
+        };
+        match self.drain_one_output_wait(wait)? {
             Some(bytes) => Ok(bytes),
             None => Ok(if force_idr { Vec::new() } else { drained.unwrap_or_default() }),
         }

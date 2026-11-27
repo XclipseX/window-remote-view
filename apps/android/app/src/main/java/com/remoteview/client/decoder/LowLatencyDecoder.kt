@@ -10,6 +10,7 @@ import android.os.HandlerThread
 import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
+import com.remoteview.client.RvLog
 import java.util.concurrent.atomic.AtomicLong
 
 // UNBUILT: chưa biên dịch. Theo docs/research-2-ket-qua-gemini.md (mục A) và research-1 (Agent 4).
@@ -257,6 +258,7 @@ class LowLatencyDecoder(
                 }
             }
             Log.w(TAG, "Tất cả bậc đều thất bại với ${pick.name}; thử codec khác")
+            RvLog.w("decoder: tất cả bậc đều thất bại với ${pick.name}, thử codec khác")
             failedNames += pick.name
         }
         listener.onFatal("Mọi bộ giải mã đều thất bại")
@@ -280,6 +282,7 @@ class LowLatencyDecoder(
             return c
         } catch (e: Exception) {
             Log.w(TAG, "Tier '${tier.label}' thất bại trên ${pick.name}: $e")
+            RvLog.w("decoder: bậc '${tier.label}' thất bại trên ${pick.name} (${width}x$height@$fps): ${e.javaClass.simpleName}: ${e.message}")
             runCatching { c?.release() }
             return null
         }
@@ -487,6 +490,7 @@ class LowLatencyDecoder(
         override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
             if (codec !== this@LowLatencyDecoder.codec) return
             Log.e(TAG, "CodecException transient=${e.isTransient} recoverable=${e.isRecoverable}: $e")
+            RvLog.e("decoder: CodecException transient=${e.isTransient} recoverable=${e.isRecoverable}: ${e.diagnosticInfo}")
             if (e.isTransient) return
             handler?.post {
                 if (e.isRecoverable) flush() else recreate(escalate = true)

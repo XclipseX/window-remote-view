@@ -242,11 +242,20 @@ impl DesktopDuplicator {
         let idx = pick_output_index(&infos, prefer)
             .ok_or_else(|| HostError::Os("no attached DXGI output".into()))?;
         let Found { adapter, output, info } = all.swap_remove(idx);
+        let refresh_hz = unsafe {
+            let wname: Vec<u16> = info.name.encode_utf16().chain(Some(0)).collect();
+            let mut dm = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
+            if EnumDisplaySettingsW(PCWSTR(wname.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm).as_bool() {
+                dm.dmDisplayFrequency
+            } else {
+                0
+            }
+        };
         crate::control::log(
             crate::control::Level::Info,
             &format!(
-                "capture: DXGI adapter '{}' output {} {:?} (adapter #{} output #{})",
-                info.adapter_name, info.name, info.desktop_rect, info.adapter_index, info.output_index
+                "capture: DXGI adapter '{}' output {} {:?} @{}Hz (adapter #{} output #{})",
+                info.adapter_name, info.name, info.desktop_rect, refresh_hz, info.adapter_index, info.output_index
             ),
         );
         unsafe {

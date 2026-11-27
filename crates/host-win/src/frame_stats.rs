@@ -7,15 +7,18 @@ use std::collections::VecDeque;
 
 pub const WINDOW_SECS: f64 = 10.0;
 pub const MAX_FRAMES: usize = 1200;
+/// Inter-frame gaps longer than this are static-screen idle periods (keepalives),
+/// excluded from mean/variance/1% low so static desktops do not report fake stutter.
+pub const IDLE_GAP_MS: f64 = 500.0;
 
 /// Summary published in the `stats` JSON event. All zero while no interval was seen yet.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct FrameSummary {
     /// Frames sent during the last second.
     pub fps_now: f64,
-    /// 1000 / mean frame time over the window.
+    /// 1000 / mean frame time over the window (excluding idle gaps > `IDLE_GAP_MS`).
     pub fps_avg: f64,
-    /// 1000 / mean of the worst 1 % frame times (at least one sample).
+    /// 1000 / mean of the worst 1 % frame times (at least one sample, excluding idle gaps).
     pub fps_low1: f64,
     pub frame_ms_mean: f64,
     pub frame_ms_std: f64,
@@ -54,17 +57,25 @@ impl FrameStats {
 
     pub fn summary(&mut self, now_s: f64) -> FrameSummary {
         self.prune(now_s);
-        let n = self.items.len();
-        if n == 0 {
+        if self.items.is_empty() {
             return FrameSummary::default();
         }
         let fps_now = self.items.iter().filter(|(t, _)| now_s - *t < 1.0 - 1e-9).count() as f64;
-        let mean = self.items.iter().map(|(_, d)| d).sum::<f64>() / n as f64;
-        let var = self.items.iter().map(|(_, d)| (d - mean).powi(2)).sum::<f64>() / n as f64;
-        let mut sorted: Vec<f64> = self.items.iter().map(|(_, d)| *d).collect();
-        sorted.sort_by(|a, b| b.total_cmp(a));
+        let mut active: Vec<f64> = self
+            .items
+            .iter()
+            .map(|(_, d)| *d)
+            .filter(|&d| d > 0.0 && d <= IDLE_GAP_MS)
+            .collect();
+        let n = active.len();
+        if n == 0 {
+            return FrameSummary { fps_now, ..FrameSummary::default() };
+        }
+        let mean = active.iter().sum::<f64>() / n as f64;
+        let var = active.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / n as f64;
+        active.sort_by(|a, b| b.total_cmp(a));
         let k = n.div_ceil(100).max(1);
-        let worst = sorted[..k].iter().sum::<f64>() / k as f64;
+        let worst = active[..k].iter().sum::<f64>() / k as f64;
         let inv = |ms: f64| if ms > 0.0 { 1000.0 / ms } else { 0.0 };
         FrameSummary {
             fps_now,
@@ -156,5 +167,18 @@ mod tests {
         let (mut s, t) = feed(&[100.0; 50]); // 10 fps for 5 s
         let r = s.summary(t);
         assert_eq!(r.fps_now, 10.0);
+    }
+
+    #[test]
+    fn idle_gaps_do_not_skew_mean_or_low1() {
+        let mut iv = vec![10.0; 40];
+        iv.push(1000.0); // 1s static-screen keepalive
+        iv.extend(vec![10.0; 40]);
+        let (mut s, t) = feed(&iv);
+        let r = s.summary(t);
+        close(r.frame_ms_mean, 10.0);
+        close(r.fps_avg, 100.0);
+        close(r.fps_low1, 100.0);
+        close(r.frame_ms_var, 0.0);
     }
 }

@@ -272,7 +272,7 @@ impl D3dPath {
                 pInputSurfaceRight: ManuallyDrop::new(None),
                 ppFutureSurfacesRight: std::ptr::null_mut(),
             };
-            let r = self.vctx.VideoProcessorBlt(&self.vp, out_view, 0, &[stream.clone()]);
+            let r = self.vctx.VideoProcessorBlt(&self.vp, out_view, 0, std::slice::from_ref(&stream));
             drop(ManuallyDrop::into_inner(stream.pInputSurface));
             r.map_err(|e| err("VideoProcessorBlt", e))?;
             // Submit the blit before the (async, possibly other-queue) MFT reads the texture.
@@ -454,13 +454,17 @@ impl MfEncoder {
             }
 
             let codec_api = transform.cast::<ICodecAPI>().ok();
-            if let Some(api) = &codec_api {
-                // Best effort: not every MFT supports every property.
-                let _ = api.SetValue(&CODECAPI_AVLowLatencyMode, &VARIANT_bool(true));
+            let apply_ll = |api: &ICodecAPI| -> (bool, bool) {
+                let ll = api.SetValue(&CODECAPI_AVLowLatencyMode, &VARIANT_bool(true)).is_ok();
+                let spd = api.SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &VARIANT_u32(0)).is_ok();
                 let _ = api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &VARIANT_u32(0)); // CBR
                 let _ = api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &VARIANT_u32(cfg.bitrate_bps));
                 let _ = api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT_u32(cfg.fps.max(1) * 3600));
                 let _ = api.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &VARIANT_u32(0));
+                (ll, spd)
+            };
+            if let Some(api) = &codec_api {
+                let _ = apply_ll(api);
             }
 
             // Output type first, then input type (encoder requirement).
@@ -472,6 +476,15 @@ impl MfEncoder {
             transform
                 .SetInputType(0, &in_t, 0)
                 .map_err(|e| err(&format!("{friendly}: SetInputType(NV12)"), e))?;
+
+            // Re-apply after media type negotiation (AMD MFT can reset low-latency/speed defaults).
+            if let Some(api) = &codec_api {
+                let (ll, spd) = apply_ll(api);
+                log(
+                    crate::control::Level::Info,
+                    &format!("mf: {friendly}: low_latency={ll} speed_preset={spd}"),
+                );
+            }
 
             let _ = transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
             transform

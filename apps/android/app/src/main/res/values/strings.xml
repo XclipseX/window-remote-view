@@ -28,6 +28,7 @@
     <string name="codec_av1">AV1</string>
     <string name="settings_hw_decode">Giải mã bằng phần cứng</string>
     <string name="settings_hw_decode_hint">Tắt để buộc dùng giải mã phần mềm (chậm, tốn pin)</string>
+    <string name="settings_hw_decode_off_warning">Đang giải mã bằng CPU phần mềm — FPS sẽ rất thấp. Nên bật lại Giải mã phần cứng.</string>
     <string name="settings_allow_av1">Cho phép AV1 ở chế độ Tự động</string>
     <string name="settings_raw_typing">Chế độ gõ thô (Raw typing)</string>
     <string name="settings_raw_typing_hint">Gửi phím vật lý thay vì ký tự Unicode; để UniKey/EVKey trên Windows xử lý Telex</string>

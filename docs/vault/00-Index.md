@@ -16,8 +16,9 @@ updated: 2026-11-27
 
 ## Known bugs / gotchas
 - Tab S10+ Android 17 không bật được USB tethering
+- [[bugs/2026-11-27-low-fps-timer-sw-decoder]] – tối ưu FPS 120 Hz (timer 1ms, tách vòng lặp session, AMF/MF speed, SudoVDA 120Hz, FramePresenter, xuất log GUI)
 
 ## Recent sessions
 - Bàn giao Gemini: [[../handoff/01-BAO-CAO-BAN-GIAO]]
-- [[sessions/2026-11-27]] (màn ảo SudoVDA, dịch vụ SYSTEM, AMD AMF gốc, OpenH264 đa slice, RTT/decode HUD, LAN UDP, hardening)
+- [[sessions/2026-11-27]] (màn ảo SudoVDA, dịch vụ SYSTEM, AMD AMF gốc, OpenH264 đa slice, RTT/decode HUD, LAN UDP, tối ưu FPS 120Hz)
 - [[sessions/2026-11-26]] (USB auto-pair, single exe)

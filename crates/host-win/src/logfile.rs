@@ -102,7 +102,9 @@ pub fn logs_dir() -> PathBuf {
 }
 
 fn is_log_of(name: &str, prefix: &str) -> bool {
-    name.starts_with(&format!("{prefix}-")) && name.ends_with(".log")
+    name.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|rest| rest.as_bytes().first().is_some_and(u8::is_ascii_digit) && rest.ends_with(".log"))
 }
 
 /// `remoteview-*.log` files in `dir`, newest first (names embed the timestamp).
@@ -179,10 +181,12 @@ pub fn write_line(level: &str, msg: &str) {
     }
 }
 
-/// Files for the "export logs" zip: the current + previous GUI log, plus every
-/// received Android log. Newest first within each group.
+/// Files for the "export logs" zip: newest 2 GUI logs, newest 2 standalone host logs,
+/// newest 2 service logs, plus up to 4 newest received Android logs.
 pub fn export_set(dir: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = list_logs(dir, PREFIX).into_iter().take(2).collect();
+    v.extend(list_logs(dir, "remoteview-host").into_iter().take(2));
+    v.extend(list_logs(dir, "remoteview-service").into_iter().take(2));
     let mut android: Vec<PathBuf> = fs::read_dir(dir)
         .map(|rd| {
             rd.filter_map(Result::ok)
@@ -196,7 +200,8 @@ pub fn export_set(dir: &Path) -> Vec<PathBuf> {
         })
         .unwrap_or_default();
     android.sort();
-    v.extend(android);
+    android.reverse();
+    v.extend(android.into_iter().take(4));
     v
 }
 
@@ -476,5 +481,24 @@ mod tests {
         assert!(g.should_log("denied"));
         assert!(!g.should_log("denied"));
         assert_eq!(g.recovered(), Some(1));
+    }
+
+    #[test]
+    fn export_set_keeps_gui_logs_when_service_logs_exist() {
+        let dir = std::env::temp_dir().join(format!("rv-export-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("remoteview-20261127-144810.log"), b"gui").unwrap();
+        fs::write(dir.join("remoteview-service-20261127-145500.log"), b"svc1").unwrap();
+        fs::write(dir.join("remoteview-service-20261127-145600.log"), b"svc2").unwrap();
+        fs::write(dir.join("android-sm-x826b-20261127-145645.log"), b"and").unwrap();
+        let names: Vec<String> = export_set(&dir)
+            .into_iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        assert!(names.contains(&"remoteview-20261127-144810.log".to_string()), "GUI log missing: {names:?}");
+        assert!(names.contains(&"remoteview-service-20261127-145600.log".to_string()), "service log missing: {names:?}");
+        assert!(names.contains(&"android-sm-x826b-20261127-145645.log".to_string()), "android log missing: {names:?}");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

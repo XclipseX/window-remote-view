@@ -196,6 +196,7 @@ class SessionController(
     @Volatile private var effectiveFps = baseFps
     @Volatile private var currentQuality = settings.qualityPercent
     @Volatile private var lastLogUploadReqMs = 0L
+    @Volatile private var lastDropNoHandleMs = 0L
 
     val liveQuality: Int get() = currentQuality
     val liveFps: Int get() = effectiveFps
@@ -290,7 +291,11 @@ class SessionController(
                         recordError("nativePushDatagram: ${t.message}")
                     }
                 } else {
-                    RvLog.w("datagram ${data.size}B tới khi chưa có phiên native (handle=$h) -> bỏ")
+                    val now = SystemClock.elapsedRealtime()
+                    if (now - lastDropNoHandleMs >= 2000L) {
+                        lastDropNoHandleMs = now
+                        RvLog.w("datagram ${data.size}B tới khi chưa có phiên native (handle=$h) -> bỏ")
+                    }
                 }
             }
             override fun onClosed(reason: String?) {
@@ -436,7 +441,10 @@ class SessionController(
         presenter = pres
         val started = dec.start(s)
         videoStarted = started
-        RvLog.i("decoder start=$started name=${dec.info?.codecName} ${w}x$h@$fps tid=${dec.codecThreadTid}")
+        RvLog.i(
+            "decoder start=$started name=${dec.info?.codecName} tier=${dec.info?.tierLabel ?: "-"} " +
+                "hwPref=${settings.hardwareDecode} direct=${settings.directPresent} ${w}x$h@$fps tid=${dec.codecThreadTid}",
+        )
         if (!started) dbgLastError = "decoder không khởi động được"
         if (started) {
             // Đăng ký luồng giải mã MediaCodec thực tế vào ADPF để governor tăng xung đúng thread.
