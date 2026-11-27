@@ -65,10 +65,69 @@ fn gop_frames_for_fps(fps: u32) -> i64 {
     (fps.max(1) as i64 * 10).clamp(60, 1200)
 }
 
+/// Caps a single HEVC Access Unit size (in bits) to 1.5x the average per-frame
+/// budget so scene cuts cannot burst past the USB AOA receive ring and cause
+/// decode/1% low spikes.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn max_au_size_bits(bps: u32, fps: u32) -> i64 {
+    let per_frame = (bps as i64).max(200_000) / (fps.max(1) as i64);
+    (per_frame * 3 / 2).clamp(256_000, 100_000_000)
+}
+
+/// Extracts the first HEVC SPS NAL unit (type 33, up to 64 bytes) from an
+/// Annex-B bitstream for one-time startup diagnostic logging.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn extract_hevc_sps_hex(annex_b: &[u8]) -> Option<String> {
+    let mut i = 0usize;
+    let n = annex_b.len();
+    while i + 4 < n {
+        let sc = if annex_b[i] == 0 && annex_b[i + 1] == 0 && annex_b[i + 2] == 1 {
+            3
+        } else if i + 4 < n
+            && annex_b[i] == 0
+            && annex_b[i + 1] == 0
+            && annex_b[i + 2] == 0
+            && annex_b[i + 3] == 1
+        {
+            4
+        } else {
+            i += 1;
+            continue;
+        };
+        let nal_start = i + sc;
+        if nal_start >= n {
+            break;
+        }
+        let nal_type = (annex_b[nal_start] >> 1) & 0x3F;
+        if nal_type == 33 {
+            let mut end = nal_start + 1;
+            while end + 3 <= n {
+                if annex_b[end] == 0
+                    && annex_b[end + 1] == 0
+                    && (annex_b[end + 2] == 1
+                        || (end + 3 < n && annex_b[end + 2] == 0 && annex_b[end + 3] == 1))
+                {
+                    break;
+                }
+                end += 1;
+            }
+            let slice = &annex_b[nal_start..end.min(nal_start + 64)];
+            let mut hex = String::with_capacity(slice.len() * 2);
+            for b in slice {
+                use std::fmt::Write;
+                let _ = write!(&mut hex, "{b:02x}");
+            }
+            return Some(hex);
+        }
+        i = nal_start + 1;
+    }
+    None
+}
+
 #[cfg(windows)]
 const RING_LEN: usize = 4;
 #[cfg(windows)]
-const QUERY_TIMEOUT_MS: i64 = 50;
+const QUERY_TIMEOUT_MS: i64 = 4;
 
 #[cfg(windows)]
 fn log(level: crate::control::Level, msg: &str) {
@@ -611,6 +670,7 @@ pub struct AmfEncoder {
     cfg: EncoderConfig,
     runtime_version: String,
     frame_no: u64,
+    logged_sps: bool,
 }
 
 #[cfg(windows)]
@@ -684,6 +744,7 @@ impl AmfEncoder {
             cfg,
             runtime_version: lib.version_string(),
             frame_no: 0,
+            logged_sps: false,
         };
         log(
             crate::control::Level::Info,
@@ -737,6 +798,7 @@ impl AmfEncoder {
         let target_bps = (cfg.bitrate_bps as i64).max(100_000);
         let peak_bps = target_bps;
         let vbv_bits = vbv_buffer_bits(cfg.bitrate_bps, fps);
+        let max_au_bits = max_au_size_bits(cfg.bitrate_bps, fps);
         let gop = gop_frames_for_fps(fps);
         let (w, h) = (cfg.width as i32, cfg.height as i32);
 
@@ -775,6 +837,7 @@ impl AmfEncoder {
                 set_req(HEVC_TARGET_BITRATE, AMFVariantStruct::from_i64(target_bps))?;
                 set_opt(HEVC_PEAK_BITRATE, AMFVariantStruct::from_i64(peak_bps));
                 set_opt(HEVC_VBV_BUFFER_SIZE, AMFVariantStruct::from_i64(vbv_bits));
+                set_opt(HEVC_MAX_AU_SIZE, AMFVariantStruct::from_i64(max_au_bits));
                 set_req(HEVC_FRAME_RATE, AMFVariantStruct::from_rate(fps, 1))?;
                 set_opt(HEVC_FRAME_SIZE, AMFVariantStruct::from_size(w, h));
                 set_opt(HEVC_PROFILE, AMFVariantStruct::from_i64(HEVC_PROFILE_MAIN));
@@ -782,12 +845,17 @@ impl AmfEncoder {
                     HEVC_HEADER_INSERTION_MODE,
                     AMFVariantStruct::from_i64(HEVC_HEADER_INSERTION_IDR_ALIGNED),
                 );
+                set_opt(HEVC_MAX_NUM_REFRAMES, AMFVariantStruct::from_i64(1));
+                set_opt(HEVC_MAX_LTR_FRAMES, AMFVariantStruct::from_i64(0));
                 set_opt(HEVC_GOP_SIZE, AMFVariantStruct::from_i64(gop));
-                set_opt(HEVC_GOPS_PER_IDR, AMFVariantStruct::from_i64(1));
+                // 0 = no periodic IDR spikes; initial IDR + client PLI handle recovery cleanly.
+                set_opt(HEVC_GOPS_PER_IDR, AMFVariantStruct::from_i64(0));
+                set_opt(HEVC_INTRA_REFRESH_NUM_CTBS_PER_SLOT, AMFVariantStruct::from_i64(0));
                 set_opt(HEVC_FILLER_DATA_ENABLE, AMFVariantStruct::from_bool(false));
                 set_opt("HevcRateControlSkipFrameEnable", AMFVariantStruct::from_bool(false));
                 set_opt(HEVC_RATE_CONTROL_PREANALYSIS_ENABLE, AMFVariantStruct::from_bool(false));
                 set_opt(HEVC_PRE_ANALYSIS_ENABLE, AMFVariantStruct::from_bool(false));
+                set_opt(HEVC_HIGH_MOTION_QUALITY_BOOST_ENABLE, AMFVariantStruct::from_bool(false));
                 set_opt(HEVC_ENABLE_VBAQ, AMFVariantStruct::from_bool(false));
                 set_opt(HEVC_QUERY_TIMEOUT, AMFVariantStruct::from_i64(QUERY_TIMEOUT_MS));
                 if surface_fmt == AMF_SURFACE_NV12 {
@@ -929,7 +997,15 @@ impl AmfEncoder {
             std::time::Duration::from_millis(25)
         };
         match self.drain_one_output_wait(wait)? {
-            Some(bytes) => Ok(bytes),
+            Some(bytes) => {
+                if !self.logged_sps && self.codec == AmfCodec::Hevc {
+                    if let Some(hex) = extract_hevc_sps_hex(&bytes) {
+                        self.logged_sps = true;
+                        log(crate::control::Level::Info, &format!("amf: hevc-sps={hex}"));
+                    }
+                }
+                Ok(bytes)
+            }
             None => Ok(if force_idr { Vec::new() } else { drained.unwrap_or_default() }),
         }
     }
@@ -951,6 +1027,12 @@ impl AmfEncoder {
         let _ = self
             .encoder
             .set_property(k_vbv, AMFVariantStruct::from_i64(vbv_bits));
+        if self.codec == AmfCodec::Hevc {
+            let max_au = max_au_size_bits(bps, self.cfg.fps);
+            let _ = self
+                .encoder
+                .set_property(HEVC_MAX_AU_SIZE, AMFVariantStruct::from_i64(max_au));
+        }
 
         if r_target == AMF_OK {
             self.cfg.bitrate_bps = bps;
@@ -986,10 +1068,24 @@ mod tests {
     fn vbv_and_gop_helpers_stay_bounded() {
         assert_eq!(vbv_buffer_bits(14_000_000, 120), 3_500_000);
         assert_eq!(vbv_buffer_bits(1_000_000, 60), 512_000);
+        assert_eq!(max_au_size_bits(60_000_000, 120), 750_000);
+        assert_eq!(max_au_size_bits(1_000_000, 120), 256_000);
         assert_eq!(gop_frames_for_fps(60), 600);
         assert_eq!(gop_frames_for_fps(120), 1200);
         assert_eq!(gop_frames_for_fps(240), 1200);
         assert_eq!(AmfCodec::Hevc.as_str(), "hevc");
         assert_eq!(AmfCodec::H264.as_str(), "h264");
+    }
+
+    #[test]
+    fn extract_hevc_sps_hex_finds_nal_type_33() {
+        // VPS (type 32: 0x40 0x01) + SPS (type 33: 0x42 0x01 0xaa 0xbb) + PPS (type 34: 0x44 0x01)
+        let stream = [
+            0, 0, 0, 1, 0x40, 0x01, 0x11,
+            0, 0, 0, 1, 0x42, 0x01, 0xaa, 0xbb,
+            0, 0, 1, 0x44, 0x01, 0x22,
+        ];
+        assert_eq!(extract_hevc_sps_hex(&stream).as_deref(), Some("4201aabb"));
+        assert_eq!(extract_hevc_sps_hex(&[0, 0, 0, 1, 0x40, 0x01]), None);
     }
 }

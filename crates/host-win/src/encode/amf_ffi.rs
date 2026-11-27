@@ -445,6 +445,11 @@ pub const HEVC_HEADER_INSERTION_IDR_ALIGNED: i64 = 2;
 
 pub const HEVC_GOP_SIZE: &str = "HevcGOPSize";
 pub const HEVC_GOPS_PER_IDR: &str = "HevcGOPSPerIDR";
+pub const HEVC_MAX_NUM_REFRAMES: &str = "HevcMaxNumRefFrames";
+pub const HEVC_MAX_LTR_FRAMES: &str = "HevcMaxOfLTRFrames";
+pub const HEVC_MAX_AU_SIZE: &str = "HevcMaxAUSize";
+pub const HEVC_INTRA_REFRESH_NUM_CTBS_PER_SLOT: &str = "HevcIntraRefreshNumCTBsPerSlot";
+pub const HEVC_HIGH_MOTION_QUALITY_BOOST_ENABLE: &str = "HevcHighMotionQualityBoostEnable";
 pub const HEVC_FILLER_DATA_ENABLE: &str = "HevcFillerDataEnable";
 pub const HEVC_RATE_CONTROL_PREANALYSIS_ENABLE: &str = "HevcRateControlPreAnalysisEnable";
 pub const HEVC_PRE_ANALYSIS_ENABLE: &str = "HevcEnablePreAnalysis";

@@ -14,9 +14,9 @@ use crate::{LinkError, Result};
 const READ_BUF: usize = 64 * 1024;
 
 /// Writer thread coalesces queued records into one bulk write up to roughly
-/// this many bytes (the stream is length-framed, so the receiver does not care
-/// where transfer boundaries fall).
-const WRITE_BATCH: usize = 256 * 1024;
+/// this many bytes (32 KiB matches Android `f_accessory.c`'s `RX_REQ_MAX(2) *
+/// BULK_BUFFER_SIZE(16384)` DMA ring to minimize syscalls without stalling xHCI).
+const WRITE_BATCH: usize = 32 * 1024;
 /// Max records queued for the writer thread; a full queue blocks `send`
 /// (back-pressure, same as the old synchronous write).
 const WRITE_QUEUE: usize = 1024;
@@ -79,7 +79,15 @@ impl UsbDatagramLink {
     /// Build from separate read/write halves. `reader` must return
     /// `ErrorKind::TimedOut`/`WouldBlock`/`Interrupted` for "no data yet" and
     /// `Ok(0)` or another error for a closed stream.
-    pub fn from_stream<R, W>(mut reader: R, writer: W) -> Self
+    pub fn from_stream<R, W>(reader: R, writer: W) -> Self
+    where
+        R: Read + Send + 'static,
+        W: Write + Send + 'static,
+    {
+        Self::from_stream_opts(reader, writer, false)
+    }
+
+    fn from_stream_opts<R, W>(mut reader: R, writer: W, pad_usb_short_packet: bool) -> Self
     where
         R: Read + Send + 'static,
         W: Write + Send + 'static,
@@ -110,6 +118,9 @@ impl UsbDatagramLink {
                             loop {
                                 match dec.next_record() {
                                     Ok(Some(r)) => {
+                                        if pad_usb_short_packet && r.is_empty() {
+                                            continue; // zero-length USB short-packet pad record
+                                        }
                                         st.dg_in.fetch_add(1, Ordering::Relaxed);
                                         if tx.send(r).is_err() {
                                             return;
@@ -143,20 +154,38 @@ impl UsbDatagramLink {
         let whandle = std::thread::Builder::new()
             .name("rv-usb-write".into())
             .spawn(move || {
-                let mut batch: Vec<u8> = Vec::with_capacity(WRITE_BATCH + crate::framing::MAX_RECORD + 4);
-                while let Ok(first) = wrx.recv() {
+                let mut batch: Vec<u8> = Vec::with_capacity(WRITE_BATCH + crate::framing::MAX_RECORD + 8);
+                let mut pending: Option<Vec<u8>> = None;
+                loop {
+                    let first = match pending.take() {
+                        Some(r) => r,
+                        None => match wrx.recv() {
+                            Ok(r) => r,
+                            Err(_) => break,
+                        },
+                    };
                     batch.clear();
                     batch.extend_from_slice(&first);
                     let mut recs = 1u64;
-                    // Stop early enough that one more record still fits the cap.
-                    while batch.len() + crate::framing::MAX_RECORD + 4 <= WRITE_BATCH {
+                    while batch.len() < WRITE_BATCH {
                         match wrx.try_recv() {
                             Ok(r) => {
-                                batch.extend_from_slice(&r);
-                                recs += 1;
+                                if batch.len() + r.len() <= WRITE_BATCH {
+                                    batch.extend_from_slice(&r);
+                                    recs += 1;
+                                } else {
+                                    pending = Some(r);
+                                    break;
+                                }
                             }
                             Err(_) => break,
                         }
+                    }
+                    // Avoid USB 2.0 (512B) / USB 3.x (1024B) short-packet stall in Android
+                    // `f_accessory.c`: if a transfer is an exact multiple of 512 bytes, append a
+                    // 4-byte zero-length pad record so `acc_read()` wakes up immediately.
+                    if pad_usb_short_packet && !batch.is_empty() && batch.len() % 512 == 0 {
+                        batch.extend_from_slice(&[0u8; 4]);
                     }
                     if let Err(e) = writer.write_all(&batch).and_then(|_| writer.flush()) {
                         st.write_errors.fetch_add(1, Ordering::Relaxed);
@@ -195,7 +224,7 @@ impl UsbDatagramLink {
     pub fn from_aoa(dev: crate::aoa::AoaDevice) -> Self {
         let loc = dev.location();
         let (r, w) = dev.into_halves();
-        let l = Self::from_stream(r, w);
+        let l = Self::from_stream_opts(r, w, true);
         if let Ok(mut g) = l.stats.location.lock() {
             *g = loc;
         }
@@ -343,5 +372,34 @@ mod tests {
         assert_eq!(st.raw_in_bytes.load(Ordering::Relaxed), total);
         assert_eq!(st.dg_in.load(Ordering::Relaxed), 4);
         assert!(st.first_bytes().unwrap().starts_with("7B:"));
+    }
+
+    #[test]
+    fn aoa_pads_512_byte_multiples_and_skips_pad_on_read() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut l = UsbDatagramLink::from_stream_opts(
+            Chunked { data: vec![], pos: 0, chunk: 1, tick: false },
+            Spy(log.clone()),
+            true,
+        );
+        // 508 bytes payload + 4 bytes length prefix = exact 512 bytes -> must pad to 516 bytes.
+        let payload = vec![0xABu8; 508];
+        l.send(&payload);
+        let t0 = std::time::Instant::now();
+        while l.stats().raw_out_bytes.load(Ordering::Relaxed) < 516 && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let wire = log.lock().unwrap().concat();
+        assert_eq!(wire.len(), 516);
+        assert_eq!(&wire[512..516], &[0, 0, 0, 0]);
+
+        // Reading that padded wire back with pad_usb_short_packet=true yields only the 1 real record.
+        let r = UsbDatagramLink::from_stream_opts(
+            Chunked { data: wire, pos: 0, chunk: 64, tick: false },
+            std::io::sink(),
+            true,
+        );
+        assert_eq!(r.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(), payload);
+        assert_eq!(r.recv_timeout(Duration::from_millis(80)).unwrap(), None);
     }
 }

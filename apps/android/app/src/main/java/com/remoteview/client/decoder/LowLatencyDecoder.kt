@@ -221,7 +221,7 @@ class LowLatencyDecoder(
         synchronized(lifecycleLock) {
             this.surface = surface
             if (thread == null) {
-                val t = HandlerThread("rv-codec").also { it.start() }
+                val t = HandlerThread("rv-codec", android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY).also { it.start() }
                 thread = t
                 handler = Handler(t.looper)
                 val tid = t.threadId
@@ -241,9 +241,11 @@ class LowLatencyDecoder(
             var startedCodec: MediaCodec? = null
             var startedTier: Tier? = null
             var startedIdx = 0
+            var loggedVendorCaps = false
             for ((i, tier) in tiers.withIndex()) {
                 if (i < minTier && i != tiers.lastIndex) continue
-                val c = tryTier(pick, tier, surf)
+                val c = tryTier(pick, tier, surf, logVendorCaps = !loggedVendorCaps)
+                loggedVendorCaps = true
                 if (c != null) {
                     startedCodec = c
                     startedTier = tier
@@ -257,7 +259,7 @@ class LowLatencyDecoder(
                 RvLog.w("decoder: ${pick.name} thất bại lượt đầu, đợi 80ms để HAL giải phóng rồi thử lại PLAIN")
                 try { Thread.sleep(80L) } catch (_: InterruptedException) {}
                 val plainTier = tiers.last()
-                val c = tryTier(pick, plainTier, surf)
+                val c = tryTier(pick, plainTier, surf, logVendorCaps = false)
                 if (c != null) {
                     startedCodec = c
                     startedTier = plainTier
@@ -290,20 +292,40 @@ class LowLatencyDecoder(
         return false
     }
 
-    private fun tryTier(pick: CodecPick, tier: Tier, surf: Surface): MediaCodec? {
+    private fun tryTier(pick: CodecPick, tier: Tier, surf: Surface, logVendorCaps: Boolean): MediaCodec? {
         var c: MediaCodec? = null
         try {
             c = MediaCodec.createByCodecName(pick.name)
             val supported: Set<String>? =
                 if (Build.VERSION.SDK_INT >= 31) c.supportedVendorParameters.toSet() else null
-            val format = tier.buildFormat(pick.mime, width, height, fps, supported)
+            if (logVendorCaps) {
+                val main10 = runCatching {
+                    c.codecInfo.getCapabilitiesForType(pick.mime).profileLevels.any {
+                        it.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10
+                    }
+                }.getOrDefault(false)
+                val interestingKeys = supported
+                    ?.filter { k ->
+                        val l = k.lowercase()
+                        l.contains("mtk") || l.contains("low") || l.contains("vdec") || l.contains("vpp") || l.contains("lat") || l.contains("dvfs")
+                    }
+                    ?.sorted()
+                    ?.joinToString(",")
+                    ?: "-"
+                RvLog.i("decoder caps: ${pick.name} main10=$main10 vendor=[$interestingKeys]")
+            }
+            val appliedKeys = ArrayList<String>()
+            val format = tier.buildFormat(pick.mime, width, height, fps, supported, appliedKeys)
             val cb = Callback(c)
             c.setCallback(cb, handler)
             c.configure(format, surf, null, 0)
             // Không bao giờ kéo giãn: giữ tỉ lệ (SurfaceView đã được đặt đúng tỉ lệ luồng, nên vừa khít).
             runCatching { c.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT) }
             c.start()
-            Log.i(TAG, "Tier '${tier.label}' OK trên ${pick.name}")
+            Log.i(TAG, "Tier '${tier.label}' OK trên ${pick.name} applied=$appliedKeys")
+            if (appliedKeys.isNotEmpty()) {
+                RvLog.i("decoder tier='${tier.label}' applied=[${appliedKeys.joinToString(",")}]")
+            }
             return c
         } catch (e: Exception) {
             Log.w(TAG, "Tier '${tier.label}' thất bại trên ${pick.name}: $e")
@@ -536,7 +558,14 @@ class LowLatencyDecoder(
         val intKeys: List<Pair<String, Int>>,
     ) {
         /** Luôn tạo MediaFormat mới cho mỗi bậc. */
-        fun buildFormat(mime: String, w: Int, h: Int, fps: Int, supported: Set<String>?): MediaFormat {
+        fun buildFormat(
+            mime: String,
+            w: Int,
+            h: Int,
+            fps: Int,
+            supported: Set<String>?,
+            appliedKeys: MutableList<String>? = null,
+        ): MediaFormat {
             val f = MediaFormat.createVideoFormat(mime, w, h)
             f.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             f.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, MAX_INPUT_SIZE)
@@ -553,6 +582,7 @@ class LowLatencyDecoder(
                     continue
                 }
                 f.setInteger(key, value)
+                appliedKeys?.add("$key=$value")
             }
             return f
         }
@@ -568,7 +598,7 @@ class LowLatencyDecoder(
 
         private val PLAIN = Tier("plain", standardLowLatency = false, operatingRate = null, intKeys = emptyList())
 
-        /** Thang bậc theo research-2: mỗi bậc là một MediaFormat mới. */
+        /** Thang bậc theo research-2 + tối ưu MediaTek Dimensity C2: mỗi bậc là một MediaFormat mới. */
         fun buildTiers(vendor: Vendor, fps: Int): List<Tier> = when (vendor) {
             Vendor.EXYNOS -> listOf(
                 // KHÔNG đặt KEY_OPERATING_RATE trên Exynos (Moonlight: crash/treo).
@@ -585,18 +615,25 @@ class LowLatencyDecoder(
                 PLAIN,
             )
             Vendor.MTK -> listOf(
+                // Dimensity C2 (MT6989 / Tab S10+): tắt toàn bộ VPP (MEMC/scaler/tuner giữ 1-2 khung),
+                // giữ xung CPU điều phối giải mã và cắt timeout BufferQueue; lọc an toàn qua supportedVendorParameters.
                 Tier(
                     "mtk-0", true, fps,
                     listOf(
-                        "vendor.mtk-codec2.low-latency-mode" to 1,
-                        "vendor.mtk-codec2.game-mode" to 1,
+                        "vendor.mtk.vdec.cpu.boost.mode.value" to 1,
+                        "vendor.mtk.vdec.buffer.fetch.timeout.ms.value" to 2,
+                        "vendor.mtk.vdec.bq.guard.interval.time.value" to 2,
+                        "vendor.mtk.ext.vdec.vpp.disabled.value" to 1,
+                        "vendor.mtk.ext.vdec.vpp.motion.intpl.disabled.value" to 1,
+                        "vendor.mtk.ext.vdec.vpp.quality.tuner.disabled.value" to 1,
+                        "vendor.mtk.ext.vdec.vpp.resolution.scaler.disabled.value" to 1,
                         "vendor.low-latency.enable" to 1,
                     ),
                 ),
-                // bậc 1: bỏ mtk-codec2.*
-                Tier("mtk-1", true, fps, listOf("vendor.low-latency.enable" to 1)),
-                // bậc 2: bỏ cả KEY_LOW_LATENCY
-                Tier("mtk-2", false, fps, listOf("vendor.low-latency.enable" to 1)),
+                // bậc 1: chuẩn AOSP KEY_LOW_LATENCY + operating-rate, không đụng vendor.*
+                Tier("mtk-1", true, fps, emptyList()),
+                // bậc 2: bỏ operating-rate
+                Tier("mtk-2", true, null, emptyList()),
                 PLAIN,
             )
             Vendor.QTI -> listOf(

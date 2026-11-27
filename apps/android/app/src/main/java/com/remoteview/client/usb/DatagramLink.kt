@@ -95,6 +95,7 @@ abstract class FramedStreamLink(override val name: String) : DatagramLink {
      * nên luôn đọc với buffer >= 16 KiB.
      */
     private fun readLoop(input: InputStream) {
+        runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY) }
         val chunk = ByteArray(READ_CHUNK)
         var acc = ByteArray(READ_CHUNK * 2)
         var have = 0
@@ -115,6 +116,10 @@ abstract class FramedStreamLink(override val name: String) : DatagramLink {
                         ((acc[off + 2].toInt() and 0xFF) shl 8) or
                         (acc[off + 3].toInt() and 0xFF)
                     if (len < 0 || len > MAX_RECORD) throw IOException("record dài bất thường: $len")
+                    if (len == 0) {
+                        off += 4 // bản ghi đệm tránh USB short-packet stall (512B/1024B)
+                        continue
+                    }
                     if (have - off - 4 < len) break
                     val payload = acc.copyOfRange(off + 4, off + 4 + len)
                     off += 4 + len
