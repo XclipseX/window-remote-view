@@ -7,8 +7,10 @@ mod control;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod driver;
 mod host;
+mod job;
 mod logexport;
 mod service;
+mod tray;
 mod update;
 mod util;
 
@@ -30,8 +32,9 @@ fn main() -> eframe::Result {
         Some(service::SERVICE_FLAG) => std::process::exit(service::run_service()),
         _ => {}
     }
-    init_logging();
-    update::cleanup_old();
+    let dpi_info = rv_host_win::session_state::set_dpi_aware();
+    init_logging(&dpi_info);
+    let just_updated = update::cleanup_old();
     let demo = std::env::args().any(|a| a == "--demo");
     // Written by the "Tự chạy cùng Windows" registry entry: start minimized and share right away.
     let minimized = std::env::args().any(|a| a == "--minimized");
@@ -48,7 +51,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "RemoteView",
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, demo, minimized)))),
+        Box::new(move |cc| Ok(Box::new(app::App::new(cc, demo, minimized, just_updated)))),
     )
 }
 
@@ -77,7 +80,7 @@ fn install_vdd_main(_dir: Option<String>) -> i32 {
 
 /// Starts the log file (`%LOCALAPPDATA%\\RemoteView\\logs\\remoteview-<date-time>.log`) from app
 /// start and records the environment (version, commit, OS, GPUs, outputs).
-fn init_logging() {
+fn init_logging(dpi_info: &str) {
     use rv_host_win::logfile::{init, write_line, PREFIX};
     let path = init(PREFIX);
     std::panic::set_hook(Box::new(|info| write_line("error", &format!("PANIC: {info}"))));
@@ -85,6 +88,9 @@ fn init_logging() {
         write_line("info", &l);
     }
     write_line("info", &format!("build sha: {}", update::BUILD_SHA));
+    if !dpi_info.is_empty() {
+        write_line("info", dpi_info);
+    }
     match &path {
         Some(p) => write_line("info", &format!("log file: {}", p.display())),
         None => eprintln!("cannot create a log file in {}", rv_host_win::logfile::logs_dir().display()),

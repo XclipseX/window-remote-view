@@ -3,6 +3,7 @@
 //! CI embeds the commit SHA (`RV_BUILD_SHA`); the release body contains
 //! "Bản build tự động từ commit <sha>". A different SHA means a newer build.
 
+use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
@@ -17,6 +18,7 @@ pub const RELEASE_URL: &str = "https://github.com/XclipseX/window-remote-view/re
 const ASSET_NAME: &str = "RemoteView.exe";
 const MIN_EXE_SIZE: u64 = 1024 * 1024;
 pub const OLD_NAME: &str = "RemoteView.old.exe";
+const NEW_NAME: &str = "RemoteView.new.exe";
 
 pub fn short_sha() -> &'static str {
     &BUILD_SHA[..BUILD_SHA.len().min(7)]
@@ -27,6 +29,7 @@ pub struct UpdateInfo {
     pub sha: String,
     pub download_url: String,
     pub size: u64,
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +56,45 @@ pub fn parse_sha(body: &str) -> Option<String> {
     (sha.len() >= 7).then(|| sha.to_ascii_lowercase())
 }
 
+fn valid_sha256(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(s.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Extracts the expected lowercase 64-hex SHA-256 digest for `asset_name`.
+///
+/// Checks the release body for `SHA256(<asset_name>): <64-hex>` (case-insensitive),
+/// then falls back to GitHub API `asset["digest"]` (`"sha256:<64-hex>"`).
+pub fn parse_sha256(body: &str, asset_name: &str, asset_digest: Option<&str>) -> Option<String> {
+    let needle = format!("sha256({asset_name}):").to_ascii_lowercase();
+    let lower = body.to_ascii_lowercase();
+    let mut offset = 0;
+    while let Some(rel) = lower[offset..].find(&needle) {
+        let start = offset + rel + needle.len();
+        let token = body[start..].trim_start().split(|c: char| !c.is_ascii_hexdigit()).next().unwrap_or("");
+        if let Some(hex) = valid_sha256(token) {
+            return Some(hex);
+        }
+        offset = start;
+    }
+    if let Some(d) = asset_digest {
+        let trimmed = d.trim();
+        let hex = trimmed
+            .get(..7)
+            .filter(|p| p.eq_ignore_ascii_case("sha256:"))
+            .map(|_| &trimmed[7..])
+            .unwrap_or(trimmed);
+        if let Some(hex) = valid_sha256(hex) {
+            return Some(hex);
+        }
+    }
+    None
+}
+
 /// True if `remote` is a different commit than `local` (prefix-tolerant).
 /// `dev` builds never report updates.
 pub fn is_newer(local: &str, remote: &str) -> bool {
@@ -64,15 +106,22 @@ pub fn is_newer(local: &str, remote: &str) -> bool {
 }
 
 pub fn evaluate(local: &str, release: &serde_json::Value) -> CheckResult {
-    let Some(sha) = release["body"].as_str().and_then(parse_sha) else {
+    let body = release["body"].as_str().unwrap_or("");
+    let Some(sha) = parse_sha(body) else {
         return CheckResult::Failed("không đọc được mã commit trong bản phát hành".into());
     };
     if !is_newer(local, &sha) {
         return CheckResult::UpToDate;
     }
     let asset = release["assets"].as_array().and_then(|a| a.iter().find(|x| x["name"] == ASSET_NAME));
-    match asset.and_then(|a| Some((a["browser_download_url"].as_str()?.to_string(), a["size"].as_u64().unwrap_or(0)))) {
-        Some((download_url, size)) => CheckResult::Available(UpdateInfo { sha, download_url, size }),
+    match asset.and_then(|a| {
+        Some((
+            a["browser_download_url"].as_str()?.to_string(),
+            a["size"].as_u64().unwrap_or(0),
+            parse_sha256(body, ASSET_NAME, a["digest"].as_str()),
+        ))
+    }) {
+        Some((download_url, size, sha256)) => CheckResult::Available(UpdateInfo { sha, download_url, size, sha256 }),
         None => CheckResult::Failed("bản phát hành không có RemoteView.exe".into()),
     }
 }
@@ -105,6 +154,25 @@ pub fn spawn_check(tx: Sender<UpdateMsg>, manual: bool, ctx: eframe::egui::Conte
     });
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Checks `actual_hex` against an optional expected SHA-256 digest.
+pub fn verify_sha256(actual_hex: &str, expected: Option<&str>) -> Result<(), String> {
+    if let Some(exp) = expected {
+        if !actual_hex.eq_ignore_ascii_case(exp) {
+            return Err(format!("sai mã kiểm tra SHA-256 (nhận {actual_hex}, mong đợi {exp})"));
+        }
+    }
+    Ok(())
+}
+
 /// `MZ` header and plausible size.
 pub fn verify_exe(path: &Path) -> Result<(), String> {
     let len = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
@@ -131,19 +199,35 @@ pub fn spawn_download(info: UpdateInfo, tx: Sender<UpdateMsg>, ctx: eframe::egui
 }
 
 fn download(info: &UpdateInfo, tx: &Sender<UpdateMsg>, ctx: &eframe::egui::Context) -> Result<PathBuf, String> {
-    let dest = std::env::temp_dir().join("RemoteView-update.exe");
+    let dest = std::env::current_exe()
+        .ok()
+        .map(|p| p.with_file_name(NEW_NAME))
+        .unwrap_or_else(|| std::env::temp_dir().join("RemoteView-update.exe"));
     let _ = std::fs::remove_file(&dest);
     let mut resp = agent().get(&info.download_url).call().map_err(|e| e.to_string())?;
     let total = resp.body().content_length().unwrap_or(info.size);
     let mut reader = resp.body_mut().as_reader();
     let mut f = std::fs::File::create(&dest).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
     let (mut buf, mut done, mut last) = (vec![0u8; 64 * 1024], 0u64, 0u64);
     loop {
-        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        let n = match reader.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                drop(f);
+                let _ = std::fs::remove_file(&dest);
+                return Err(e.to_string());
+            }
+        };
         if n == 0 {
             break;
         }
-        f.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        if let Err(e) = f.write_all(&buf[..n]) {
+            drop(f);
+            let _ = std::fs::remove_file(&dest);
+            return Err(e.to_string());
+        }
+        hasher.update(&buf[..n]);
         done += n as u64;
         if done - last > 256 * 1024 {
             last = done;
@@ -155,9 +239,18 @@ fn download(info: &UpdateInfo, tx: &Sender<UpdateMsg>, ctx: &eframe::egui::Conte
     drop(f);
     let _ = tx.send(UpdateMsg::Progress { done, total: done });
     if info.size > 0 && done != info.size {
+        let _ = std::fs::remove_file(&dest);
         return Err(format!("tải thiếu dữ liệu ({done}/{} byte)", info.size));
     }
-    verify_exe(&dest)?;
+    let actual_sha256 = hex_encode(&hasher.finalize());
+    if let Err(e) = verify_sha256(&actual_sha256, info.sha256.as_deref()) {
+        let _ = std::fs::remove_file(&dest);
+        return Err(e);
+    }
+    if let Err(e) = verify_exe(&dest) {
+        let _ = std::fs::remove_file(&dest);
+        return Err(e);
+    }
     Ok(dest)
 }
 
@@ -187,16 +280,36 @@ pub fn relaunch(exe: &Path) -> Result<(), String> {
 }
 
 /// Delete the leftover `RemoteView.old.exe` from a previous self-update.
-pub fn cleanup_old() {
-    if let Ok(cur) = std::env::current_exe() {
-        let _ = std::fs::remove_file(cur.with_file_name(OLD_NAME));
+/// Returns `true` if `RemoteView.old.exe` existed at startup (meaning this launch
+/// follows a self-update). Retries briefly in a background thread in case the
+/// exiting parent process has not finished unmapping the old image yet.
+pub fn cleanup_old() -> bool {
+    let Ok(cur) = std::env::current_exe() else {
+        return false;
+    };
+    let old = cur.with_file_name(OLD_NAME);
+    if !old.exists() {
+        return false;
     }
+    if std::fs::remove_file(&old).is_err() {
+        std::thread::spawn(move || {
+            for _ in 0..5 {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                if std::fs::remove_file(&old).is_ok() || !old.exists() {
+                    break;
+                }
+            }
+        });
+    }
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    const SAMPLE_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[test]
     fn sha_parse_and_compare() {
@@ -210,14 +323,61 @@ mod tests {
     }
 
     #[test]
+    fn parse_sha256_body_and_digest() {
+        let upper = SAMPLE_HASH.to_ascii_uppercase();
+        let body = format!("Bản build tự động từ commit abcdef1.\n- SHA256(RemoteView.exe): {upper}\n");
+        assert_eq!(parse_sha256(&body, ASSET_NAME, None).as_deref(), Some(SAMPLE_HASH));
+
+        // Case-insensitive header and asset name
+        let body_ci = format!("- sha256(remoteview.exe):  {SAMPLE_HASH}  ");
+        assert_eq!(parse_sha256(&body_ci, ASSET_NAME, None).as_deref(), Some(SAMPLE_HASH));
+
+        // Fallback to GitHub API asset digest
+        let digest = format!("sha256:{upper}");
+        assert_eq!(parse_sha256("no checksum here", ASSET_NAME, Some(&digest)).as_deref(), Some(SAMPLE_HASH));
+
+        // Invalid hex in body falls back to valid asset digest
+        let bad_body = "- SHA256(RemoteView.exe): not-a-real-hash\n";
+        assert_eq!(parse_sha256(bad_body, ASSET_NAME, Some(&digest)).as_deref(), Some(SAMPLE_HASH));
+
+        // Invalid lengths / non-hex rejected
+        assert_eq!(parse_sha256("- SHA256(RemoteView.exe): deadbeef", ASSET_NAME, None), None);
+        assert_eq!(parse_sha256("", ASSET_NAME, Some("sha256:1234")), None);
+        assert_eq!(parse_sha256("", ASSET_NAME, Some("sha256:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")), None);
+        // 65 hex chars rejected
+        let too_long = format!("- SHA256(RemoteView.exe): {SAMPLE_HASH}a");
+        assert_eq!(parse_sha256(&too_long, ASSET_NAME, None), None);
+    }
+
+    #[test]
     fn evaluate_release() {
         let rel = json!({
-            "body": "Bản build tự động từ commit abcdef1234.",
-            "assets": [{"name": "RemoteView.exe", "browser_download_url": "https://x/RemoteView.exe", "size": 5000000}]
+            "body": format!("Bản build tự động từ commit abcdef1234.\n- SHA256(RemoteView.exe): {SAMPLE_HASH}"),
+            "assets": [{
+                "name": "RemoteView.exe",
+                "browser_download_url": "https://x/RemoteView.exe",
+                "size": 5000000
+            }]
         });
         assert_eq!(evaluate("abcdef1", &rel), CheckResult::UpToDate);
         match evaluate("0000000", &rel) {
-            CheckResult::Available(i) => assert_eq!(i.download_url, "https://x/RemoteView.exe"),
+            CheckResult::Available(i) => {
+                assert_eq!(i.download_url, "https://x/RemoteView.exe");
+                assert_eq!(i.sha256.as_deref(), Some(SAMPLE_HASH));
+            }
+            o => panic!("{o:?}"),
+        }
+        let rel_digest = json!({
+            "body": "Bản build tự động từ commit abcdef1234.",
+            "assets": [{
+                "name": "RemoteView.exe",
+                "browser_download_url": "https://x/RemoteView.exe",
+                "size": 5000000,
+                "digest": format!("sha256:{SAMPLE_HASH}")
+            }]
+        });
+        match evaluate("0000000", &rel_digest) {
+            CheckResult::Available(i) => assert_eq!(i.sha256.as_deref(), Some(SAMPLE_HASH)),
             o => panic!("{o:?}"),
         }
         assert!(matches!(evaluate("0000000", &json!({"body": "x", "assets": []})), CheckResult::Failed(_)));
@@ -233,6 +393,11 @@ mod tests {
         good[..2].copy_from_slice(b"MZ");
         std::fs::write(&new, &good).unwrap();
         assert!(verify_exe(&new).is_ok());
+        let actual = hex_encode(&Sha256::digest(&good));
+        assert!(verify_sha256(&actual, Some(&actual)).is_ok());
+        assert!(verify_sha256(&actual, Some(&actual.to_ascii_uppercase())).is_ok());
+        assert!(verify_sha256(&actual, None).is_ok());
+        assert!(verify_sha256(&actual, Some(SAMPLE_HASH)).is_err());
         std::fs::write(dir.join("bad.exe"), vec![b'x'; 2 * 1024 * 1024]).unwrap();
         assert!(verify_exe(&dir.join("bad.exe")).is_err());
         std::fs::write(dir.join("small.exe"), b"MZ").unwrap();

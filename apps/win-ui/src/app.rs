@@ -70,13 +70,17 @@ pub struct App {
     vdd_present: bool,
     /// RemoteView service (shows / controls the lock screen) is registered.
     svc_present: bool,
+    /// Installed service points to a different exe or is still running the pre-update image.
+    svc_needs_refresh: bool,
     /// Connect to this device as soon as its driver install succeeds.
     connect_after_driver: Option<DeviceItem>,
     local_ip: String,
     demo: Option<Demo>,
     autostart_msg: Option<String>,
     ctx: egui::Context,
-    quit: bool,
+    really_quit: bool,
+    tray: Option<crate::tray::TrayHandle>,
+    tray_tip: String,
     upd_tx: std::sync::mpsc::Sender<crate::update::UpdateMsg>,
     upd_rx: Receiver<crate::update::UpdateMsg>,
     upd: UpdateState,
@@ -84,6 +88,10 @@ pub struct App {
     outputs: Vec<rv_host_win::capture::OutputInfo>,
     /// Result of the last "Xuất log" (success?, text).
     export_note: Option<(bool, String)>,
+    /// Delayed ZIP export timer after asking Android for its log over the active session.
+    pending_log_export: Option<Instant>,
+    /// Last time a concise `stats:` summary line was appended to the log file.
+    last_stats_log: Option<Instant>,
     /// Start sharing automatically once the driver/service auto-install is out of the way.
     pending_auto_share: bool,
     /// Launched with `--minimized` (autostart): minimize the window on the first frame.
@@ -166,13 +174,17 @@ impl App {
         ctx.set_fonts(fonts);
     }
 
-    pub fn new(cc: &eframe::CreationContext<'_>, demo: bool, minimized: bool) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, demo: bool, minimized: bool, just_updated: bool) -> Self {
         Self::setup_fonts(&cc.egui_ctx);
         Self::setup_style(&cc.egui_ctx);
         let (tx, rx) = new_channel();
         let (upd_tx, upd_rx) = std::sync::mpsc::channel();
         let cfg = Config::load();
         let pending_auto_share = !demo && (cfg.auto_share || minimized);
+        let svc_present = driver::service_installed();
+        let svc_repoint = crate::service::service_needs_repoint();
+        let svc_needs_refresh = cfg!(windows) && svc_present && (svc_repoint || just_updated);
+        let tray = crate::tray::TrayHandle::spawn(cc.egui_ctx.clone());
         let mut app = Self {
             cfg,
             page: Page::Home,
@@ -196,23 +208,36 @@ impl App {
             vdd_busy: false,
             vdd_tried: false,
             vdd_present: rv_host_win::sudovda::driver_present(),
-            svc_present: driver::service_installed(),
+            svc_present,
+            svc_needs_refresh,
             connect_after_driver: None,
             local_ip: util::local_ip(),
             demo: None,
             autostart_msg: None,
             ctx: cc.egui_ctx.clone(),
-            quit: false,
+            really_quit: false,
+            tray,
+            tray_tip: String::new(),
             upd_tx,
             upd_rx,
             upd: UpdateState::Idle,
             outputs: Vec::new(),
             export_note: None,
+            pending_log_export: None,
+            last_stats_log: None,
             pending_auto_share,
             minimize_first_frame: minimized && !demo,
         };
         if !demo {
             app.refresh_outputs();
+            if app.svc_needs_refresh {
+                let msg = if svc_repoint {
+                    "Dịch vụ RemoteView đang trỏ sang đường dẫn khác; nhấn \"Cập nhật dịch vụ\" để đồng bộ."
+                } else {
+                    "Ứng dụng vừa cập nhật; nhấn \"Cập nhật dịch vụ\" để khởi động lại dịch vụ RemoteView với bản mới."
+                };
+                app.log(LogLevel::Warn, msg.into());
+            }
             // Cài driver màn hình ảo + dịch vụ RemoteView (xem/điều khiển cả màn hình khóa) ngay lần
             // đầu mở app: một hộp thoại UAC, không cần bấm nút. Thiếu dịch vụ (driver đã có) vẫn chạy một lần.
             if cfg!(windows) && !app.cfg.vdd_auto_declined {
@@ -234,6 +259,7 @@ impl App {
             app.start();
             app.demo.as_mut().unwrap().started -= Duration::from_secs(5);
         }
+        app.update_tray_tooltip();
         app
     }
 
@@ -335,6 +361,8 @@ impl App {
         self.svc_present = driver::service_installed();
         match result {
             DriverResult::Installed => {
+                self.svc_needs_refresh = crate::service::service_needs_repoint();
+                let _ = crate::update::cleanup_old();
                 self.log(LogLevel::Info, "Đã cài driver màn hình ảo và dịch vụ RemoteView".into());
                 self.driver_note = Some((true, "Đã cài driver màn hình ảo và dịch vụ RemoteView (xem được cả màn hình khóa).".into()));
             }
@@ -388,6 +416,7 @@ impl App {
         self.error = None;
         self.stats = StatsEvent::default();
         self.fps_hist.clear();
+        self.last_stats_log = None;
         self.log(LogLevel::Info, format!("Bắt đầu chia sẻ ({})", self.cfg.mode.name()));
         if self.demo.is_some() || std::env::args().any(|a| a == "--demo") {
             self.demo = Some(Demo { started: Instant::now(), last_stats: Instant::now(), tick: 0 });
@@ -418,6 +447,7 @@ impl App {
         self.pin = None;
         self.devices.clear();
         self.fps_hist.clear();
+        self.last_stats_log = None;
     }
 
     fn send(&self, cmd: HostCmd) {
@@ -428,6 +458,19 @@ impl App {
 
     fn refresh_outputs(&mut self) {
         self.outputs = rv_host_win::capture::list_outputs().unwrap_or_default().into_iter().filter(|o| o.attached).collect();
+    }
+
+    /// Requests a fresh log upload from the connected Android client (when sharing)
+    /// before zipping all logs onto Desktop ~900 ms later.
+    fn request_export_logs(&mut self) {
+        if self.host.is_some() {
+            self.send(HostCmd::RequestLog);
+            self.pending_log_export = Some(Instant::now() + Duration::from_millis(900));
+            self.export_note = Some((true, "Đang thu thập log từ thiết bị nhận...".into()));
+            self.ctx.request_repaint_after(Duration::from_millis(950));
+        } else {
+            self.export_logs();
+        }
     }
 
     fn export_logs(&mut self) {
@@ -481,6 +524,19 @@ impl App {
                 while self.fps_hist.front().is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_secs(60)) {
                     self.fps_hist.pop_front();
                 }
+                let due = self.last_stats_log.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(5));
+                if due && (s.fps > 0.0 || s.width > 0) {
+                    self.last_stats_log = Some(now);
+                    let dec = s.decode_ms.map(|d| format!("{d:.1}ms")).unwrap_or_else(|| "-".into());
+                    let rtt = s.rtt_ms.map(|r| format!("{r:.1}ms")).unwrap_or_else(|| "-".into());
+                    rv_host_win::logfile::write_line(
+                        "info",
+                        &format!(
+                            "stats: fps={:.1} avg={:.1} low1={:.1} enc={:.1}ms dec={dec} rtt={rtt} kbps={} {}x{} {}",
+                            s.fps, s.fps_avg, s.fps_low1, s.encode_ms, s.bitrate_kbps, s.width, s.height, s.encoder
+                        ),
+                    );
+                }
                 self.stats = s;
             }
             HostEvent::Devices { items } => self.set_devices(items),
@@ -509,16 +565,21 @@ impl App {
                 }
                 UpdateMsg::Progress { done, total } => self.upd = UpdateState::Downloading(done, total),
                 UpdateMsg::Failed(e) => self.upd = UpdateState::Error(e),
-                UpdateMsg::Downloaded(path) => match crate::update::replace_self(&path) {
-                    Ok(exe) => {
-                        self.host = None; // stop the worker before restarting
-                        match crate::update::relaunch(&exe) {
-                            Ok(()) => std::process::exit(0),
-                            Err(e) => self.upd = UpdateState::Error(format!("không mở lại được: {e}")),
+                UpdateMsg::Downloaded(path) => {
+                    // Stop the worker first so no child process holds locks on the exe before swap.
+                    self.host = None;
+                    self.running = false;
+                    match crate::update::replace_self(&path) {
+                        Ok(exe) => {
+                            self.tray = None;
+                            match crate::update::relaunch(&exe) {
+                                Ok(()) => std::process::exit(0),
+                                Err(e) => self.upd = UpdateState::Error(format!("không mở lại được: {e}")),
+                            }
                         }
+                        Err(e) => self.upd = UpdateState::Error(e),
                     }
-                    Err(e) => self.upd = UpdateState::Error(e),
-                },
+                }
             }
         }
     }
@@ -564,8 +625,64 @@ impl App {
         }
     }
 
+    fn poll_tray(&mut self, ctx: &egui::Context) {
+        let mut actions = Vec::new();
+        if let Some(tray) = &self.tray {
+            while let Some(act) = tray.try_recv() {
+                actions.push(act);
+            }
+        }
+        for act in actions {
+            match act {
+                crate::tray::TrayAction::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                crate::tray::TrayAction::ToggleShare => {
+                    if self.running {
+                        self.stop();
+                    } else {
+                        self.start();
+                    }
+                }
+                crate::tray::TrayAction::Quit => {
+                    self.really_quit = true;
+                    self.host = None;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    fn update_tray_tooltip(&mut self) {
+        let Some(tray) = &self.tray else { return };
+        let tip = match self.view() {
+            View::Streaming => match self.status.as_ref().and_then(|s| s.peer.as_deref()) {
+                Some(peer) => format!("RemoteView — Đang truyền ({peer})"),
+                None => "RemoteView — Đang truyền...".to_string(),
+            },
+            View::Waiting | View::Starting | View::Connecting => "RemoteView — Đang chờ".to_string(),
+            View::Error => "RemoteView — Lỗi".to_string(),
+            View::Idle => "RemoteView — Đang chờ".to_string(),
+        };
+        if tip != self.tray_tip {
+            tray.set_tooltip(&tip);
+            self.tray_tip = tip;
+        }
+    }
+
     fn poll(&mut self) {
         self.poll_update();
+        if let Some(due) = self.pending_log_export {
+            let now = Instant::now();
+            if now >= due {
+                self.pending_log_export = None;
+                self.export_logs();
+            } else {
+                self.ctx.request_repaint_after(due - now);
+            }
+        }
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 UiMsg::Event(e) => self.handle_event(e),
@@ -767,6 +884,7 @@ impl App {
                 bitrate_kbps: (24000.0 + 4000.0 * (el * 0.7).sin()) as u32,
                 encode_ms: 3.4 + 0.5 * w,
                 rtt_ms: Some(7.0 + 2.0 * (el * 1.3).cos()),
+                decode_ms: Some(2.1 + 0.3 * f64::from(w.abs())),
                 encoder: "NVENC HEVC".into(),
                 width: 2560,
                 height: 1600,
@@ -830,7 +948,7 @@ impl App {
             ui.add_space(6.0);
             ui.weak(format!("Phiên bản {}", env!("CARGO_PKG_VERSION")));
             if ui.button("Thoát").clicked() {
-                self.quit = true;
+                self.really_quit = true;
             }
             if self.demo.is_some() {
                 ui.colored_label(Color32::from_rgb(230, 160, 40), "Chế độ demo");
@@ -1041,6 +1159,9 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 stat(ui, "Bitrate", format!("{:.1} Mbps", s.bitrate_kbps as f32 / 1000.0), None);
                 stat(ui, "Mã hóa", format!("{:.1} ms", s.encode_ms), None);
+                if let Some(d) = s.decode_ms {
+                    stat(ui, "Giải mã", format!("{d:.1} ms"), None);
+                }
                 stat(ui, "RTT", s.rtt_ms.map(|r| format!("{r:.0} ms")).unwrap_or_else(na), None);
                 stat(ui, "Bộ mã hóa", if s.encoder.is_empty() { na() } else { s.encoder.clone() }, None);
                 stat(ui, "Độ phân giải", if s.width > 0 { format!("{}×{}", s.width, s.height) } else { na() }, None);
@@ -1106,6 +1227,20 @@ impl App {
         egui::ScrollArea::vertical().show(ui, |ui| {
             if matches!(self.upd, UpdateState::Available(_) | UpdateState::Downloading(..) | UpdateState::Inaccessible) {
                 card(ui, |ui| self.update_ui(ui, true));
+            }
+            if self.svc_needs_refresh {
+                let mut refresh = false;
+                card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(Color32::from_rgb(230, 160, 40), RichText::new("Dịch vụ RemoteView cần cập nhật để dùng bản mới.").strong());
+                        if ui.add_enabled(!self.vdd_busy, egui::Button::new("Cập nhật dịch vụ")).clicked() {
+                            refresh = true;
+                        }
+                    });
+                });
+                if refresh {
+                    self.install_service();
+                }
             }
             self.status_card(ui);
             let big = if self.running {
@@ -1232,12 +1367,15 @@ impl App {
 
                     ui.label("Dịch vụ (màn hình khóa)");
                     ui.horizontal(|ui| {
-                        if self.svc_present {
+                        if self.svc_needs_refresh {
+                            ui.colored_label(Color32::from_rgb(230, 160, 40), "Cần cập nhật (dịch vụ đang chạy bản cũ / đường dẫn khác)");
+                        } else if self.svc_present {
                             ui.colored_label(Color32::from_rgb(60, 170, 90), "Đã cài (xem/điều khiển được màn hình khóa)");
                         } else {
                             ui.colored_label(Color32::from_rgb(230, 160, 40), "Chưa cài (khi khóa máy sẽ không thấy gì)");
                         }
-                        if ui.add_enabled(cfg!(windows) && !self.vdd_busy, egui::Button::new("Cài / cài lại")).clicked() {
+                        let btn = if self.svc_needs_refresh { "Cập nhật dịch vụ" } else { "Cài / cài lại" };
+                        if ui.add_enabled(cfg!(windows) && !self.vdd_busy, egui::Button::new(btn)).clicked() {
                             self.install_service();
                         }
                     });
@@ -1257,7 +1395,7 @@ impl App {
                 if let Some(m) = &self.autostart_msg {
                     ui.colored_label(Color32::from_rgb(230, 70, 70), m);
                 }
-                ui.checkbox(&mut self.cfg.minimize_to_tray, "Thu nhỏ xuống thanh tác vụ khi đóng cửa sổ");
+                ui.checkbox(&mut self.cfg.minimize_to_tray, "Thu nhỏ xuống khay hệ thống khi đóng cửa sổ");
                 ui.checkbox(&mut self.cfg.auto_update_check, "Tự kiểm tra cập nhật khi mở ứng dụng");
                 ui.horizontal(|ui| {
                     ui.label("Đường dẫn rv-host (gỡ lỗi)");
@@ -1295,9 +1433,8 @@ impl App {
             self.send(HostCmd::SetFps { fps: self.cfg.fps });
         }
         if self.cfg.resolution != before.resolution {
-            if let Some((width, height)) = self.cfg.resolution {
-                self.send(HostCmd::SetResolution { width, height });
-            }
+            let (width, height) = self.cfg.resolution.unwrap_or((0, 0));
+            self.send(HostCmd::SetResolution { width, height });
         }
     }
 
@@ -1349,8 +1486,13 @@ impl App {
             if ui.button("Xóa").clicked() {
                 self.logs.clear();
             }
-            if ui.button("Xuất log").on_hover_text("Nén log hiện tại, log trước đó và log Android đã nhận ra Desktop").clicked() {
-                self.export_logs();
+            let exporting = self.pending_log_export.is_some();
+            if ui
+                .add_enabled(!exporting, egui::Button::new("Xuất log"))
+                .on_hover_text("Tự thu thập log Android (nếu đang kết nối) và nén toàn bộ log ra Desktop")
+                .clicked()
+            {
+                self.request_export_logs();
             }
         });
         if let Some((ok, note)) = &self.export_note {
@@ -1400,14 +1542,25 @@ fn draw_qr(ui: &mut egui::Ui, data: &str, size: f32) {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+        self.poll_tray(ctx);
+        self.update_tray_tooltip();
         if std::mem::take(&mut self.minimize_first_frame) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            if self.cfg.minimize_to_tray && self.tray.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
         }
-        if ctx.input(|i| i.viewport().close_requested()) && self.cfg.minimize_to_tray && !self.quit {
+        if ctx.input(|i| i.viewport().close_requested()) && self.cfg.minimize_to_tray && !self.really_quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            if self.tray.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
         }
-        if self.quit {
+        if self.really_quit {
+            self.host = None;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         egui::SidePanel::left("nav").exact_width(190.0).resizable(false).show(ctx, |ui| self.sidebar(ui));
@@ -1422,6 +1575,7 @@ impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.cfg.save();
         self.host = None; // Drop: stop + kill child
+        self.tray = None;
     }
 }
 

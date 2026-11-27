@@ -3,7 +3,7 @@
 use crate::config::Mode;
 
 pub const ADB_PORT: u16 = 47810;
-pub const LAN_PORT: u16 = 47900;
+pub const LAN_PORT: u16 = 47800;
 
 pub fn port_for(mode: Mode) -> u16 {
     match mode {
@@ -136,10 +136,11 @@ mod tests {
 
     #[test]
     fn qr_payload_is_json() {
-        let p = qr_payload("123456", "192.168.1.5", 47900, Mode::Lan);
+        assert_eq!(port_for(Mode::Lan), 47800);
+        let p = qr_payload("123456", "192.168.1.5", LAN_PORT, Mode::Lan);
         let v: serde_json::Value = serde_json::from_str(&p).unwrap();
         assert_eq!(v["pin"], "123456");
-        assert_eq!(v["port"], 47900);
+        assert_eq!(v["port"], 47800);
         assert_eq!(v["mode"], "lan");
     }
 

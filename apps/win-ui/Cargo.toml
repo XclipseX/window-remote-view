@@ -23,6 +23,7 @@ qrcode = { version = "0.14", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
+sha2 = "0.10"
 ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -36,6 +37,9 @@ features = [
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
   "Win32_System_Threading",
+  "Win32_System_JobObjects",
+  "Win32_System_LibraryLoader",
+  "Win32_Graphics_Gdi",
   # service mode (`--service`), pipe transport and the elevated install
   "Win32_System_Services",
   "Win32_System_RemoteDesktop",

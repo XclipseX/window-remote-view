@@ -119,12 +119,20 @@ pub fn wdi_args(vid: u16, pid: u16) -> String {
     format!("--vid 0x{vid:04X} --pid 0x{pid:04X}{iid} --type 0 --name \"RemoteView USB\"")
 }
 
+#[cfg(any(feature = "embed-wdi", test))]
+fn wdi_extract_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("RemoteView")
+        .join("driver")
+}
+
 /// Where wdi-simple comes from: embedded bytes (extracted) or a sibling file.
 fn locate_wdi() -> Result<PathBuf, String> {
     #[cfg(feature = "embed-wdi")]
     {
-        let dir = std::env::temp_dir().join("RemoteView");
-        std::fs::create_dir_all(&dir).map_err(|e| format!("không tạo được thư mục tạm: {e}"))?;
+        let dir = wdi_extract_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| format!("không tạo được thư mục cài driver: {e}"))?;
         let p = dir.join("wdi-simple.exe");
         std::fs::write(&p, WDI_SIMPLE).map_err(|e| format!("không giải nén được wdi-simple.exe: {e}"))?;
         Ok(p)
@@ -162,7 +170,7 @@ fn run_elevated(exe: &std::path::Path, params: &str) -> DriverResult {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, TerminateProcess, WaitForSingleObject};
     use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
     use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
@@ -196,12 +204,15 @@ fn run_elevated(exe: &std::path::Path, params: &str) -> DriverResult {
         }
         // Installing + trusting the self-signed catalog can take a while.
         let waited = WaitForSingleObject(h, 180_000);
+        if waited != WAIT_OBJECT_0 {
+            let _ = TerminateProcess(h, 1);
+            let _ = WaitForSingleObject(h, 2_000);
+            let _ = CloseHandle(h);
+            return DriverResult::Failed("cài driver quá thời gian chờ".into());
+        }
         let mut code = 1u32;
         let got = GetExitCodeProcess(h, &mut code);
         let _ = CloseHandle(h);
-        if waited != WAIT_OBJECT_0 {
-            return DriverResult::Failed("cài driver quá thời gian chờ".into());
-        }
         if got.is_ok() && code == 0 {
             DriverResult::Installed
         } else {
@@ -218,6 +229,12 @@ mod tests {
     fn args_match_contract() {
         assert_eq!(wdi_args(0x18D1, 0x2D00), "--vid 0x18D1 --pid 0x2D00 --type 0 --name \"RemoteView USB\"");
         assert_eq!(wdi_args(0x18D1, 0x2D01), "--vid 0x18D1 --pid 0x2D01 --iid 0 --type 0 --name \"RemoteView USB\"");
+    }
+
+    #[test]
+    fn wdi_dir_is_scoped() {
+        let d = wdi_extract_dir();
+        assert!(d.ends_with(std::path::Path::new("RemoteView").join("driver")));
     }
 
     #[cfg(not(windows))]

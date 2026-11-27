@@ -48,6 +48,8 @@ pub struct StatsEvent {
     #[serde(default)]
     pub rtt_ms: Option<f32>,
     #[serde(default)]
+    pub decode_ms: Option<f64>,
+    #[serde(default)]
     pub encoder: String,
     #[serde(default)]
     pub width: u32,
@@ -133,6 +135,7 @@ pub enum HostCmd {
     SetFps { fps: u32 },
     SetResolution { width: u32, height: u32 },
     RequestIdr,
+    RequestLog,
     NewOtp,
     /// Retry the USB link now for this device card.
     Connect { serial: String },
@@ -176,6 +179,7 @@ mod tests {
             Some(HostEvent::Stats(s)) => {
                 assert_eq!(s.bitrate_kbps, 25000);
                 assert_eq!(s.rtt_ms, None);
+                assert_eq!(s.decode_ms, None);
                 assert_eq!(s.width, 2560);
                 // Older hosts do not send the frame-time fields.
                 assert_eq!(s.fps_low1, 0.0);
@@ -183,9 +187,10 @@ mod tests {
             }
             o => panic!("{o:?}"),
         }
-        let l = r#"{"event":"stats","fps":60.0,"fps_now":59.0,"fps_avg":58.5,"fps_low1":41.2,"frame_ms_mean":17.1,"frame_ms_std":3.4,"frame_ms_var":11.6}"#;
+        let l = r#"{"event":"stats","fps":60.0,"decode_ms":2.75,"fps_now":59.0,"fps_avg":58.5,"fps_low1":41.2,"frame_ms_mean":17.1,"frame_ms_std":3.4,"frame_ms_var":11.6}"#;
         match parse_event(l) {
             Some(HostEvent::Stats(s)) => {
+                assert_eq!(s.decode_ms, Some(2.75));
                 assert_eq!(s.fps_now, 59.0);
                 assert_eq!(s.fps_avg, 58.5);
                 assert_eq!(s.fps_low1, 41.2);
@@ -193,6 +198,11 @@ mod tests {
                 assert_eq!(s.frame_ms_std, 3.4);
                 assert_eq!(s.frame_ms_var, 11.6);
             }
+            o => panic!("{o:?}"),
+        }
+        let l = r#"{"event":"stats","fps":60.0,"decode_ms":null}"#;
+        match parse_event(l) {
+            Some(HostEvent::Stats(s)) => assert_eq!(s.decode_ms, None),
             o => panic!("{o:?}"),
         }
     }
@@ -219,11 +229,16 @@ mod tests {
     fn cmd_lines() {
         assert_eq!(HostCmd::SetQuality { quality: 80 }.to_line(), "{\"cmd\":\"set_quality\",\"quality\":80}\n");
         assert_eq!(HostCmd::RequestIdr.to_line(), "{\"cmd\":\"request_idr\"}\n");
+        assert_eq!(HostCmd::RequestLog.to_line(), "{\"cmd\":\"request_log\"}\n");
         assert_eq!(HostCmd::NewOtp.to_line(), "{\"cmd\":\"new_otp\"}\n");
         assert_eq!(HostCmd::Connect { serial: "1-5".into() }.to_line(), "{\"cmd\":\"connect\",\"serial\":\"1-5\"}\n");
         assert_eq!(
             HostCmd::SetResolution { width: 1920, height: 1080 }.to_line(),
             "{\"cmd\":\"set_resolution\",\"width\":1920,\"height\":1080}\n"
+        );
+        assert_eq!(
+            HostCmd::SetResolution { width: 0, height: 0 }.to_line(),
+            "{\"cmd\":\"set_resolution\",\"width\":0,\"height\":0}\n"
         );
     }
 }

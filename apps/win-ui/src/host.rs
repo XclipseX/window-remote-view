@@ -113,7 +113,7 @@ struct Link {
 }
 
 enum LinkEnd {
-    Child(Child),
+    Child { child: Child, _job: Option<crate::job::ChildJob> },
     Pipe { close: Arc<AtomicBool>, done: Arc<AtomicBool> },
 }
 
@@ -121,7 +121,7 @@ impl LinkEnd {
     /// `Some(exit code)` once ended (`Some(None)` = ended, code unknown).
     fn try_wait(&mut self) -> Option<Option<i32>> {
         match self {
-            LinkEnd::Child(c) => match c.try_wait() {
+            LinkEnd::Child { child, .. } => match child.try_wait() {
                 Ok(Some(st)) => Some(st.code()),
                 Ok(None) => None,
                 Err(_) => Some(None),
@@ -133,9 +133,9 @@ impl LinkEnd {
     /// Hard stop after the grace period (the service stops its worker when the pipe closes).
     fn kill(&mut self) -> Option<i32> {
         match self {
-            LinkEnd::Child(c) => {
-                let _ = c.kill();
-                c.wait().ok().and_then(|s| s.code())
+            LinkEnd::Child { child, .. } => {
+                let _ = child.kill();
+                child.wait().ok().and_then(|s| s.code())
             }
             LinkEnd::Pipe { close, done } => {
                 close.store(true, Ordering::SeqCst);
@@ -188,11 +188,15 @@ fn open_link(exe: &PathBuf, args: &[String], allow_service: bool) -> std::io::Re
         }
     }
     let mut child = spawn_child(exe, args)?;
+    let job = crate::job::ChildJob::new();
+    if let Some(ref j) = job {
+        let _ = j.assign_child(&child);
+    }
     let link = Link {
         stdout: Box::new(child.stdout.take().expect("piped stdout")),
         stderr: child.stderr.take().map(|e| Box::new(e) as Box<dyn Read + Send>),
         stdin: Box::new(child.stdin.take().expect("piped stdin")),
-        end: LinkEnd::Child(child),
+        end: LinkEnd::Child { child, _job: job },
     };
     Ok((link, "host: tiến trình con của app (không xử lý được màn hình khóa; cài dịch vụ để có)"))
 }

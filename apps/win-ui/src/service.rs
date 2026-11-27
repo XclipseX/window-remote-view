@@ -45,6 +45,25 @@ pub fn quote_arg(a: &str) -> String {
     out
 }
 
+/// Expected service binary path line for `exe`: `"<exe>" --service` (quoted when needed).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn expected_bin_path(exe: &std::path::Path) -> String {
+    format!("{} {SERVICE_FLAG}", quote_arg(&exe.to_string_lossy()))
+}
+
+/// True when a service's `lpBinaryPathName` points to `exe` with `--service` (case-insensitive).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn bin_path_matches(configured: &str, exe: &std::path::Path) -> bool {
+    let trimmed = configured.trim();
+    if trimmed.eq_ignore_ascii_case(&expected_bin_path(exe)) {
+        return true;
+    }
+    let exe_str = exe.to_string_lossy();
+    let alt_quoted = format!("\"{exe_str}\" {SERVICE_FLAG}");
+    let alt_unquoted = format!("{exe_str} {SERVICE_FLAG}");
+    trimmed.eq_ignore_ascii_case(&alt_quoted) || trimmed.eq_ignore_ascii_case(&alt_unquoted)
+}
+
 #[cfg(windows)]
 pub use imp::*;
 
@@ -77,6 +96,14 @@ mod stub {
     }
     #[allow(dead_code)]
     pub fn service_installed() -> bool {
+        false
+    }
+    #[allow(dead_code)]
+    pub fn service_bin_matches_current_exe() -> Option<bool> {
+        None
+    }
+    #[allow(dead_code)]
+    pub fn service_needs_repoint() -> bool {
         false
     }
 }
@@ -641,6 +668,68 @@ mod imp {
         open_scm(SC_MANAGER_CONNECT).ok().is_some_and(|scm| open_service(&scm, SERVICE_QUERY_STATUS).is_ok())
     }
 
+    /// Queries `RemoteViewSvc`'s configured binary path (read-only `SERVICE_QUERY_CONFIG`,
+    /// works without admin elevation). Returns `None` if the service is not installed or
+    /// cannot be queried; `Some(true)` if it matches the running exe; `Some(false)` otherwise.
+    #[allow(dead_code)]
+    pub fn service_bin_matches_current_exe() -> Option<bool> {
+        let exe = std::env::current_exe().ok()?;
+        let scm = open_scm(SC_MANAGER_CONNECT).ok()?;
+        let svc = open_service(&scm, SERVICE_QUERY_CONFIG).ok()?;
+        let mut needed = 0u32;
+        // First call asks for required buffer size (fails with ERROR_INSUFFICIENT_BUFFER).
+        // SAFETY: valid handle; null buffer with size 0 queries the byte count.
+        let _ = unsafe { QueryServiceConfigW(svc.0, None, 0, &mut needed) };
+        if needed == 0 {
+            return None;
+        }
+        let words = (needed as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut buf = vec![0usize; words];
+        let buf_bytes = (words * std::mem::size_of::<usize>()) as u32;
+        let cfg_ptr = buf.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW;
+        // SAFETY: `buf` is usize-aligned, at least `needed` bytes, and outlives the call.
+        unsafe { QueryServiceConfigW(svc.0, Some(cfg_ptr), buf_bytes, &mut needed) }.ok()?;
+        // SAFETY: `QueryServiceConfigW` succeeded and populated `lpBinaryPathName` inside `buf`.
+        let bin_pwstr = unsafe { (*cfg_ptr).lpBinaryPathName };
+        if bin_pwstr.is_null() {
+            return Some(false);
+        }
+        // SAFETY: `lpBinaryPathName` is a NUL-terminated UTF-16 string within `buf`.
+        let configured = unsafe { bin_pwstr.to_string().ok()? };
+        Some(super::bin_path_matches(&configured, &exe))
+    }
+
+    /// `true` when `RemoteViewSvc` is installed AND points to a different exe path than current_exe.
+    #[allow(dead_code)]
+    pub fn service_needs_repoint() -> bool {
+        service_bin_matches_current_exe() == Some(false)
+    }
+
+    /// Enables Windows Software SAS policy (`SoftwareSASGeneration = 1`) so `SendSAS(FALSE)`
+    /// works for Ctrl+Alt+Del from the LocalSystem service. Non-fatal if policy is locked.
+    fn enable_software_sas() {
+        use winreg::{enums::*, RegKey};
+        const SUBKEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
+        const VALUE: &str = "SoftwareSASGeneration";
+        let key = match RegKey::predef(HKEY_LOCAL_MACHINE).create_subkey(SUBKEY) {
+            Ok((k, _)) => k,
+            Err(e) => {
+                log("warn", &format!("sas policy: cannot open {SUBKEY}: {e}"));
+                return;
+            }
+        };
+        let cur: u32 = key.get_value(VALUE).unwrap_or(0);
+        if cur & 1 != 0 {
+            log("info", &format!("sas policy: {VALUE} already {cur}"));
+            return;
+        }
+        let target = cur | 1;
+        match key.set_value(VALUE, &target) {
+            Ok(()) => log("info", &format!("sas policy: set {VALUE} = {target}")),
+            Err(e) => log("warn", &format!("sas policy: failed to set {VALUE}: {e}")),
+        }
+    }
+
     fn state_of(svc: &Sc) -> Option<SERVICE_STATUS_CURRENT_STATE> {
         let mut st = SERVICE_STATUS::default();
         // SAFETY: valid handle + out struct.
@@ -660,7 +749,7 @@ mod imp {
     /// Creates or updates the service (auto start, LocalSystem, `"<this exe>" --service`) and starts it.
     fn install_service() -> Result<(), String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let bin = wide(&format!("{} --service", quote_arg(&exe.to_string_lossy())));
+        let bin = wide(&super::expected_bin_path(&exe));
         let (name, display) = (wide(SERVICE_NAME), wide(SERVICE_DISPLAY));
         let scm = open_scm(SC_MANAGER_ALL_ACCESS)?;
         let svc = match open_service(&scm, SERVICE_ALL_ACCESS) {
@@ -719,6 +808,7 @@ mod imp {
         let info = SERVICE_DESCRIPTIONW { lpDescription: PWSTR(desc.as_mut_ptr()) };
         // SAFETY: `info` outlives the call. Cosmetic: errors ignored.
         let _ = unsafe { ChangeServiceConfig2W(svc.0, SERVICE_CONFIG_DESCRIPTION, Some(&info as *const _ as *const c_void)) };
+        enable_software_sas();
         // SAFETY: valid handle, no start arguments.
         match unsafe { StartServiceW(svc.0, None) } {
             Ok(()) => {}
@@ -786,7 +876,8 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::quote_arg;
+    use super::{bin_path_matches, quote_arg};
+    use std::path::Path;
 
     #[test]
     fn quoting() {
@@ -796,5 +887,18 @@ mod tests {
         assert_eq!(quote_arg(""), "\"\"");
         assert_eq!(quote_arg(r#"a"b"#), r#""a\"b""#);
         assert_eq!(quote_arg(r"C:\dir with space\"), r#""C:\dir with space\\""#);
+    }
+
+    #[test]
+    fn bin_path_matching() {
+        let p = Path::new(r"C:\Tools\RemoteView.exe");
+        assert!(bin_path_matches(r"C:\Tools\RemoteView.exe --service", p));
+        assert!(bin_path_matches(r#""C:\Tools\RemoteView.exe" --service"#, p));
+        assert!(bin_path_matches(r"c:\tools\remoteview.exe --service", p));
+        assert!(!bin_path_matches(r"C:\Other\RemoteView.exe --service", p));
+
+        let spaced = Path::new(r"C:\Program Files\RemoteView\RemoteView.exe");
+        assert!(bin_path_matches(r#""C:\Program Files\RemoteView\RemoteView.exe" --service"#, spaced));
+        assert!(!bin_path_matches(r#""C:\Old\RemoteView.exe" --service"#, spaced));
     }
 }
