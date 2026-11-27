@@ -44,7 +44,7 @@ pub fn norm_cursor(px: i32, py: i32, rect: Rect) -> (u16, u16, bool) {
 /// (I-beam XOR cursors) become opaque black.
 pub fn composite_alpha(on_black: &[u8], on_white: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(on_black.len());
-    for (b, w) in on_black.chunks_exact(4).zip(on_white.chunks_exact(4)) {
+    for (b, w) in on_black.as_chunks::<4>().0.iter().zip(on_white.as_chunks::<4>().0.iter()) {
         let diff: i32 = (0..3).map(|i| i32::from(w[i]) - i32::from(b[i])).sum::<i32>() / 3;
         if diff < 0 {
             out.extend_from_slice(&[0, 0, 0, 255]);

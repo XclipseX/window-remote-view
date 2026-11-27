@@ -284,9 +284,71 @@ impl InputInjector for WinInjector {
             InputEvent::Pen { x, y, pressure, tilt_x, tilt_y, buttons, phase } => {
                 self.inject_pen(*x, *y, *pressure, *tilt_x, *tilt_y, *buttons, *phase)
             }
-            InputEvent::SecureAttention => Err(HostError::Unsupported(
-                "Ctrl+Alt+Del cannot be sent via SendInput; needs SendSAS (sas.dll) from a service",
-            )),
+            InputEvent::SecureAttention => send_sas(),
         }
     }
+}
+
+type SendSasFn = unsafe extern "system" fn(windows::core::BOOL);
+
+fn resolve_send_sas() -> std::result::Result<SendSasFn, String> {
+    use std::sync::OnceLock;
+
+    static SEND_SAS: OnceLock<std::result::Result<SendSasFn, String>> = OnceLock::new();
+    SEND_SAS
+        .get_or_init(|| {
+            const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn LoadLibraryExW(
+                    lp_lib_file_name: *const u16,
+                    h_file: *mut core::ffi::c_void,
+                    dw_flags: u32,
+                ) -> *mut core::ffi::c_void;
+                fn GetProcAddress(
+                    h_module: *mut core::ffi::c_void,
+                    lp_proc_name: *const u8,
+                ) -> *const core::ffi::c_void;
+                fn FreeLibrary(h_module: *mut core::ffi::c_void) -> i32;
+            }
+            // SAFETY: Load `sas.dll` strictly from System32 and resolve `SendSAS`.
+            // On success the library remains loaded for the process lifetime so the cached
+            // function pointer stays valid; on lookup failure the handle is freed.
+            unsafe {
+                let module = LoadLibraryExW(
+                    windows::core::w!("sas.dll").as_ptr(),
+                    std::ptr::null_mut(),
+                    LOAD_LIBRARY_SEARCH_SYSTEM32,
+                );
+                if module.is_null() {
+                    let err = windows::core::Error::from_thread();
+                    return Err(format!("LoadLibraryExW(sas.dll): {err}"));
+                }
+                let proc = GetProcAddress(module, windows::core::s!("SendSAS").as_ptr());
+                if proc.is_null() {
+                    let err = windows::core::Error::from_thread();
+                    FreeLibrary(module);
+                    return Err(format!("GetProcAddress(SendSAS): {err}"));
+                }
+                Ok(std::mem::transmute::<*const core::ffi::c_void, SendSasFn>(proc))
+            }
+        })
+        .clone()
+}
+
+/// Sends a Software Secure Attention Sequence (Ctrl+Alt+Del) via `sas.dll!SendSAS(FALSE)`.
+/// Requires running as LocalSystem (`RemoteViewSvc`) with the `SoftwareSASGeneration`
+/// policy enabled.
+fn send_sas() -> Result<()> {
+    if !crate::session_state::running_as_system() {
+        return Err(HostError::Unsupported(
+            "Ctrl+Alt+Del cần dịch vụ RemoteViewSvc (SYSTEM)",
+        ));
+    }
+    let f = resolve_send_sas().map_err(HostError::Os)?;
+    // SAFETY: `f` is the resolved `VOID WINAPI SendSAS(BOOL AsUser)` entry point in `sas.dll`.
+    // Passing `BOOL(0)` (`asUser = FALSE`) is the documented LocalSystem service mode.
+    unsafe { f(windows::core::BOOL(0)) };
+    crate::control::log(crate::control::Level::Info, "input: SendSAS(FALSE) invoked");
+    Ok(())
 }

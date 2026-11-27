@@ -327,7 +327,7 @@ impl MfEncoder {
         let subtype = match kind {
             EncoderKind::MfHevcHw => MFVideoFormat_HEVC,
             EncoderKind::MfH264Hw => MFVideoFormat_H264,
-            EncoderKind::OpenH264 => return Err(HostError::Encoder("not an MF kind".into())),
+            _ => return Err(HostError::Encoder("not an MF kind".into())),
         };
         if cfg.width < 16 || cfg.height < 16 {
             return Err(HostError::Encoder("encoder size must be set".into()));

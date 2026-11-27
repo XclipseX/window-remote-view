@@ -195,6 +195,19 @@ struct LanHandle {
     io: Arc<Mutex<UdpIo>>,
     rx: Arc<Mutex<Receiver<Vec<u8>>>>,
     peer: SharedPeer,
+    established: Arc<AtomicBool>,
+}
+
+/// Truncates `s` to at most `max_bytes` UTF-8 bytes without splitting a char.
+fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 /// Datagram / byte counters of one link (black-screen debugging).
@@ -266,9 +279,11 @@ impl Transport {
     }
 }
 
-fn open_lan(bind: SocketAddr) -> Result<LanHandle, String> {
+fn open_lan(bind: SocketAddr, host_id: [u8; 16], sh: Arc<Shared>) -> Result<LanHandle, String> {
     let (tx, rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
+    let established = Arc::new(AtomicBool::new(false));
+    let est_reader = established.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async move {
@@ -277,23 +292,91 @@ fn open_lan(bind: SocketAddr) -> Result<LanHandle, String> {
                     let _ = ready_tx.send(Err(e.to_string()));
                 }
                 Ok((io, sock)) => {
+                    let local_port = sock.local_addr().map(|a| a.port()).unwrap_or(bind.port());
                     let peer = io.peer_handle();
                     let _ = ready_tx.send(Ok(io));
+
+                    // Broadcast LAN discovery beacons while LAN mode is active.
+                    let announce = rv_transport::discovery::Announce {
+                        host_id,
+                        name: truncate_utf8(&control::computer_name(), rv_transport::discovery::MAX_NAME_LEN),
+                        port: local_port,
+                    };
+                    let beacon_sh = sh.clone();
+                    let beacon_task = tokio::spawn(async move {
+                        let beacon = rv_transport::discovery::run_beacon(
+                            announce,
+                            Duration::from_secs(1),
+                            rv_transport::discovery::DISCOVERY_PORT,
+                        );
+                        tokio::pin!(beacon);
+                        let mut check = tokio::time::interval(Duration::from_millis(250));
+                        loop {
+                            tokio::select! {
+                                res = &mut beacon => {
+                                    if let Err(e) = res {
+                                        warn!("LAN discovery beacon stopped: {e}");
+                                    }
+                                    break;
+                                }
+                                _ = check.tick() => {
+                                    if beacon_sh.stop.load(Ordering::Relaxed) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+
                     let mut buf = vec![0u8; 65536]; // control packets (cursor, Android logs) can exceed one MTU
-                    while let Ok((n, from)) = sock.recv_from(&mut buf).await {
-                        *peer.lock().unwrap() = Some(from);
+                    loop {
+                        let (n, from) = tokio::select! {
+                            r = sock.recv_from(&mut buf) => match r {
+                                Ok(v) => v,
+                                Err(_) => break,
+                            },
+                            _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                                if sh.stop.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                continue;
+                            }
+                        };
+                        // Ignore LAN discovery beacons (including our own broadcast on port 47800).
+                        if n >= rv_transport::discovery::MAGIC.len()
+                            && buf[..rv_transport::discovery::MAGIC.len()] == rv_transport::discovery::MAGIC
+                        {
+                            continue;
+                        }
+                        // Guard SharedPeer: while a session is established, do not let stray UDP
+                        // packets from another endpoint overwrite the active peer.
+                        {
+                            let mut guard = peer.lock().unwrap();
+                            if est_reader.load(Ordering::Relaxed) {
+                                if let Some(active_peer) = *guard {
+                                    if active_peer != from {
+                                        continue;
+                                    }
+                                } else {
+                                    *guard = Some(from);
+                                }
+                            } else {
+                                *guard = Some(from);
+                            }
+                        }
                         if tx.send(buf[..n].to_vec()).is_err() {
                             break;
                         }
                     }
+                    beacon_task.abort();
                 }
             }
         });
     });
     let io: UdpIo = ready_rx.recv().map_err(|e| e.to_string())??;
-    info!("LAN: listening on {bind}");
+    info!("LAN: listening on {bind} (discovery beacon on UDP {})", rv_transport::discovery::DISCOVERY_PORT);
     let peer = io.peer_handle();
-    Ok(LanHandle { io: Arc::new(Mutex::new(io)), rx: Arc::new(Mutex::new(rx)), peer })
+    Ok(LanHandle { io: Arc::new(Mutex::new(io)), rx: Arc::new(Mutex::new(rx)), peer, established })
 }
 
 fn open_usb(a: &Args, token: &str) -> Result<(Transport, &'static str), String> {
@@ -327,6 +410,8 @@ struct Shared {
     paused: AtomicBool,
     /// Make the cursor thread forget its state: shape + position are re-sent (new session, IDR request).
     cursor_reset: AtomicBool,
+    /// Pending `ControlMessage::RequestLog` to send to the connected Android client.
+    log_request: AtomicBool,
     stop: AtomicBool,
     usb_present: AtomicBool,
     quality: AtomicU32,
@@ -342,6 +427,10 @@ struct Shared {
     codec_flag: AtomicU32,
     /// Client advertised HEVC decode in Hello (assumed until a Hello says otherwise).
     client_hevc: AtomicBool,
+    /// Client panel / decoder hints from `Hello` (0 = unspecified).
+    client_max_w: AtomicU32,
+    client_max_h: AtomicU32,
+    client_max_fps: AtomicU32,
     /// A USB/adb link is open right now (do not probe accessory devices).
     usb_link_open: AtomicBool,
     /// Friendly name from the client's `DeviceInfo`.
@@ -483,7 +572,11 @@ fn video_thread(
         let sw_mode = force_sw
             || prefs.encoder == EncoderPref::Sw
             || hw_exhausted(sh.client_hevc.load(Ordering::Relaxed) && prefs.codec != CodecPref::H264);
-        let fps = sh.fps.load(Ordering::Relaxed).max(1);
+        let mut fps = sh.fps.load(Ordering::Relaxed).max(1);
+        let client_max_fps = sh.client_max_fps.load(Ordering::Relaxed);
+        if client_max_fps > 0 {
+            fps = fps.min(client_max_fps);
+        }
         let fps = if sw_mode { fps.min(crate::encode::SW_MAX_FPS) } else { fps };
         let min_interval = Duration::from_micros(1_000_000 / fps as u64);
         let want_idr = sh.idr.load(Ordering::Relaxed);
@@ -498,7 +591,12 @@ fn video_thread(
         let (nw, nh) = (frame.width, frame.height);
         let rw = sh.width.load(Ordering::Relaxed);
         let rh = sh.height.load(Ordering::Relaxed);
-        let (tw, th) = fit_size(nw, nh, rw, rh);
+        let (eff_rw, eff_rh) = if rw == 0 && rh == 0 {
+            (sh.client_max_w.load(Ordering::Relaxed), sh.client_max_h.load(Ordering::Relaxed))
+        } else {
+            (rw, rh)
+        };
+        let (tw, th) = fit_size(nw, nh, eff_rw, eff_rh);
         let (tw, th) = (tw & !1, th & !1);
         let (tw, th) = if sw_mode { let c = cap_software(tw, th, fps); (c.0, c.1) } else { (tw, th) };
         let q = sh.quality.load(Ordering::Relaxed) as u8;
@@ -515,8 +613,10 @@ fn video_thread(
         } else {
             prefs.codec
         };
-        let codec_mismatch = eff_codec == CodecPref::H264 && enc.as_ref().map_or(false, |e| e.kind() == EncoderKind::MfHevcHw);
-        let geometry_changed = codec_mismatch || active.map_or(true, |a| (a.width, a.height, a.fps) != (tw, th, fps));
+        let codec_mismatch = eff_codec == CodecPref::H264
+            && enc.as_ref().is_some_and(|e| e.codec() == rv_proto::codec_flags::CODEC_H265);
+        let geometry_changed =
+            codec_mismatch || active.is_none_or(|a| (a.width, a.height, a.fps) != (tw, th, fps));
         if enc.is_none() || geometry_changed || gen != seen_gen {
             seen_gen = gen;
             let mut applied_live = false;
@@ -935,6 +1035,7 @@ struct Ctx {
     curx: Receiver<CursorUpdate>,
     active: Option<ActiveEnc>,
     rtt_us: Option<u32>,
+    decode_us: Option<u32>,
     last_video_kbps: u64,
     // last status, so `new_otp` can re-emit it
     state: State,
@@ -996,11 +1097,18 @@ impl Ctx {
                 sh.width.store(width, Ordering::Relaxed);
                 sh.height.store(height, Ordering::Relaxed);
                 sh.bump();
-                info!("resolution -> {width}x{height}");
+                if width == 0 && height == 0 {
+                    info!("resolution -> native (theo thiết bị nhận)");
+                } else {
+                    info!("resolution -> {width}x{height}");
+                }
             }
             Command::RequestIdr => {
                 sh.idr.store(true, Ordering::Relaxed);
                 sh.cursor_reset.store(true, Ordering::Relaxed);
+            }
+            Command::RequestLog => {
+                sh.log_request.store(true, Ordering::SeqCst);
             }
             Command::NewOtp => {
                 self.otp = control::random_otp();
@@ -1081,18 +1189,26 @@ impl Ctx {
             }
         }
         if self.lan.is_none() {
-            self.lan = Some(open_lan(self.args.bind)?);
+            let mut host_id = [0u8; 16];
+            host_id.copy_from_slice(&self.kp.public_bytes()[..16]);
+            self.lan = Some(open_lan(self.args.bind, host_id, self.sh.clone())?);
         }
         Ok((Transport::lan(self.lan.clone().unwrap()), "lan"))
     }
 }
 
-/// Clears the "USB link open" flag however `run_session` returns.
-struct LinkGuard(Arc<Shared>);
+/// Clears link-active flags however `run_session` returns.
+struct LinkGuard {
+    sh: Arc<Shared>,
+    lan_established: Option<Arc<AtomicBool>>,
+}
 impl Drop for LinkGuard {
     fn drop(&mut self) {
-        self.0.usb_link_open.store(false, Ordering::Relaxed);
-        self.0.dev_refresh.store(true, Ordering::Relaxed);
+        self.sh.usb_link_open.store(false, Ordering::Relaxed);
+        self.sh.dev_refresh.store(true, Ordering::Relaxed);
+        if let Some(est) = &self.lan_established {
+            est.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -1122,14 +1238,15 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
     let reliable = transport.reliable();
     let io_stats = transport.io.clone();
     let usb_stats = transport.usb_stats();
-    let lan_peer = match &transport.kind {
+    let (lan_peer, lan_established) = match &transport.kind {
         TransportKind::Lan(h) => {
             // Forget the previous client and any stale datagrams.
+            h.established.store(false, Ordering::SeqCst);
             *h.peer.lock().unwrap() = None;
             while h.rx.lock().unwrap().try_recv().is_ok() {}
-            Some(h.peer.clone())
+            (Some(h.peer.clone()), Some(h.established.clone()))
         }
-        _ => None,
+        _ => (None, None),
     };
     let session_otp = ctx.otp_for(link);
     let mut session =
@@ -1137,7 +1254,7 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
     session.set_codec(rv_proto::codec_flags::CODEC_H264);
     ctx.sh.usb_link_open.store(link != "lan", Ordering::Relaxed);
     ctx.sh.dev_refresh.store(true, Ordering::Relaxed);
-    let _guard = LinkGuard(ctx.sh.clone());
+    let _guard = LinkGuard { sh: ctx.sh.clone(), lan_established: lan_established.clone() };
     let mut last_dbg = Instant::now();
     let mut last_session_err = String::new();
     ctx.set_status(State::Waiting, link, None, waiting_message(link));
@@ -1267,6 +1384,9 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                     established = true;
                     connecting = false;
                     streaming = false;
+                    if let Some(est) = &lan_established {
+                        est.store(true, Ordering::SeqCst);
+                    }
                     let peer = lan_peer
                         .as_ref()
                         .and_then(|p| p.lock().unwrap().map(|a| a.to_string()))
@@ -1282,9 +1402,16 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                     established = false;
                     streaming = false;
                     connecting = false;
+                    if let Some(est) = &lan_established {
+                        est.store(false, Ordering::SeqCst);
+                    }
                     ctx.sh.ready.store(false, Ordering::Relaxed);
                     ctx.sh.paused.store(false, Ordering::Relaxed);
                     ctx.rtt_us = None;
+                    ctx.decode_us = None;
+                    ctx.sh.client_max_w.store(0, Ordering::Relaxed);
+                    ctx.sh.client_max_h.store(0, Ordering::Relaxed);
+                    ctx.sh.client_max_fps.store(0, Ordering::Relaxed);
                     ctx.set_status(State::Waiting, link, None, "Thiết bị đã ngắt kết nối, đang chờ kết nối lại...");
                     *ctx.sh.peer_name.lock().unwrap() = None;
                     ctx.sh.dev_refresh.store(true, Ordering::Relaxed);
@@ -1345,12 +1472,22 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                     sh.bump();
                     info!("client slider: quality {quality}, {width}x{height}@{fps}");
                 }
-                HostSessionEvent::Control(ControlMessage::Hello { codecs, .. }) => {
+                HostSessionEvent::Control(ControlMessage::Hello { codecs, max_w, max_h, max_fps, .. }) => {
                     let hevc = codecs & rv_proto::codec_mask::H265 != 0;
-                    if ctx.sh.client_hevc.swap(hevc, Ordering::SeqCst) != hevc {
+                    let mut changed = ctx.sh.client_hevc.swap(hevc, Ordering::SeqCst) != hevc;
+                    if ctx.sh.client_max_w.swap(max_w as u32, Ordering::Relaxed) != max_w as u32 {
+                        changed = true;
+                    }
+                    if ctx.sh.client_max_h.swap(max_h as u32, Ordering::Relaxed) != max_h as u32 {
+                        changed = true;
+                    }
+                    if ctx.sh.client_max_fps.swap(max_fps as u32, Ordering::Relaxed) != max_fps as u32 {
+                        changed = true;
+                    }
+                    if changed {
                         ctx.sh.bump();
                     }
-                    info!("client Hello: codecs mask {codecs:#x} (hevc={hevc})");
+                    info!("client Hello: codecs mask {codecs:#x} (hevc={hevc}), max {max_w}x{max_h}@{max_fps}");
                 }
                 HostSessionEvent::Control(ControlMessage::DeviceInfo { name }) => {
                     info!("client DeviceInfo: {name:?}");
@@ -1359,7 +1496,10 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                     let (st, msg) = (ctx.state, ctx.message.clone());
                     ctx.set_status(st, link, Some(name), &msg);
                 }
-                HostSessionEvent::Control(ControlMessage::FeedbackStats { rtt_us, .. }) => ctx.rtt_us = Some(rtt_us),
+                HostSessionEvent::Control(ControlMessage::FeedbackStats { rtt_us, decode_us, .. }) => {
+                    ctx.rtt_us = Some(rtt_us);
+                    ctx.decode_us = (decode_us > 0).then_some(decode_us);
+                }
                 HostSessionEvent::Control(ControlMessage::LogChunk { name, seq, last, data }) => {
                     if let Some(done) = logs.push(&name, seq, last, &data, Instant::now()) {
                         save_android_log(&done);
@@ -1415,6 +1555,10 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
             while ctx.curx.try_recv().is_ok() {}
             continue;
         }
+        if ctx.sh.log_request.swap(false, Ordering::SeqCst) {
+            let _ = session.send_control(ControlMessage::RequestLog);
+            info!("đã gửi yêu cầu lấy log từ thiết bị Android");
+        }
         while let Ok(u) = ctx.curx.try_recv() {
             let msg = match u {
                 CursorUpdate::Shape { w, h, hot_x, hot_y, rgba } => ControlMessage::CursorShape { w, h, hot_x, hot_y, rgba },
@@ -1462,6 +1606,7 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                         bitrate_kbps: kbps,
                         encode_ms,
                         rtt_ms: ctx.rtt_us.map(|r| r as f64 / 1000.0),
+                        decode_ms: ctx.decode_us.map(|u| u as f64 / 1000.0),
                         encoder: a.kind.name().to_string(),
                         width: a.width,
                         height: a.height,
@@ -1502,6 +1647,7 @@ fn run(argv: Vec<String>) -> Result<(), String> {
         idr: AtomicBool::new(true),
         paused: AtomicBool::new(false),
         cursor_reset: AtomicBool::new(true),
+        log_request: AtomicBool::new(false),
         stop: AtomicBool::new(false),
         usb_present: AtomicBool::new(false),
         quality: AtomicU32::new(a.quality as u32),
@@ -1512,6 +1658,9 @@ fn run(argv: Vec<String>) -> Result<(), String> {
         cfg_gen: AtomicU32::new(0),
         codec_flag: AtomicU32::new(0),
         client_hevc: AtomicBool::new(true),
+        client_max_w: AtomicU32::new(0),
+        client_max_h: AtomicU32::new(0),
+        client_max_fps: AtomicU32::new(0),
         usb_link_open: AtomicBool::new(false),
         peer_name: Mutex::new(None),
         dev_refresh: AtomicBool::new(false),
@@ -1659,6 +1808,7 @@ fn run(argv: Vec<String>) -> Result<(), String> {
         curx,
         active: None,
         rtt_us: None,
+        decode_us: None,
         last_video_kbps: 0,
         state: State::Starting,
         link: link0,
@@ -1710,26 +1860,6 @@ pub fn run_cli(argv: Vec<String>) -> i32 {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::fit_size;
-
-    #[test]
-    fn fit_keeps_the_capture_aspect_and_never_enlarges() {
-        // no limit / limit larger than the capture: the capture size as is
-        assert_eq!(fit_size(2880, 1800, 0, 0), (2880, 1800));
-        assert_eq!(fit_size(1920, 1080, 2800, 1752), (1920, 1080));
-        // 16:10 panel into a 16:9 request: scaled by the tighter side, not stretched
-        assert_eq!(fit_size(2880, 1800, 1920, 1080), (1728, 1080));
-        // tablet 2800x1752 vs panel 2880x1800: 16:10 stays ~16:10
-        let (w, h) = fit_size(2880, 1800, 2800, 1752);
-        assert!(w <= 2800 && h <= 1752);
-        assert!(((w as f64 / h as f64) - 1.6).abs() < 0.002);
-        // only one side limited
-        assert_eq!(fit_size(2000, 1000, 1000, 5000), (1000, 500));
-    }
-}
-
 /// Creates RemoteView's own SudoVDA monitor and returns it with its DXGI output.
 #[cfg(windows)]
 fn create_vdd(mode: DisplayMode, primary: bool) -> std::result::Result<(crate::sudovda::SudoVdaMonitor, crate::capture::OutputInfo), String> {
@@ -1755,4 +1885,101 @@ fn create_vdd(mode: DisplayMode, primary: bool) -> std::result::Result<(crate::s
 #[cfg(not(windows))]
 fn create_vdd(_mode: DisplayMode, _primary: bool) -> std::result::Result<(crate::sudovda::SudoVdaMonitor, crate::capture::OutputInfo), String> {
     Err("virtual display needs Windows".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_keeps_the_capture_aspect_and_never_enlarges() {
+        // no limit / limit larger than the capture: the capture size as is
+        assert_eq!(fit_size(2880, 1800, 0, 0), (2880, 1800));
+        assert_eq!(fit_size(1920, 1080, 2800, 1752), (1920, 1080));
+        // 16:10 panel into a 16:9 request: scaled by the tighter side, not stretched
+        assert_eq!(fit_size(2880, 1800, 1920, 1080), (1728, 1080));
+        // tablet 2800x1752 vs panel 2880x1800: 16:10 stays ~16:10
+        let (w, h) = fit_size(2880, 1800, 2800, 1752);
+        assert!(w <= 2800 && h <= 1752);
+        assert!(((w as f64 / h as f64) - 1.6).abs() < 0.002);
+        // only one side limited
+        assert_eq!(fit_size(2000, 1000, 1000, 5000), (1000, 500));
+    }
+
+    #[test]
+    fn truncate_utf8_respects_char_boundaries() {
+        assert_eq!(truncate_utf8("DESKTOP-PC", 64), "DESKTOP-PC");
+        // 'á' is 2 bytes in UTF-8 (bytes 1..3); truncating at 2 must not split it.
+        assert_eq!(truncate_utf8("Máy tính", 2), "M");
+        assert_eq!(truncate_utf8("Máy tính", 4), "Máy");
+        assert_eq!(truncate_utf8("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn lan_ignores_discovery_magic_and_guards_established_peer() {
+        let sh = Arc::new(Shared {
+            ready: AtomicBool::new(false),
+            idr: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            cursor_reset: AtomicBool::new(false),
+            log_request: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            usb_present: AtomicBool::new(false),
+            quality: AtomicU32::new(80),
+            fps: AtomicU32::new(60),
+            width: AtomicU32::new(0),
+            height: AtomicU32::new(0),
+            bitrate_override_bps: AtomicU32::new(0),
+            cfg_gen: AtomicU32::new(0),
+            codec_flag: AtomicU32::new(0),
+            client_hevc: AtomicBool::new(true),
+            client_max_w: AtomicU32::new(0),
+            client_max_h: AtomicU32::new(0),
+            client_max_fps: AtomicU32::new(0),
+            usb_link_open: AtomicBool::new(false),
+            peer_name: Mutex::new(None),
+            dev_refresh: AtomicBool::new(false),
+            locked: AtomicBool::new(false),
+            cap_rect: Mutex::new(crate::Rect::default()),
+        });
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bind_addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let lan = open_lan(bind_addr, [7u8; 16], sh.clone()).unwrap();
+        let client_a = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client_b = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr_a = client_a.local_addr().unwrap();
+
+        // 1. Discovery beacon (RVD1...) must be ignored and must not set SharedPeer.
+        let beacon = rv_transport::discovery::Announce {
+            host_id: [1u8; 16],
+            name: "other".into(),
+            port: 47800,
+        }
+        .encode()
+        .unwrap();
+        client_b.send_to(&beacon, bind_addr).unwrap();
+        assert!(lan.rx.lock().unwrap().recv_timeout(Duration::from_millis(80)).is_err());
+        assert_eq!(*lan.peer.lock().unwrap(), None);
+
+        // 2. Normal packet from client A sets SharedPeer and is delivered.
+        client_a.send_to(b"hello-a", bind_addr).unwrap();
+        let pkt = lan.rx.lock().unwrap().recv_timeout(Duration::from_millis(200)).unwrap();
+        assert_eq!(pkt, b"hello-a");
+        assert_eq!(*lan.peer.lock().unwrap(), Some(addr_a));
+
+        // 3. Once established, stray packet from client B must NOT overwrite SharedPeer or be delivered.
+        lan.established.store(true, Ordering::SeqCst);
+        client_b.send_to(b"stray-b", bind_addr).unwrap();
+        assert!(lan.rx.lock().unwrap().recv_timeout(Duration::from_millis(80)).is_err());
+        assert_eq!(*lan.peer.lock().unwrap(), Some(addr_a));
+
+        // 4. Packet from established client A still gets through.
+        client_a.send_to(b"data-a", bind_addr).unwrap();
+        let pkt2 = lan.rx.lock().unwrap().recv_timeout(Duration::from_millis(200)).unwrap();
+        assert_eq!(pkt2, b"data-a");
+
+        sh.stop.store(true, Ordering::SeqCst);
+    }
 }

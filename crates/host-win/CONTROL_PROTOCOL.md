@@ -21,7 +21,7 @@ Human logs go to stderr. Closing stdin makes the host exit.
 
 ```json
 {"event":"status","state":"starting|waiting|connecting|connected|streaming|error","link":"usb|lan|adb|none","peer":"<string or null>","otp":"123456","message":"<vi text>"}
-{"event":"stats","fps":59.9,"bitrate_kbps":14000,"encode_ms":2.3,"rtt_ms":3.1,"encoder":"mf-hevc-hw|mf-h264-hw|openh264","width":2800,"height":1752,"fps_now":59.0,"fps_avg":58.0,"fps_low1":41.2,"frame_ms_mean":17.2,"frame_ms_std":3.5,"frame_ms_var":11.9}
+{"event":"stats","fps":59.9,"bitrate_kbps":14000,"encode_ms":2.3,"rtt_ms":3.1,"decode_ms":2.45,"encoder":"amf-hevc-hw|amf-h264-hw|mf-hevc-hw|mf-h264-hw|openh264","width":2800,"height":1752,"fps_now":59.0,"fps_avg":58.0,"fps_low1":41.2,"frame_ms_mean":17.2,"frame_ms_std":3.5,"frame_ms_var":11.9}
 {"event":"devices","items":[{"kind":"usb","name":"Galaxy Tab S10+ (SM-X826B)","serial":"1-5","vid":6353,"pid":11520,"accessory":true,"driver_ok":true,"connected":true}]}
 {"event":"log","level":"info|warn|error","msg":"..."}
 ```
@@ -29,7 +29,9 @@ Human logs go to stderr. Closing stdin makes the host exit.
 * `status` is emitted on every state change and again when the OTP changes.
   `state=error` with exit code 1 is also emitted on fatal startup failure (`otp` may be "").
   After a client disconnect the host goes back to `waiting` (it never exits by itself).
-* `stats` every 1 s while `streaming`; `rtt_ms` is `null` until the client reports one.
+* `stats` every 1 s while `streaming`; `rtt_ms` and `decode_ms` are `null` until the client
+  reports them in `FeedbackStats`. `encoder` is one of `amf-hevc-hw`, `amf-h264-hw`,
+  `mf-hevc-hw`, `mf-h264-hw`, or `openh264`.
   Frame-time fields (added later; clients must default them to 0 when absent) are computed over the
   frames actually SENT to the client (after encode) in a rolling window of the last 10 s / 1200
   frames (`frame_stats.rs`): `fps_now` = frames sent in the last second, `fps_avg` = 1000 / mean
@@ -58,6 +60,7 @@ Human logs go to stderr. Closing stdin makes the host exit.
 {"cmd":"set_fps","fps":60}
 {"cmd":"set_resolution","width":1920,"height":1080}
 {"cmd":"request_idr"}
+{"cmd":"request_log"}
 {"cmd":"new_otp"}
 {"cmd":"connect","serial":"1-5"}
 {"cmd":"stop"}
@@ -66,9 +69,11 @@ Human logs go to stderr. Closing stdin makes the host exit.
 `connect` clears the USB retry backoff so the link is attempted immediately (device card button).
 Invalid lines produce a `log` warn event and are otherwise ignored. `set_quality` changes the
 bitrate live (no re-init when the encoder supports it); `set_fps` / `set_resolution` rebuild
-the encoder (the client is told through `StreamConfig`). `new_otp` re-emits `status` with the
-new OTP; if a client is already connected it applies to the next connection. `stop` shuts
-down (process exits within 2 s at most).
+the encoder (the client is told through `StreamConfig`). `set_resolution` with `width: 0, height: 0`
+resets to native / client-matched capture resolution ("theo thiết bị nhận"). `request_log` sends
+`ControlMessage::RequestLog` to the connected Android client so it uploads its diagnostic log.
+`new_otp` re-emits `status` with the new OTP; if a client is already connected it applies to the
+next connection. `stop` shuts down (process exits within 2 s at most).
 
 ## Service pipe (lock screen support)
 

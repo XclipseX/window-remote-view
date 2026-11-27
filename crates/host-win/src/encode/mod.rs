@@ -1,19 +1,28 @@
 //! Video encoders.
 //!
-//! Selection order (see [`create_encoder`]): Media Foundation HEVC hardware
-//! MFT -> Media Foundation H.264 hardware MFT -> OpenH264 software. The MF
-//! path (`mf.rs`) is the primary one; [`AmfEncoder`] is only a stub kept for a
-//! possible native AMF SDK path later.
+//! Selection order (see [`create_encoder`]):
+//! 1. Native AMD AMF DX11 (`amf.rs`): HEVC -> H.264
+//! 2. Media Foundation hardware MFT D3D11 (`mf.rs`): HEVC -> H.264
+//! 3. Media Foundation hardware MFT system-memory (`mf.rs`): HEVC -> H.264
+//! 4. Multi-slice OpenH264 software (`openh264_mt.rs`)
 
 use crate::capture::CapturedFrame;
 use crate::{HostError, Result};
 
+pub mod amf;
+pub mod amf_ffi;
 #[cfg(windows)]
 pub mod mf;
+pub mod openh264_mt;
+
+#[cfg(windows)]
+pub use amf::AmfEncoder;
 
 /// Which concrete encoder is producing the stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncoderKind {
+    AmfHevc,
+    AmfH264,
     MfHevcHw,
     MfH264Hw,
     OpenH264,
@@ -23,6 +32,8 @@ impl EncoderKind {
     /// Stable name used in the JSON `stats.encoder` field.
     pub fn name(self) -> &'static str {
         match self {
+            EncoderKind::AmfHevc => "amf-hevc-hw",
+            EncoderKind::AmfH264 => "amf-h264-hw",
             EncoderKind::MfHevcHw => "mf-hevc-hw",
             EncoderKind::MfH264Hw => "mf-h264-hw",
             EncoderKind::OpenH264 => "openh264",
@@ -30,13 +41,13 @@ impl EncoderKind {
     }
     pub fn codec_flag(self) -> u8 {
         match self {
-            EncoderKind::MfHevcHw => rv_proto::codec_flags::CODEC_H265,
+            EncoderKind::AmfHevc | EncoderKind::MfHevcHw => rv_proto::codec_flags::CODEC_H265,
             _ => rv_proto::codec_flags::CODEC_H264,
         }
     }
     pub fn slider_codec(self) -> rv_session::Codec {
         match self {
-            EncoderKind::MfHevcHw => rv_session::Codec::Hevc,
+            EncoderKind::AmfHevc | EncoderKind::MfHevcHw => rv_session::Codec::Hevc,
             _ => rv_session::Codec::H264,
         }
     }
@@ -177,14 +188,16 @@ pub enum HwFailAction {
     UseSoftware,
 }
 
-/// True when no MF hardware kind usable for this client is left.
+/// True when no hardware encoder kind usable for this client is left.
 pub fn hw_exhausted(hevc_ok: bool) -> bool {
-    is_blocked(EncoderKind::MfH264Hw) && (!hevc_ok || is_blocked(EncoderKind::MfHevcHw))
+    let h264_done = is_blocked(EncoderKind::AmfH264) && is_blocked(EncoderKind::MfH264Hw);
+    let hevc_done = !hevc_ok || (is_blocked(EncoderKind::AmfHevc) && is_blocked(EncoderKind::MfHevcHw));
+    h264_done && hevc_done
 }
 
 /// Applies the per-encoder policy. The resulting order (see `create_encoder`) is
-/// HEVC D3D -> H.264 D3D -> HEVC sysmem -> H.264 sysmem -> OpenH264. `hevc_ok`
-/// is false when the client cannot decode HEVC (HEVC is then never a candidate).
+/// AMF HEVC -> AMF H.264 -> MF HEVC D3D -> MF H.264 D3D -> MF HEVC sysmem -> MF H.264 sysmem -> OpenH264.
+/// `hevc_ok` is false when the client cannot decode HEVC (HEVC is then never a candidate).
 pub fn on_hw_failure(kind: EncoderKind, uses_d3d: bool, hevc_ok: bool) -> HwFailAction {
     if uses_d3d && !no_d3d(kind) {
         set_no_d3d(kind, true);
@@ -199,7 +212,7 @@ pub fn on_hw_failure(kind: EncoderKind, uses_d3d: bool, hevc_ok: bool) -> HwFail
 }
 
 /// Builds the best available encoder. `sample` is a real captured frame (its
-/// D3D11 device is reused by the MF path). `bitrate_for` maps the chosen
+/// D3D11 device is reused by the AMF and MF paths). `bitrate_for` maps the chosen
 /// codec to a bitrate (slider formula depends on the codec). `log` receives
 /// human-readable progress/warnings.
 /// Encoders that failed at runtime in this process (e.g. MFT that errors on every frame).
@@ -219,7 +232,7 @@ pub fn is_blocked(kind: EncoderKind) -> bool {
 }
 
 pub fn create_encoder(
-    codec: CodecPref,
+    #[cfg_attr(not(windows), allow(unused_variables))] codec: CodecPref,
     enc: EncoderPref,
     mut cfg: EncoderConfig,
     sample: &CapturedFrame,
@@ -231,14 +244,40 @@ pub fn create_encoder(
     if enc != EncoderPref::Sw {
         #[cfg(windows)]
         {
+            // Pass 0: Native AMD AMF zero-copy DX11 (HEVC -> H.264).
+            let mut amf_kinds = Vec::new();
+            if codec != CodecPref::H264 {
+                amf_kinds.push((EncoderKind::AmfHevc, amf::AmfCodec::Hevc));
+            }
+            amf_kinds.push((EncoderKind::AmfH264, amf::AmfCodec::H264));
+            for (k, amf_codec) in amf_kinds {
+                if is_blocked(k) {
+                    log(&format!("encoder {} skipped (failed earlier)", k.name()));
+                    continue;
+                }
+                let c = EncoderConfig { bitrate_bps: bitrate_for(k.slider_codec()), ..cfg };
+                match amf::AmfEncoder::new(amf_codec, c, sample) {
+                    Ok(e) => {
+                        log(&format!("encoder: {} ({})", k.name(), e.describe()));
+                        return Ok(Box::new(e));
+                    }
+                    Err(e) => {
+                        log(&format!("encoder {} unavailable: {e}", k.name()));
+                        // Block on non-AMD GPUs (amfrt64.dll absent) or genuine DX11 init failure
+                        // so we do not retry AMF on every rebuild and `hw_exhausted` stays accurate.
+                        if sample.texture().is_some() || amf_ffi::AmfLibrary::global().is_err() {
+                            block_encoder(k);
+                        }
+                    }
+                }
+            }
+
             let mut kinds = Vec::new();
             if codec != CodecPref::H264 {
                 kinds.push(EncoderKind::MfHevcHw);
             }
-            {
-                kinds.push(EncoderKind::MfH264Hw);
-            }
-            // Pass 1: every kind with its D3D path; pass 2: kinds demoted to system memory.
+            kinds.push(EncoderKind::MfH264Hw);
+            // Pass 1: every MF kind with its D3D path; pass 2: kinds demoted to system memory.
             for sysmem_pass in [false, true] {
                 for &k in &kinds {
                     if no_d3d(k) != sysmem_pass {
@@ -280,7 +319,7 @@ pub fn create_encoder(
 
 /// BGRA8 -> NV12 (BT.709 limited), `w`/`h` even. `out` is resized to w*h*3/2.
 pub fn bgra_to_nv12(bgra: &[u8], w: usize, h: usize, out: &mut Vec<u8>) {
-    debug_assert!(w % 2 == 0 && h % 2 == 0);
+    debug_assert!(w.is_multiple_of(2) && h.is_multiple_of(2));
     debug_assert_eq!(bgra.len(), w * h * 4);
     out.resize(w * h * 3 / 2, 0);
     let (yp, uv) = out.split_at_mut(w * h);
@@ -339,10 +378,9 @@ pub fn has_sps(annexb: &[u8], hevc: bool) -> bool {
 }
 
 /// BGRA8 -> planar I420 (BT.709 limited range), `w`/`h` must be even.
-/// OpenH264 consumes I420 (not NV12), hence planar output. A future AMF
-/// encoder wants NV12 (or the D3D11 texture directly, which is the point).
+/// OpenH264 consumes I420 (not NV12), hence planar output.
 pub fn bgra_to_i420(bgra: &[u8], w: usize, h: usize, y: &mut [u8], u: &mut [u8], v: &mut [u8]) {
-    debug_assert!(w % 2 == 0 && h % 2 == 0);
+    debug_assert!(w.is_multiple_of(2) && h.is_multiple_of(2));
     debug_assert_eq!(bgra.len(), w * h * 4);
     // Split into bands of whole chroma rows; each band is independent (same results as serial).
     let threads = if w * h >= 640 * 360 { std::thread::available_parallelism().map_or(1, |n| n.get()).min(4) } else { 1 };
@@ -405,44 +443,25 @@ fn i420_band(bgra: &[u8], w: usize, h: usize, y: &mut [u8], u: &mut [u8], v: &mu
 }
 
 struct I420 {
-    w: usize,
-    h: usize,
     y: Vec<u8>,
     u: Vec<u8>,
     v: Vec<u8>,
 }
 
-impl openh264::formats::YUVSource for I420 {
-    fn dimensions(&self) -> (usize, usize) {
-        (self.w, self.h)
-    }
-    fn strides(&self) -> (usize, usize, usize) {
-        (self.w, self.w / 2, self.w / 2)
-    }
-    fn y(&self) -> &[u8] {
-        &self.y
-    }
-    fn u(&self) -> &[u8] {
-        &self.u
-    }
-    fn v(&self) -> &[u8] {
-        &self.v
-    }
-}
-
-/// Software H.264 fallback (Cisco OpenH264, built from source by the crate).
+/// Software H.264 fallback (multi-slice Cisco OpenH264 via `openh264_mt`).
 ///
-/// Works without any GPU so the pipeline runs end to end, but a CPU encoder
-/// will not reach 2800x1752@120: expect tens of ms per frame at that size.
-/// Also note H.264 level limits (level 5.2 caps at ~2.07M macroblocks/s,
-/// below 2800x1752x120).
+/// Works without any GPU so the pipeline runs end to end, using OpenH264's
+/// multi-slice thread pool (`SM_FIXEDSLCNUM_SLICE`) and live bitrate updates.
 pub struct OpenH264Encoder {
-    enc: Option<openh264::encoder::Encoder>,
+    enc: Option<openh264_mt::MtOpenH264>,
     dims: (usize, usize),
     /// Fixed output size (0,0 = follow the frame size, cropped to even).
     target: (usize, usize),
     fps: f32,
     bitrate_bps: u32,
+    start: std::time::Instant,
+    last_ts_ms: i64,
+    frame_count: u64,
     bgra: Vec<u8>,
     scaled: Vec<u8>,
     yuv: I420,
@@ -488,40 +507,39 @@ impl OpenH264Encoder {
             dims: (0, 0),
             target: (c.width as usize, c.height as usize),
             fps: c.fps as f32,
-            bitrate_bps: c.bitrate_bps,
+            bitrate_bps: c.bitrate_bps.max(100_000),
+            start: std::time::Instant::now(),
+            last_ts_ms: 0,
+            frame_count: 0,
             bgra: Vec::new(),
             scaled: Vec::new(),
-            yuv: I420 { w: 0, h: 0, y: vec![], u: vec![], v: vec![] },
+            yuv: I420 { y: vec![], u: vec![], v: vec![] },
             load: (std::time::Instant::now(), 0, std::time::Duration::ZERO),
             downscaled: false,
         }
     }
 
     fn rebuild(&mut self, w: usize, h: usize) -> Result<()> {
-        use openh264::encoder::{BitRate, Complexity, Encoder, EncoderConfig, FrameRate, QpRange, RateControlMode, UsageType};
-        use openh264::OpenH264API;
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8) as u16;
-        let cfg = EncoderConfig::new()
-            .bitrate(BitRate::from_bps(self.bitrate_bps))
-            .max_frame_rate(FrameRate::from_hz(self.fps))
-            .usage_type(UsageType::ScreenContentRealTime)
-            .rate_control_mode(RateControlMode::Bitrate)
-            // Real time: let the rate controller drop a frame instead of blowing the budget,
-            // fastest preset, and never go to the blurry QP 40..51 range.
-            .skip_frames(true)
-            .complexity(Complexity::Low)
-            .qp(QpRange::new(0, 40))
-            // The crate always uses a single slice (OpenH264 then runs the encode on one
-            // thread regardless); the thread hint is still passed for builds that slice.
-            .num_threads(threads);
-        self.enc = Some(
-            Encoder::with_api_config(OpenH264API::from_source(), cfg)
-                .map_err(|e| HostError::Encoder(e.to_string()))?,
+        let fps = (self.fps.round() as u32).max(1);
+        let bps = self.bitrate_bps.max(100_000);
+        let enc = openh264_mt::MtOpenH264::new(w as u32, h as u32, fps, bps)?;
+        crate::control::log(
+            crate::control::Level::Info,
+            &format!(
+                "openh264: initialized {}x{}@{} {} kbps ({} threads/slices)",
+                w,
+                h,
+                fps,
+                bps / 1000,
+                enc.threads()
+            ),
         );
+        self.enc = Some(enc);
         self.dims = (w, h);
+        self.start = std::time::Instant::now();
+        self.last_ts_ms = 0;
+        self.frame_count = 0;
         self.yuv = I420 {
-            w,
-            h,
             y: vec![0; w * h],
             u: vec![0; w * h / 4],
             v: vec![0; w * h / 4],
@@ -565,6 +583,15 @@ impl VideoEncoder for OpenH264Encoder {
     fn kind(&self) -> EncoderKind {
         EncoderKind::OpenH264
     }
+    fn set_bitrate(&mut self, bps: u32) -> Result<bool> {
+        let bps = bps.max(100_000);
+        self.bitrate_bps = bps;
+        if let Some(enc) = self.enc.as_mut() {
+            enc.set_bitrate(bps)
+        } else {
+            Ok(true)
+        }
+    }
 }
 
 impl OpenH264Encoder {
@@ -597,41 +624,41 @@ impl OpenH264Encoder {
             scale_bgra_nearest(&raw, fw, fh, w, h, &mut self.scaled);
             &self.scaled
         };
-        let I420 { y, u, v, .. } = &mut self.yuv;
+        let I420 { y, u, v } = &mut self.yuv;
         bgra_to_i420(src, w, h, y, u, v);
         self.bgra = raw;
-        let enc = self.enc.as_mut().expect("encoder built");
-        if force_idr {
-            enc.force_intra_frame();
+        let mut ts_ms = self.start.elapsed().as_millis() as i64;
+        if self.frame_count > 0 && ts_ms <= self.last_ts_ms {
+            ts_ms = self.last_ts_ms + 1;
         }
-        let bs = enc.encode(&self.yuv).map_err(|e| HostError::Encoder(e.to_string()))?;
-        Ok(bs.to_vec())
+        self.last_ts_ms = ts_ms;
+        self.frame_count += 1;
+        let enc = self.enc.as_mut().expect("encoder built");
+        enc.encode_i420(&self.yuv.y, &self.yuv.u, &self.yuv.v, ts_ms, force_idr)
     }
 }
 
-/// AMD AMF hardware encoder: NOT IMPLEMENTED. The Media Foundation path
-/// (`mf.rs`, which uses AMD's AMF-backed MFT) is primary for now; this stub is
-/// only a placeholder for a native AMF SDK path.
-///
-/// Plan (native AMF SDK, `amf.dll` loaded at runtime, no Rust binding assumed):
-/// * component `AMFVideoEncoder_HEVC`, `USAGE = ULTRA_LOW_LATENCY`
-/// * no B-frames, `QUALITY_PRESET = SPEED`, GOP = infinite + on-demand IDR
-///   (`FORCE_PICTURE_TYPE = IDR`)
-/// * `RATE_CONTROL_METHOD = CBR`, HRD enforced, `VBV_BUFFER_SIZE` = 1.5x the
-///   per-frame budget at target bitrate (ie. bitrate/fps*1.5)
-/// * input: wrap the captured `ID3D11Texture2D` via `AMFContext::CreateSurfaceFromDX11Native`
-///   after a BGRA->NV12 video-processor/compute pass (no CPU readback).
-pub struct AmfEncoder;
-
-impl VideoEncoder for AmfEncoder {
-    fn encode(&mut self, _frame: &CapturedFrame, _force_idr: bool) -> Result<Vec<u8>> {
-        Err(HostError::Unsupported("AMF encoder not implemented"))
+#[cfg(windows)]
+impl VideoEncoder for amf::AmfEncoder {
+    fn encode(&mut self, frame: &CapturedFrame, force_idr: bool) -> Result<Vec<u8>> {
+        self.encode_frame(frame, force_idr)
     }
     fn codec(&self) -> u8 {
-        rv_proto::codec_flags::CODEC_H265
+        VideoEncoder::kind(self).codec_flag()
     }
     fn kind(&self) -> EncoderKind {
-        EncoderKind::MfHevcHw
+        match amf::AmfEncoder::codec(self) {
+            amf::AmfCodec::Hevc => EncoderKind::AmfHevc,
+            amf::AmfCodec::H264 => EncoderKind::AmfH264,
+        }
+    }
+    fn set_bitrate(&mut self, bps: u32) -> Result<bool> {
+        self.set_bitrate_live(bps)
+    }
+    fn uses_d3d(&self) -> bool {
+        // AMF has no system-memory fallback mode; returning false means a runtime
+        // failure immediately blocks this AMF kind and falls through to the next HW kind.
+        false
     }
 }
 
@@ -699,12 +726,16 @@ mod tests {
     }
 
     /// Mirrors the engine loop: a failing HW encoder is retried without D3D
-    /// once, then replaced by OpenH264 which really produces H.264.
+    /// once, then once all HW kinds are blocked, replaced by OpenH264.
     #[test]
     fn failing_hw_encoder_falls_back_to_openh264() {
         let _g = POLICY_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let f = CapturedFrame::from_bgra(64, 64, vec![90u8; 64 * 64 * 4]);
         clear_policy_state();
+        // Simulate non-AMD host where AMF kinds are already unavailable/blocked.
+        block_encoder(EncoderKind::AmfHevc);
+        block_encoder(EncoderKind::AmfH264);
+
         let mut e: Box<dyn VideoEncoder> = Box::new(FailingEncoder);
         let mut sup = HwSupervisor::new();
         assert!(e.encode(&f, true).is_err());
@@ -713,11 +744,10 @@ mod tests {
         assert!(no_d3d(EncoderKind::MfH264Hw));
         assert!(!no_d3d(EncoderKind::MfHevcHw), "other codec keeps its D3D path");
         assert!(!is_blocked(EncoderKind::MfHevcHw));
-        // second attempt (also failing) -> software
+        // second attempt (also failing) -> next encoder (MF HEVC still untouched)
         let mut sup = HwSupervisor::new();
         assert!(e.encode(&f, true).is_err());
         assert!(sup.on_error().is_some());
-        // H.264 blocked now, HEVC still untouched -> next encoder, not software.
         assert_eq!(on_hw_failure(EncoderKind::MfH264Hw, true, true), HwFailAction::NextEncoder);
         assert!(is_blocked(EncoderKind::MfH264Hw) && !is_blocked(EncoderKind::MfHevcHw));
         assert_eq!(on_hw_failure(EncoderKind::MfHevcHw, true, true), HwFailAction::RetryWithoutD3d);
@@ -740,22 +770,48 @@ mod tests {
         }
     }
 
-    /// Fallback order: HEVC D3D -> H.264 D3D -> HEVC sysmem -> H.264 sysmem -> software.
+    /// Full fallback chain:
+    /// AmfHevc -> AmfH264 -> MfHevcHw D3D -> MfH264Hw D3D -> MfHevcHw SysMem -> MfH264Hw SysMem -> OpenH264.
     /// Policy state is global; tests that touch it serialize on `POLICY_TEST`.
     #[test]
-    fn fallback_order_hevc_h264_d3d_then_sysmem() {
+    fn fallback_order_full_amf_mf_d3d_sysmem_openh264() {
         let _g = POLICY_TEST.lock().unwrap_or_else(|e| e.into_inner());
         clear_policy_state();
-        let (hevc, h264) = (EncoderKind::MfHevcHw, EncoderKind::MfH264Hw);
-        assert_eq!(on_hw_failure(hevc, true, true), HwFailAction::RetryWithoutD3d); // HEVC D3D failed
-        assert!(no_d3d(hevc) && !no_d3d(h264)); // H.264 D3D is next in create_encoder pass 1
-        assert_eq!(on_hw_failure(h264, true, true), HwFailAction::RetryWithoutD3d); // H.264 D3D failed
-        assert_eq!(on_hw_failure(hevc, false, true), HwFailAction::NextEncoder); // HEVC sysmem failed
-        assert_eq!(on_hw_failure(h264, false, true), HwFailAction::UseSoftware); // H.264 sysmem failed
-        // Client without HEVC: only H.264 counts.
+        let (amf_hevc, amf_h264) = (EncoderKind::AmfHevc, EncoderKind::AmfH264);
+        let (mf_hevc, mf_h264) = (EncoderKind::MfHevcHw, EncoderKind::MfH264Hw);
+
+        // Pass 0: AMF HEVC fails (uses_d3d=false) -> blocked immediately, move to AMF H.264.
+        assert_eq!(on_hw_failure(amf_hevc, false, true), HwFailAction::NextEncoder);
+        assert!(is_blocked(amf_hevc) && !is_blocked(amf_h264));
+        assert!(!hw_exhausted(true));
+
+        // Pass 0: AMF H.264 fails (uses_d3d=false) -> blocked immediately, move to MF HEVC D3D.
+        assert_eq!(on_hw_failure(amf_h264, false, true), HwFailAction::NextEncoder);
+        assert!(is_blocked(amf_h264) && !is_blocked(mf_hevc));
+        assert!(!hw_exhausted(true));
+
+        // Pass 1: MF HEVC D3D fails -> demoted to sysmem, MF H.264 D3D keeps D3D.
+        assert_eq!(on_hw_failure(mf_hevc, true, true), HwFailAction::RetryWithoutD3d);
+        assert!(no_d3d(mf_hevc) && !no_d3d(mf_h264));
+
+        // Pass 1: MF H.264 D3D fails -> demoted to sysmem.
+        assert_eq!(on_hw_failure(mf_h264, true, true), HwFailAction::RetryWithoutD3d);
+        assert!(no_d3d(mf_h264));
+
+        // Pass 2: MF HEVC sysmem fails -> blocked, MF H.264 sysmem still available.
+        assert_eq!(on_hw_failure(mf_hevc, false, true), HwFailAction::NextEncoder);
+        assert!(!hw_exhausted(true));
+
+        // Pass 2: MF H.264 sysmem fails -> all HW kinds exhausted -> OpenH264.
+        assert_eq!(on_hw_failure(mf_h264, false, true), HwFailAction::UseSoftware);
+        assert!(hw_exhausted(true));
+
+        // Client without HEVC: only AMF H.264 + MF H.264 count.
         clear_policy_state();
-        assert_eq!(on_hw_failure(h264, true, false), HwFailAction::RetryWithoutD3d);
-        assert_eq!(on_hw_failure(h264, false, false), HwFailAction::UseSoftware);
+        assert_eq!(on_hw_failure(amf_h264, false, false), HwFailAction::NextEncoder);
+        assert!(!hw_exhausted(false));
+        assert_eq!(on_hw_failure(mf_h264, true, false), HwFailAction::RetryWithoutD3d);
+        assert_eq!(on_hw_failure(mf_h264, false, false), HwFailAction::UseSoftware);
         assert!(hw_exhausted(false) && !hw_exhausted(true));
         clear_policy_state();
     }
@@ -792,9 +848,16 @@ mod tests {
 
     #[test]
     fn kind_names() {
+        assert_eq!(EncoderKind::AmfHevc.name(), "amf-hevc-hw");
+        assert_eq!(EncoderKind::AmfH264.name(), "amf-h264-hw");
         assert_eq!(EncoderKind::MfHevcHw.name(), "mf-hevc-hw");
         assert_eq!(EncoderKind::MfH264Hw.name(), "mf-h264-hw");
         assert_eq!(EncoderKind::OpenH264.name(), "openh264");
+
+        assert_eq!(EncoderKind::AmfHevc.codec_flag(), rv_proto::codec_flags::CODEC_H265);
+        assert_eq!(EncoderKind::AmfH264.codec_flag(), rv_proto::codec_flags::CODEC_H264);
+        assert_eq!(EncoderKind::AmfHevc.slider_codec(), rv_session::Codec::Hevc);
+        assert_eq!(EncoderKind::AmfH264.slider_codec(), rv_session::Codec::H264);
     }
 
     #[test]
@@ -811,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn openh264_produces_idr_annexb() {
+    fn openh264_produces_idr_annexb_and_updates_bitrate_live() {
         let (w, h) = (128u32, 64u32);
         let mut px = Vec::new();
         for i in 0..w * h {
@@ -822,5 +885,8 @@ mod tests {
         let out = e.encode(&f, true).unwrap();
         assert!(out.len() > 16, "got {} bytes", out.len());
         assert_eq!(&out[..4], &[0, 0, 0, 1]);
+        assert!(e.set_bitrate(4_000_000).unwrap());
+        let p = e.encode(&f, false).unwrap();
+        assert!(!p.is_empty());
     }
 }

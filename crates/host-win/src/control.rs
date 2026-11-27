@@ -82,6 +82,7 @@ pub enum Command {
     SetFps(u32),
     SetResolution { width: u32, height: u32 },
     RequestIdr,
+    RequestLog,
     NewOtp,
     /// Retry the USB link now (clears the LAN fallback backoff), for the
     /// device card the user clicked. `serial` is the item's `serial` (may be empty).
@@ -118,12 +119,16 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
         }
         "set_resolution" => {
             let (w, h) = (get_u64(&v, "width")?, get_u64(&v, "height")?);
+            if (w, h) == (0, 0) {
+                return Ok(Command::SetResolution { width: 0, height: 0 });
+            }
             if !(16..=16384).contains(&w) || !(16..=16384).contains(&h) {
-                return Err("width/height must be in 16..=16384".into());
+                return Err("width/height must be 0x0 (native) or in 16..=16384".into());
             }
             Ok(Command::SetResolution { width: w as u32, height: h as u32 })
         }
         "request_idr" => Ok(Command::RequestIdr),
+        "request_log" => Ok(Command::RequestLog),
         "new_otp" => Ok(Command::NewOtp),
         "connect" => Ok(Command::Connect {
             serial: v.get("serial").and_then(Value::as_str).unwrap_or("").to_string(),
@@ -150,6 +155,7 @@ pub struct Stats {
     pub bitrate_kbps: u64,
     pub encode_ms: f64,
     pub rtt_ms: Option<f64>,
+    pub decode_ms: Option<f64>,
     pub encoder: String,
     pub width: u32,
     pub height: u32,
@@ -164,6 +170,7 @@ pub fn stats_json(s: &Stats) -> Value {
         "bitrate_kbps": s.bitrate_kbps,
         "encode_ms": round2(s.encode_ms),
         "rtt_ms": s.rtt_ms.map(round1),
+        "decode_ms": s.decode_ms.map(round2),
         "encoder": s.encoder,
         "width": s.width,
         "height": s.height,
@@ -289,7 +296,12 @@ mod tests {
             parse_command(r#" {"cmd":"set_resolution","width":1920,"height":1080} "#),
             Ok(Command::SetResolution { width: 1920, height: 1080 })
         );
+        assert_eq!(
+            parse_command(r#"{"cmd":"set_resolution","width":0,"height":0}"#),
+            Ok(Command::SetResolution { width: 0, height: 0 })
+        );
         assert_eq!(parse_command(r#"{"cmd":"request_idr"}"#), Ok(Command::RequestIdr));
+        assert_eq!(parse_command(r#"{"cmd":"request_log"}"#), Ok(Command::RequestLog));
         assert_eq!(parse_command(r#"{"cmd":"new_otp"}"#), Ok(Command::NewOtp));
         assert_eq!(parse_command(r#"{"cmd":"stop"}"#), Ok(Command::Stop));
         assert_eq!(
@@ -309,7 +321,10 @@ mod tests {
             r#"{"cmd":"set_quality"}"#,
             r#"{"cmd":"set_fps","fps":0}"#,
             r#"{"cmd":"set_resolution","width":1920}"#,
+            r#"{"cmd":"set_resolution","width":0,"height":1080}"#,
+            r#"{"cmd":"set_resolution","width":1920,"height":0}"#,
             r#"{"cmd":"set_resolution","width":4,"height":1080}"#,
+            r#"{"cmd":"set_resolution","width":20000,"height":1080}"#,
             r#"{"cmd":"explode"}"#,
             r#"{"quality":3}"#,
         ] {
@@ -338,6 +353,7 @@ mod tests {
             bitrate_kbps: 14000,
             encode_ms: 2.345,
             rtt_ms: None,
+            decode_ms: None,
             encoder: "mf-hevc-hw".into(),
             width: 2800,
             height: 1752,
@@ -361,9 +377,11 @@ mod tests {
         assert_eq!(v["fps"], 60.0);
         assert_eq!(v["encode_ms"], 2.35);
         assert!(v["rtt_ms"].is_null());
+        assert!(v["decode_ms"].is_null());
         assert_eq!(v["encoder"], "mf-hevc-hw");
-        let v = stats_json(&Stats { rtt_ms: Some(2.54), ..s });
+        let v = stats_json(&Stats { rtt_ms: Some(2.54), decode_ms: Some(3.456), ..s });
         assert_eq!(v["rtt_ms"], 2.5);
+        assert_eq!(v["decode_ms"], 3.46);
     }
 
     #[test]
