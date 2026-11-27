@@ -295,6 +295,10 @@ impl AmfSurfaceHandle {
             ((*(*self.0).pVtbl).SetProperty)(self.0, w.as_ptr(), value)
         }
     }
+
+    fn set_crop(&self, x: i32, y: i32, w: i32, h: i32) -> AmfResult {
+        unsafe { ((*(*self.0).pVtbl).SetCrop)(self.0, x, y, w, h) }
+    }
 }
 
 #[cfg(windows)]
@@ -386,7 +390,8 @@ struct D3dNv12Ring {
     next: usize,
     in_size: (u32, u32),
     out_size: (u32, u32),
-    in_view: Option<(*mut c_void, ID3D11VideoProcessorInputView)>,
+    tex_size: (u32, u32),
+    in_views: Vec<(*mut c_void, ID3D11VideoProcessorInputView)>,
 }
 
 #[cfg(windows)]
@@ -397,6 +402,9 @@ impl D3dNv12Ring {
         out_size: (u32, u32),
         fps: u32,
     ) -> Result<Self> {
+        // VCN 4 hardware aligns NV12 surfaces to 64x16 (e.g. 2800x1752 -> 2816x1760).
+        // Pre-allocating aligned textures + SetCrop avoids an internal AMF staging copy.
+        let tex_size = ((out_size.0 + 63) & !63, (out_size.1 + 15) & !15);
         unsafe {
             let ctx = device
                 .GetImmediateContext()
@@ -413,8 +421,8 @@ impl D3dNv12Ring {
                 InputWidth: in_size.0,
                 InputHeight: in_size.1,
                 OutputFrameRate: DXGI_RATIONAL { Numerator: fps.max(1), Denominator: 1 },
-                OutputWidth: out_size.0,
-                OutputHeight: out_size.1,
+                OutputWidth: tex_size.0,
+                OutputHeight: tex_size.1,
                 Usage: D3D11_VIDEO_USAGE_OPTIMAL_SPEED,
             };
             let venum = vdev
@@ -447,8 +455,8 @@ impl D3dNv12Ring {
             let mut with_srv = true;
             for _ in 0..RING_LEN {
                 let mut td = D3D11_TEXTURE2D_DESC {
-                    Width: out_size.0,
-                    Height: out_size.1,
+                    Width: tex_size.0,
+                    Height: tex_size.1,
                     MipLevels: 1,
                     ArraySize: 1,
                     Format: DXGI_FORMAT_NV12,
@@ -503,7 +511,8 @@ impl D3dNv12Ring {
                 next: 0,
                 in_size,
                 out_size,
-                in_view: None,
+                tex_size,
+                in_views: Vec::with_capacity(4),
             })
         }
     }
@@ -511,24 +520,30 @@ impl D3dNv12Ring {
     fn convert(&mut self, src: &ID3D11Texture2D) -> Result<ID3D11Texture2D> {
         unsafe {
             let raw = src.as_raw();
-            let need_view = !matches!(&self.in_view, Some((p, _)) if *p == raw);
-            if need_view {
-                let vd = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
-                    FourCC: 0,
-                    ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
-                    Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
-                        Texture2D: D3D11_TEX2D_VPIV { MipSlice: 0, ArraySlice: 0 },
-                    },
-                };
-                let mut view = None;
-                self.vdev
-                    .CreateVideoProcessorInputView(src, &self.venum, &vd, Some(&mut view))
-                    .map_err(|e| d3d_err("CreateVideoProcessorInputView", e))?;
-                let view =
-                    view.ok_or_else(|| HostError::Encoder("amf: VP input view null".into()))?;
-                self.in_view = Some((raw, view));
-            }
-            let (_, in_view) = self.in_view.as_ref().expect("input view just created");
+            let view_idx = match self.in_views.iter().position(|(p, _)| *p == raw) {
+                Some(i) => i,
+                None => {
+                    let vd = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+                        FourCC: 0,
+                        ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+                        Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                            Texture2D: D3D11_TEX2D_VPIV { MipSlice: 0, ArraySlice: 0 },
+                        },
+                    };
+                    let mut view = None;
+                    self.vdev
+                        .CreateVideoProcessorInputView(src, &self.venum, &vd, Some(&mut view))
+                        .map_err(|e| d3d_err("CreateVideoProcessorInputView", e))?;
+                    let view =
+                        view.ok_or_else(|| HostError::Encoder("amf: VP input view null".into()))?;
+                    if self.in_views.len() >= 4 {
+                        self.in_views.remove(0);
+                    }
+                    self.in_views.push((raw, view));
+                    self.in_views.len() - 1
+                }
+            };
+            let (_, in_view) = &self.in_views[view_idx];
             let (tex, out_view) = &self.ring[self.next];
             self.next = (self.next + 1) % self.ring.len();
 
@@ -619,6 +634,13 @@ impl InputPath {
         match self {
             InputPath::Nv12(_) => "nv12",
             InputPath::Bgra(_) => "bgra",
+        }
+    }
+
+    fn needs_crop(&self) -> bool {
+        match self {
+            InputPath::Nv12(vp) => vp.tex_size != vp.out_size,
+            InputPath::Bgra(_) => false,
         }
     }
 
@@ -850,7 +872,6 @@ impl AmfEncoder {
                 set_opt(HEVC_GOP_SIZE, AMFVariantStruct::from_i64(gop));
                 // 0 = no periodic IDR spikes; initial IDR + client PLI handle recovery cleanly.
                 set_opt(HEVC_GOPS_PER_IDR, AMFVariantStruct::from_i64(0));
-                set_opt(HEVC_INTRA_REFRESH_NUM_CTBS_PER_SLOT, AMFVariantStruct::from_i64(0));
                 set_opt(HEVC_FILLER_DATA_ENABLE, AMFVariantStruct::from_bool(false));
                 set_opt("HevcRateControlSkipFrameEnable", AMFVariantStruct::from_bool(false));
                 set_opt(HEVC_RATE_CONTROL_PREANALYSIS_ENABLE, AMFVariantStruct::from_bool(false));
@@ -922,10 +943,10 @@ impl AmfEncoder {
                         return Ok(None);
                     }
                     spins += 1;
-                    if spins <= 3 {
+                    if spins <= 1 {
                         std::thread::yield_now();
                     } else {
-                        std::thread::sleep(std::time::Duration::from_micros(300));
+                        std::thread::sleep(std::time::Duration::from_micros(500));
                     }
                 }
                 (AMF_EOF, _) | (AMF_OK, None) => return Ok(None),
@@ -944,6 +965,9 @@ impl AmfEncoder {
             .input
             .prepare(src_tex, frame.width, frame.height, self.cfg.fps)?;
         let surface = self.context.create_surface_from_dx11_native(ring_tex.as_raw())?;
+        if self.input.needs_crop() {
+            let _ = surface.set_crop(0, 0, self.cfg.width as i32, self.cfg.height as i32);
+        }
 
         let fps = self.cfg.fps.max(1) as u64;
         let pts_100ns = (self.frame_no * 10_000_000 / fps) as amf_pts;

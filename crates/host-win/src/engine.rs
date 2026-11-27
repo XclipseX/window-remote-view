@@ -283,8 +283,8 @@ impl Drop for HighResTimerGuard {
 fn boost_thread_priority(name: &str) {
     #[cfg(windows)]
     unsafe {
-        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST};
-        if let Err(e) = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) {
+        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+        if let Err(e) = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) {
             warn!("priority: SetThreadPriority({name}) failed: {e}");
         }
     }

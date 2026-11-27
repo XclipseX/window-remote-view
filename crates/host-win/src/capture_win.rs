@@ -226,7 +226,8 @@ pub struct DesktopDuplicator {
     dup: IDXGIOutputDuplication,
     rect: Rect,
     size: (u32, u32),
-    copy: Option<ID3D11Texture2D>,
+    copies: [Option<ID3D11Texture2D>; 2],
+    copy_idx: usize,
     staging: StagingCache,
     rects_buf: Vec<RECT>,
 }
@@ -263,17 +264,34 @@ impl DesktopDuplicator {
             let base: IDXGIAdapter = adapter.cast()?;
             let mut device = None;
             let mut ctx = None;
-            D3D11CreateDevice(
+            let video_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+            if D3D11CreateDevice(
                 &base,
                 D3D_DRIVER_TYPE_UNKNOWN,
                 HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                video_flags,
                 None,
                 D3D11_SDK_VERSION,
                 Some(&mut device),
                 None,
                 Some(&mut ctx),
-            )?;
+            )
+            .is_err()
+            {
+                device = None;
+                ctx = None;
+                D3D11CreateDevice(
+                    &base,
+                    D3D_DRIVER_TYPE_UNKNOWN,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut ctx),
+                )?;
+            }
             let device = device.ok_or_else(|| HostError::Os("no D3D11 device".into()))?;
             let ctx = ctx.ok_or_else(|| HostError::Os("no D3D11 context".into()))?;
             let dup = output1.DuplicateOutput(&device)?;
@@ -285,7 +303,8 @@ impl DesktopDuplicator {
                 dup,
                 size: (rect.width() as u32, rect.height() as u32),
                 rect,
-                copy: None,
+                copies: [None, None],
+                copy_idx: 0,
                 staging: Default::default(),
                 rects_buf: vec![RECT::default(); 64],
             })
@@ -346,7 +365,13 @@ impl DesktopDuplicator {
                 .cast()?;
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             tex.GetDesc(&mut desc);
-            if self.copy.is_none() || self.size != (desc.Width, desc.Height) {
+            if self.size != (desc.Width, desc.Height) {
+                self.copies = [None, None];
+                self.size = (desc.Width, desc.Height);
+            }
+            let slot = self.copy_idx;
+            self.copy_idx = (self.copy_idx + 1) % self.copies.len();
+            if self.copies[slot].is_none() {
                 let mut d = desc;
                 d.Usage = D3D11_USAGE_DEFAULT;
                 // RENDER_TARGET | SHADER_RESOURCE: accepted as a VideoProcessor input by all
@@ -357,10 +382,9 @@ impl DesktopDuplicator {
                 d.MiscFlags = 0;
                 let mut t = None;
                 self.device.CreateTexture2D(&d, None, Some(&mut t))?;
-                self.copy = t;
-                self.size = (desc.Width, desc.Height);
+                self.copies[slot] = t;
             }
-            let copy = self.copy.clone().expect("copy texture");
+            let copy = self.copies[slot].clone().expect("copy texture");
             self.ctx.CopyResource(&copy, &tex);
             self.dup.ReleaseFrame()?;
             Ok(Some(CapturedFrame {
