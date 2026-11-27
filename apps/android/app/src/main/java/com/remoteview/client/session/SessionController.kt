@@ -9,6 +9,7 @@ import android.os.Process
 import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.view.Surface
+import com.remoteview.client.LogShare
 import com.remoteview.client.NativeBridge
 import com.remoteview.client.NativeInputSink
 import com.remoteview.client.RvLog
@@ -25,6 +26,7 @@ import com.remoteview.client.input.KeyboardBridge
 import com.remoteview.client.input.PointerCaptureController
 import com.remoteview.client.input.StylusMapper
 import com.remoteview.client.input.TouchGestureMapper
+import com.remoteview.client.input.TouchMode
 import com.remoteview.client.perf.AdpfSession
 import com.remoteview.client.perf.ThermalGovernor
 import com.remoteview.client.render.DisplayLock
@@ -49,28 +51,42 @@ class SessionController(
     private val otp: String? = null,
 ) {
     @Volatile var nativeHandle: Long = 0L
+    @Volatile var rttMs: Float = 0f
+    @Volatile var bitrateKbps: Int = 0
+    @Volatile var lossPercent: Float = 0f
 
     private val sink = NativeInputSink { nativeHandle }
     val keyboard = KeyboardBridge(sink).also { it.rawTyping = settings.rawTyping }
     private val stylus = StylusMapper(sink)
     private val touch = TouchGestureMapper(
-        activity, sink, if (usbDisplay) com.remoteview.client.input.TouchMode.DIRECT else settings.touchMode,
+        activity, sink, settings.touchMode,
         onLocalMove = { dx, dy -> onLocalCursorDelta(dx, dy) },
     ) { s, fx, fy -> view?.applyZoom(s, fx, fy) }
-    private val directTouch = if (usbDisplay) DirectTouchMapper(sink) else null
-    private val baseFps = if (usbDisplay) DisplayCaps.nativeDisplay(activity).refreshHz else settings.fps
+    private val directTouch = if (usbDisplay && settings.touchMode == TouchMode.DIRECT) DirectTouchMapper(sink) else null
+    private val baseFps: Int = run {
+        val maxHz = DisplayCaps.nativeDisplay(activity).refreshHz
+        if (maxHz > 0) minOf(settings.fps, maxHz) else settings.fps
+    }
     val helloJson: String get() = DisplayCaps.helloJson(activity, settings, usbDisplay, otp, deviceName)
     private val deviceName: String = DeviceName.friendly(activity)
 
     private var audio: AudioPlayer? = null
     private var link: DatagramLink? = null
+    @Volatile private var lanTarget: String? = null
     /** Liên kết USB đóng (rút cáp...): MainActivity kết thúc phiên. Gọi từ thread nền. */
     var onLinkClosed: ((String?) -> Unit)? = null
     /** Lõi Rust báo phiên lỗi (sai PIN, host không trả lời...). Gọi từ thread nền. */
     var onNativeFailed: ((String?) -> Unit)? = null
 
+    @Volatile private var established = false
     /** true khi đã bắt tay xong (có handle + state ESTABLISHED): dùng cho nút "Gửi log lên máy tính". */
-    val isConnected: Boolean get() = nativeHandle != 0L && dbgState == NativeBridge.STATE_ESTABLISHED
+    val isConnected: Boolean get() = nativeHandle != 0L && established
+
+    fun onNativeStats(rttMs: Float, bitrateKbps: Int, lossPercent: Float) {
+        this.rttMs = rttMs
+        this.bitrateKbps = bitrateKbps
+        this.lossPercent = lossPercent
+    }
 
     /** Kích thước khung hình luồng (WxH) để UI đặt SurfaceView đúng tỉ lệ; ban đầu = kích thước màn hình. */
     private val _streamSize = MutableStateFlow(decodeSize())
@@ -131,6 +147,10 @@ class SessionController(
                 width = w,
                 height = h,
                 dropped = pres?.droppedStale?.get() ?: 0L,
+                rttMs = rttMs,
+                decodeMs = decoder?.avgDecodeMs ?: 0f,
+                bitrateKbps = bitrateKbps,
+                lossPercent = lossPercent,
             )
             mainHandler.postDelayed(this, HUD_INTERVAL_MS)
         }
@@ -170,11 +190,15 @@ class SessionController(
     @Volatile private var decoder: LowLatencyDecoder? = null
     private var presenter: FramePresenter? = null
     private var watchdog: StallWatchdog? = null
-    private var adpf: AdpfSession? = null
+    @Volatile private var adpf: AdpfSession? = null
     private var thermal: ThermalGovernor? = null
     private var surface: Surface? = null
-    private var effectiveFps = baseFps
-    private var lastFrameSubmitMs = 0L
+    @Volatile private var effectiveFps = baseFps
+    @Volatile private var currentQuality = settings.qualityPercent
+    @Volatile private var lastLogUploadReqMs = 0L
+
+    val liveQuality: Int get() = currentQuality
+    val liveFps: Int get() = effectiveFps
 
     // --- Số liệu gỡ lỗi ---
     @Volatile private var dbgState = -1
@@ -187,9 +211,10 @@ class SessionController(
     fun debugSnapshot(): DebugSnapshot {
         val l = link
         val aoa = l as? AccessoryLink
+        val lan = lanTarget
         return DebugSnapshot(
-            linkType = l?.name ?: "-",
-            linkOpen = l?.isOpen == true,
+            linkType = l?.name ?: lan?.let { "LAN ($it)" } ?: "-",
+            linkOpen = l?.isOpen == true || (lan != null && nativeHandle != 0L),
             aoaOpened = if (aoa == null) "-" else if (aoa.fdOpened) "có" else if (aoa.permissionGranted) "đang mở" else "chờ quyền",
             bytesIn = l?.bytesIn ?: 0,
             bytesOut = l?.bytesOut ?: 0,
@@ -204,6 +229,10 @@ class SessionController(
             framesDecoded = decoder?.framesOut?.get() ?: 0,
             lastError = dbgLastError,
             establishedAtMs = dbgEstablishedAt,
+            rttMs = rttMs,
+            decodeMs = decoder?.avgDecodeMs ?: 0f,
+            bitrateKbps = bitrateKbps,
+            lossPercent = lossPercent,
         )
     }
 
@@ -274,9 +303,68 @@ class SessionController(
         l.start()
     }
 
+    /**
+     * Kết nối qua mạng LAN (UDP trực tiếp tới [target]) bằng lõi Rust.
+     * Dùng [otp] đã truyền vào constructor (gửi trong [helloJson]).
+     */
+    fun connectLan(target: String) {
+        lanTarget = target
+        RvLog.i("connectLan: target=$target, native=${NativeBridge.available}, otp=${if (otp != null) "đã nhập" else "PIN lưu"}")
+        if (!NativeBridge.available) {
+            val msg = "librv_core.so chưa nạp, không thể kết nối LAN"
+            recordError(msg)
+            dbgHandshake = "không có lõi native"
+            onNativeFailed?.invoke(msg)
+            return
+        }
+        dbgHandshake = "đang kết nối LAN ($target)"
+        val h = try {
+            NativeBridge.nativeConnect(target, helloJson)
+        } catch (t: Throwable) {
+            recordError("nativeConnect ném lỗi: ${t.javaClass.simpleName}: ${t.message}")
+            dbgHandshake = "lỗi native"
+            onNativeFailed?.invoke(t.message ?: "lỗi nativeConnect")
+            return
+        }
+        nativeHandle = h
+        RvLog.i("nativeConnect($target) -> handle=$h")
+        if (h == 0L) {
+            recordError("nativeConnect trả 0 (địa chỉ hoặc PIN không hợp lệ?)")
+            dbgHandshake = "native từ chối tạo phiên LAN"
+            onNativeFailed?.invoke("không thể kết nối tới $target")
+        } else {
+            dbgHandshake = "đã gửi Hello tới $target"
+        }
+    }
+
+    /** Yêu cầu host đổi chất lượng (1..100) và FPS trực tiếp trong phiên đang chạy (fps <= 0 giữ nguyên). */
+    fun applyStreamQuality(quality: Int, fps: Int) {
+        val h = nativeHandle
+        val q = quality.coerceIn(1, 100)
+        val f = if (fps > 0) fps.coerceIn(15, 240) else 0
+        currentQuality = q
+        if (f > 0) {
+            val maxHz = DisplayCaps.nativeDisplay(activity).refreshHz
+            effectiveFps = if (maxHz > 0) minOf(f, maxHz) else f
+            surface?.let { DisplayLock.applyFrameRate(it, effectiveFps.toFloat()) }
+            adpf?.updateTarget(effectiveFps)
+        }
+        if (NativeBridge.available && h != 0L) {
+            NativeBridge.nativeSetStreamQuality(h, q, 0, 0, f)
+        }
+    }
+
     fun toggleSoftKeyboard() { view?.toggleSoftKeyboard() }
 
     fun onWindowFocusChanged(hasFocus: Boolean) = capture?.onWindowFocusChanged(hasFocus)
+
+    private fun refreshAdpf(codecTid: Int = 0) {
+        val tid = if (codecTid > 0) codecTid else Process.myTid()
+        val prev = adpf
+        adpf = null
+        prev?.close()
+        adpf = AdpfSession(activity, intArrayOf(tid), effectiveFps)
+    }
 
     fun onSurfaceReady(s: Surface) {
         surface = s
@@ -285,8 +373,8 @@ class SessionController(
 
         // Chỉ dựng decoder khi đã biết cấu hình luồng; chưa có thì chờ STATE_STREAM_CONFIG (hoặc dự phòng).
         if (streamConfig != null) startVideo(s) else armConfigFallback()
+        if (adpf == null) refreshAdpf()
 
-        adpf = AdpfSession(activity, intArrayOf(Process.myTid()), effectiveFps)
         thermal = ThermalGovernor(activity, object : ThermalGovernor.Listener {
             override fun onBitrateScale(scale: Float) {
                 if (NativeBridge.available && nativeHandle != 0L) {
@@ -307,7 +395,7 @@ class SessionController(
 
     private fun armConfigFallback() {
         mainHandler.removeCallbacks(configFallback)
-        if (dbgState == NativeBridge.STATE_ESTABLISHED && surface != null && streamConfig == null) {
+        if (established && surface != null && streamConfig == null) {
             mainHandler.postDelayed(configFallback, CONFIG_WAIT_MS)
         }
     }
@@ -337,13 +425,22 @@ class SessionController(
             if (settings.directPresent) FramePresenter.Mode.DIRECT else FramePresenter.Mode.CHOREOGRAPHER,
         ) { idle -> surface?.let { DisplayLock.setIdle(it, idle, effectiveFps.toFloat()) } }
         dec.onOutput = pres::onOutput
+        dec.onDecodeTiming = { decodeUs ->
+            val handle = nativeHandle
+            if (NativeBridge.available && handle != 0L) {
+                NativeBridge.nativeReportDecodeUs(handle, decodeUs)
+            }
+            adpf?.report(decodeUs * 1000L)
+        }
         decoder = dec
         presenter = pres
         val started = dec.start(s)
         videoStarted = started
-        RvLog.i("decoder start=$started name=${dec.info?.codecName} ${w}x$h@$fps")
+        RvLog.i("decoder start=$started name=${dec.info?.codecName} ${w}x$h@$fps tid=${dec.codecThreadTid}")
         if (!started) dbgLastError = "decoder không khởi động được"
         if (started) {
+            // Đăng ký luồng giải mã MediaCodec thực tế vào ADPF để governor tăng xung đúng thread.
+            refreshAdpf(dec.codecThreadTid)
             // Frame tới trước khi decoder sẵn sàng đã bị bỏ: xin keyframe để không bị đen.
             keyFrame()
             watchdog = StallWatchdog(object : StallWatchdog.Host {
@@ -399,10 +496,14 @@ class SessionController(
         dbgMessage = message ?: ""
         when (state) {
             NativeBridge.STATE_CONNECTING -> dbgHandshake = "đang bắt tay"
-            NativeBridge.STATE_CLOSED -> dbgHandshake = "đã đóng"
-            NativeBridge.STATE_FAILED -> { dbgHandshake = "thất bại"; dbgLastError = message ?: "native FAILED" }
-            NativeBridge.STATE_DISCONNECTED -> dbgHandshake = "host im lặng"
-            NativeBridge.STATE_ESTABLISHED -> { dbgHandshake = "đã bắt tay"; if (dbgEstablishedAt == 0L) dbgEstablishedAt = SystemClock.elapsedRealtime() }
+            NativeBridge.STATE_CLOSED -> { established = false; dbgHandshake = "đã đóng" }
+            NativeBridge.STATE_FAILED -> { established = false; dbgHandshake = "thất bại"; dbgLastError = message ?: "native FAILED" }
+            NativeBridge.STATE_DISCONNECTED -> { established = false; dbgHandshake = "host im lặng" }
+            NativeBridge.STATE_ESTABLISHED -> {
+                established = true
+                dbgHandshake = "đã bắt tay"
+                if (dbgEstablishedAt == 0L) dbgEstablishedAt = SystemClock.elapsedRealtime()
+            }
         }
         when (state) {
             NativeBridge.STATE_FAILED -> onNativeFailed?.invoke(message)
@@ -438,6 +539,21 @@ class SessionController(
                     old.width == cfg.width && old.height == cfg.height && old.fps == cfg.fps
                 if (!same) startVideo(s) // mime/kích thước/fps đổi (hoặc decoder chưa đúng cấu hình): dựng lại
             }
+            NativeBridge.STATE_LOG_REQUEST -> {
+                val h = nativeHandle
+                val now = SystemClock.elapsedRealtime()
+                if (h != 0L && NativeBridge.available && now - lastLogUploadReqMs >= LOG_UPLOAD_MIN_INTERVAL_MS) {
+                    lastLogUploadReqMs = now
+                    Thread({
+                        val ok = LogShare.upload(h)
+                        if (ok) {
+                            RvLog.i("host yêu cầu log -> đã gửi lên máy tính")
+                        } else {
+                            RvLog.w("host yêu cầu log -> gửi thất bại")
+                        }
+                    }, "rv-log-host-req").also { it.isDaemon = true; it.start() }
+                }
+            }
         }
     }
 
@@ -446,9 +562,7 @@ class SessionController(
         val dec = decoder ?: return
         val mime = dec.info?.mime ?: "video/hevc"
         val key = (flags and NativeBridge.FLAG_KEYFRAME) != 0 || AnnexB.containsKeyFrame(data, mime)
-        val start = SystemClock.elapsedRealtimeNanos()
         dec.submit(EncodedFrame(data, ptsUs, key, (flags and NativeBridge.FLAG_CONFIG) != 0))
-        adpf?.report(SystemClock.elapsedRealtimeNanos() - start)
     }
 
     /** Activity ra nền (onStop): dừng âm thanh (surface bị hủy -> video cũng dừng). */
@@ -473,6 +587,7 @@ class SessionController(
 
     fun release() {
         released = true
+        established = false
         mainHandler.removeCallbacksAndMessages(null)
         onSurfaceDestroyed()
         audio?.stop(); audio = null
@@ -483,13 +598,13 @@ class SessionController(
         view = null
     }
 
-    /** Kích thước giải mã khởi tạo = màn hình gốc x tỉ lệ (số chẵn). TODO: lấy kích thước thật từ host. */
+    /** Kích thước giải mã khởi tạo = màn hình gốc x tỉ lệ (số chẵn). */
     private fun decodeSize(): Pair<Int, Int> {
         val dm = DisplayMetrics()
         @Suppress("DEPRECATION")
         activity.windowManager.defaultDisplay.getRealMetrics(dm)
-        val k = if (usbDisplay) 1f else settings.resolutionPercent / 100f
-        fun even(v: Float) = (v.toInt() / 2) * 2
+        val k = settings.resolutionPercent.coerceIn(25, 100) / 100f
+        fun even(v: Float) = ((v.toInt() / 2) * 2).coerceAtLeast(2)
         return even(dm.widthPixels * k) to even(dm.heightPixels * k)
     }
 
@@ -499,5 +614,6 @@ class SessionController(
     private companion object {
         const val CONFIG_WAIT_MS = 1500L
         const val HUD_INTERVAL_MS = 500L
+        const val LOG_UPLOAD_MIN_INTERVAL_MS = 3000L
     }
 }

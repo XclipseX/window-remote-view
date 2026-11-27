@@ -171,6 +171,9 @@ class LowLatencyDecoder(
     /** Đặt bởi FramePresenter. Nếu null, khung được render ngay. Gọi từ thread callback của codec. */
     @Volatile var onOutput: ((index: Int, ptsUs: Long) -> Unit)? = null
 
+    /** Gọi từ thread callback của codec khi đo được độ trễ giải mã phần cứng (microsecond). */
+    @Volatile var onDecodeTiming: ((decodeUs: Int) -> Unit)? = null
+
     @Volatile var info: DecoderInfo? = null
         private set
 
@@ -178,6 +181,15 @@ class LowLatencyDecoder(
     @Volatile var lastInputMs: Long = 0
         private set
     @Volatile var lastOutputMs: Long = 0
+        private set
+    /** Thời gian giải mã MediaCodec khung gần nhất (microsecond, kẹp 0..500_000). */
+    @Volatile var lastDecodeUs: Int = 0
+        private set
+    /** Thời gian giải mã trung bình EWMA (alpha = 0.2, đơn vị ms). */
+    @Volatile var avgDecodeMs: Float = 0f
+        private set
+    /** Linux TID của luồng callback MediaCodec (dùng để đăng ký với ADPF). */
+    @Volatile var codecThreadTid: Int = 0
         private set
     val framesIn = AtomicLong()
     val framesOut = AtomicLong()
@@ -188,6 +200,13 @@ class LowLatencyDecoder(
     private val frames = ArrayDeque<EncodedFrame>()
     private val pendingInputs = ArrayDeque<Int>()
     private var waitingForKey = true
+
+    // Vòng đệm 64 khe không cấp phát (ptsUs -> System.nanoTime() lúc queueInputBuffer) để đo decode latency thật.
+    private val timingLock = Any()
+    private val ptsRing = LongArray(TIMING_RING_SIZE) { Long.MIN_VALUE }
+    private val enqNsRing = LongArray(TIMING_RING_SIZE)
+    private var timingWriteIdx = 0
+    private var hasDecodeSample = false
 
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
@@ -204,6 +223,8 @@ class LowLatencyDecoder(
                 val t = HandlerThread("rv-codec").also { it.start() }
                 thread = t
                 handler = Handler(t.looper)
+                val tid = t.threadId
+                codecThreadTid = if (tid > 0) tid else 0
             }
             return startLocked()
         }
@@ -271,6 +292,7 @@ class LowLatencyDecoder(
             thread?.quitSafely()
             thread = null
             handler = null
+            codecThreadTid = 0
         }
     }
 
@@ -282,6 +304,7 @@ class LowLatencyDecoder(
             runCatching { c.release() }
         }
         synchronized(lock) { pendingInputs.clear(); frames.clear() }
+        clearTimingRing(resetStats = true)
     }
 
     /** Watchdog 1 s: flush (async mode phải start() lại sau flush). */
@@ -291,6 +314,7 @@ class LowLatencyDecoder(
             try {
                 c.flush()
                 synchronized(lock) { pendingInputs.clear(); frames.clear(); waitingForKey = true }
+                clearTimingRing(resetStats = false)
                 c.start()
                 listener.onKeyFrameNeeded()
             } catch (e: Exception) {
@@ -307,6 +331,57 @@ class LowLatencyDecoder(
             if (escalate) minTier = (info?.tierIndex ?: -1) + 1
             stopCodecLocked()
             startLocked()
+        }
+    }
+
+    private fun clearTimingRing(resetStats: Boolean) {
+        synchronized(timingLock) {
+            ptsRing.fill(Long.MIN_VALUE)
+            enqNsRing.fill(0L)
+            timingWriteIdx = 0
+            if (resetStats) {
+                hasDecodeSample = false
+                lastDecodeUs = 0
+                avgDecodeMs = 0f
+            }
+        }
+    }
+
+    private fun recordEnqueueTime(ptsUs: Long, nowNs: Long) {
+        val ts = if (nowNs == 0L) 1L else nowNs
+        synchronized(timingLock) {
+            val slot = timingWriteIdx and TIMING_RING_MASK
+            ptsRing[slot] = ptsUs
+            enqNsRing[slot] = ts
+            timingWriteIdx++
+        }
+    }
+
+    private fun recordDequeueTime(ptsUs: Long, nowNs: Long): Int {
+        synchronized(timingLock) {
+            var foundNs = 0L
+            var i = timingWriteIdx - 1
+            for (step in 0 until TIMING_RING_SIZE) {
+                val slot = i and TIMING_RING_MASK
+                if (ptsRing[slot] == ptsUs && enqNsRing[slot] != 0L) {
+                    foundNs = enqNsRing[slot]
+                    ptsRing[slot] = Long.MIN_VALUE
+                    enqNsRing[slot] = 0L
+                    break
+                }
+                i--
+            }
+            if (foundNs == 0L) return -1
+            val decodeUs = ((nowNs - foundNs) / 1000L).coerceIn(0L, MAX_DECODE_US).toInt()
+            lastDecodeUs = decodeUs
+            val decodeMs = decodeUs / 1000f
+            avgDecodeMs = if (!hasDecodeSample) {
+                hasDecodeSample = true
+                decodeMs
+            } else {
+                avgDecodeMs * (1f - DECODE_EWMA_ALPHA) + decodeMs * DECODE_EWMA_ALPHA
+            }
+            return decodeUs
         }
     }
 
@@ -350,6 +425,9 @@ class LowLatencyDecoder(
                 if (f.isCodecConfig) flags = flags or MediaCodec.BUFFER_FLAG_CODEC_CONFIG
                 if (f.isKeyFrame) flags = flags or MediaCodec.BUFFER_FLAG_KEY_FRAME
                 c.queueInputBuffer(idx, 0, f.data.size, f.ptsUs, flags)
+                if ((flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
+                    recordEnqueueTime(f.ptsUs, System.nanoTime())
+                }
                 if (f.isKeyFrame) waitingForKey = false
                 lastInputMs = SystemClock.elapsedRealtime()
                 framesIn.incrementAndGet()
@@ -387,6 +465,10 @@ class LowLatencyDecoder(
             if (info.size == 0 || (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
                 runCatching { codec.releaseOutputBuffer(index, false) }
                 return
+            }
+            val decodeUs = recordDequeueTime(info.presentationTimeUs, System.nanoTime())
+            if (decodeUs >= 0) {
+                onDecodeTiming?.invoke(decodeUs)
             }
             lastOutputMs = SystemClock.elapsedRealtime()
             framesOut.incrementAndGet()
@@ -450,6 +532,10 @@ class LowLatencyDecoder(
     companion object {
         private const val MAX_QUEUE = 8
         private const val MAX_INPUT_SIZE = 4 * 1024 * 1024
+        private const val TIMING_RING_SIZE = 64
+        private const val TIMING_RING_MASK = TIMING_RING_SIZE - 1
+        private const val MAX_DECODE_US = 500_000L
+        private const val DECODE_EWMA_ALPHA = 0.2f
 
         private val PLAIN = Tier("plain", standardLowLatency = false, operatingRate = null, intKeys = emptyList())
 

@@ -19,8 +19,11 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.MessageDigest
+import java.util.Locale
 import kotlin.coroutines.coroutineContext
 
 sealed interface UpdateState {
@@ -148,10 +151,11 @@ class UpdateController(context: Context, private val scope: CoroutineScope) {
             setRequestProperty("User-Agent", "RemoteView-Android")
         }
         try {
-            if (conn.responseCode != 200) throw java.io.IOException("HTTP ${conn.responseCode}")
+            if (conn.responseCode != 200) throw IOException("HTTP ${conn.responseCode}")
             val total = conn.contentLengthLong.takeIf { it > 0 } ?: info.apkSize
             var done = 0L
             var lastPct = -1
+            val md = MessageDigest.getInstance("SHA-256")
             conn.inputStream.use { ins ->
                 tmp.outputStream().use { os ->
                     val buf = ByteArray(64 * 1024)
@@ -160,6 +164,7 @@ class UpdateController(context: Context, private val scope: CoroutineScope) {
                         val n = ins.read(buf)
                         if (n < 0) break
                         os.write(buf, 0, n)
+                        md.update(buf, 0, n)
                         done += n
                         if (total > 0) {
                             val pct = (done * 100 / total).toInt()
@@ -169,15 +174,39 @@ class UpdateController(context: Context, private val scope: CoroutineScope) {
                             }
                         }
                     }
+                    os.flush()
                 }
             }
-            if (total > 0 && done != total) throw java.io.IOException("tải thiếu dữ liệu ($done/$total byte)")
+            if (total > 0 && done != total) throw IOException("tải thiếu dữ liệu ($done/$total byte)")
+            val actualSha256 = md.digest().toHexLower()
+            val expectedSha256 = info.sha256?.lowercase(Locale.US)
+            if (expectedSha256 != null) {
+                if (actualSha256 != expectedSha256) {
+                    tmp.delete()
+                    RvLog.w("cập nhật: sai SHA-256 (kỳ vọng=$expectedSha256 thực tế=$actualSha256)")
+                    throw IOException("Tệp tải về hỏng hoặc sai mã kiểm tra SHA-256")
+                }
+                RvLog.i("cập nhật: xác thực SHA-256 hợp lệ (${actualSha256.take(12)}…)")
+            } else {
+                RvLog.i("cập nhật: bản phát hành không có SHA-256, bỏ qua kiểm tra (${actualSha256.take(12)}…)")
+            }
             if (out.exists()) out.delete()
-            if (!tmp.renameTo(out)) throw java.io.IOException("không ghi được tệp APK")
+            if (!tmp.renameTo(out)) throw IOException("không ghi được tệp APK")
         } finally {
             conn.disconnect()
             if (tmp.exists()) tmp.delete()
         }
+    }
+
+    private fun ByteArray.toHexLower(): String {
+        val hex = CharArray(size * 2)
+        val digits = "0123456789abcdef"
+        for (i in indices) {
+            val b = this[i].toInt() and 0xFF
+            hex[i * 2] = digits[b ushr 4]
+            hex[i * 2 + 1] = digits[b and 0x0F]
+        }
+        return String(hex)
     }
 
     /** Gọi lại khi app trở lại foreground: nếu vừa cấp quyền "cài ứng dụng không rõ nguồn" thì cài tiếp. */

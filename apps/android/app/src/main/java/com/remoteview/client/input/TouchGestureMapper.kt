@@ -10,8 +10,6 @@ import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.min
 
-// UNBUILT: chưa biên dịch.
-
 enum class TouchMode {
     /** Con trỏ tương đối như touchpad (mặc định điện thoại). */
     TRACKPAD,
@@ -30,14 +28,17 @@ class TouchGestureMapper(
     var mode: TouchMode,
     /** Chế độ trackpad: delta pixel gửi đi, để UI dịch con trỏ cục bộ ngay lập tức. */
     private val onLocalMove: (dx: Int, dy: Int) -> Unit = { _, _ -> },
-    /** scaleFactor tức thời (>1 = phóng to) quanh điểm (focusX, focusY) tính theo pixel view. */
+    /** scaleFactor tức thời (>1 = phóng to) quanh điểm (focusX, focusY) theo tọa độ hộp chứa view. */
     private val onPinchZoom: (scaleFactor: Float, focusX: Float, focusY: Float) -> Unit = { _, _, _ -> },
 ) {
+    /** Callback mở rộng kèm dịch chuyển (panDx, panDy) trong hệ tọa độ hộp chứa, do RemoteSurfaceView gắn khi bind. */
+    internal var onPinchZoomPan: ((scaleFactor: Float, focusX: Float, focusY: Float, panDx: Float, panDy: Float) -> Unit)? = null
+
     private val slop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
     private val density = context.resources.displayMetrics.density
     private val handler = Handler(Looper.getMainLooper())
 
-    // 1 ngón
+    // 1 ngón (lưu theo tọa độ hộp chứa không bị scale/translation làm méo)
     private var downTime = 0L
     private var startX = 0f
     private var startY = 0f
@@ -54,7 +55,7 @@ class TouchGestureMapper(
     private var remX = 0f
     private var remY = 0f
 
-    // 2 ngón
+    // 2 ngón (tọa độ hộp chứa bất biến với scale/translation của SurfaceView để không dao động khi zoom)
     private enum class Two { NONE, SCROLL, PINCH }
     private var two = Two.NONE
     private var twoStartCx = 0f
@@ -74,22 +75,31 @@ class TouchGestureMapper(
         }
     }
 
-    fun onTouchEvent(ev: MotionEvent, viewW: Int, viewH: Int): Boolean {
+    fun onTouchEvent(
+        ev: MotionEvent,
+        viewW: Int,
+        viewH: Int,
+        viewScale: Float = 1f,
+        viewTransX: Float = 0f,
+        viewTransY: Float = 0f,
+    ): Boolean {
         val tool = ev.getToolType(0)
         if (tool == MotionEvent.TOOL_TYPE_STYLUS || tool == MotionEvent.TOOL_TYPE_ERASER ||
             tool == MotionEvent.TOOL_TYPE_MOUSE
         ) return false
 
+        val scale = if (viewScale.isFinite() && viewScale > 0f) viewScale else 1f
         when (ev.actionMasked) {
-            MotionEvent.ACTION_DOWN -> onDown(ev, viewW, viewH)
+            MotionEvent.ACTION_DOWN -> onDown(ev, viewW, viewH, scale, viewTransX, viewTransY)
             MotionEvent.ACTION_POINTER_DOWN -> {
                 maxPointers = maxOf(maxPointers, ev.pointerCount)
-                if (ev.pointerCount == 2) beginTwo(ev)
+                if (ev.pointerCount == 2) beginTwo(ev, scale, viewTransX, viewTransY)
             }
             MotionEvent.ACTION_MOVE ->
-                if (ev.pointerCount >= 2) moveTwo(ev) else moveSingle(ev, viewW, viewH)
+                if (ev.pointerCount >= 2) moveTwo(ev, scale, viewTransX, viewTransY)
+                else moveSingle(ev, viewW, viewH, scale, viewTransX, viewTransY)
             MotionEvent.ACTION_POINTER_UP -> if (ev.pointerCount == 2) endTwo()
-            MotionEvent.ACTION_UP -> onUp(ev)
+            MotionEvent.ACTION_UP -> onUp(ev, scale, viewTransX, viewTransY)
             MotionEvent.ACTION_CANCEL -> cancel()
         }
         return true
@@ -97,17 +107,19 @@ class TouchGestureMapper(
 
     // ---------------------------------------------------------------- 1 ngón
 
-    private fun onDown(ev: MotionEvent, w: Int, h: Int) {
+    private fun onDown(ev: MotionEvent, w: Int, h: Int, scale: Float, transX: Float, transY: Float) {
         val now = SystemClock.uptimeMillis()
+        val px = parentX(ev, 0, scale, transX)
+        val py = parentY(ev, 0, scale, transY)
         downTime = now
-        startX = ev.x; startY = ev.y; lastX = ev.x; lastY = ev.y
+        startX = px; startY = py; lastX = px; lastY = py
         moved = false; longPressFired = false; maxPointers = 1; suppressSingle = false
         dragging = false; two = Two.NONE; twoMoved = false; remX = 0f; remY = 0f
         handler.removeCallbacks(longPress)
 
         if (mode == TouchMode.DIRECT) moveAbs(ev.x, ev.y, w, h)
 
-        val nearLastTap = hypot(ev.x - lastTapX, ev.y - lastTapY) < slop * 4
+        val nearLastTap = hypot(px - lastTapX, py - lastTapY) < slop * 4
         if (now - lastTapUpTime < DOUBLE_TAP_MS && nearLastTap) {
             // Chạm-đúp-giữ = kéo thả: giữ chuột trái.
             dragging = true
@@ -117,9 +129,11 @@ class TouchGestureMapper(
         }
     }
 
-    private fun moveSingle(ev: MotionEvent, w: Int, h: Int) {
+    private fun moveSingle(ev: MotionEvent, w: Int, h: Int, scale: Float, transX: Float, transY: Float) {
         if (suppressSingle) return
-        if (!moved && hypot(ev.x - startX, ev.y - startY) > slop) {
+        val px = parentX(ev, 0, scale, transX)
+        val py = parentY(ev, 0, scale, transY)
+        if (!moved && hypot(px - startX, py - startY) > slop) {
             moved = true
             handler.removeCallbacks(longPress)
         }
@@ -127,8 +141,8 @@ class TouchGestureMapper(
         when (mode) {
             TouchMode.DIRECT -> moveAbs(ev.x, ev.y, w, h)
             TouchMode.TRACKPAD -> {
-                val dx = ev.x - lastX
-                val dy = ev.y - lastY
+                val dx = px - lastX
+                val dy = py - lastY
                 // Gia tốc đơn giản: chuyển động nhanh thì khuếch đại tới 3x.
                 val gain = 1f + min(2f, hypot(dx, dy) / (12f * density))
                 remX += dx * gain
@@ -142,10 +156,10 @@ class TouchGestureMapper(
                 }
             }
         }
-        lastX = ev.x; lastY = ev.y
+        lastX = px; lastY = py
     }
 
-    private fun onUp(ev: MotionEvent) {
+    private fun onUp(ev: MotionEvent, scale: Float, transX: Float, transY: Float) {
         handler.removeCallbacks(longPress)
         val now = SystemClock.uptimeMillis()
         when {
@@ -157,7 +171,8 @@ class TouchGestureMapper(
             !moved && !longPressFired && maxPointers == 1 && now - downTime < TAP_MS -> {
                 click(MouseButtonId.LEFT)
                 lastTapUpTime = now
-                lastTapX = ev.x; lastTapY = ev.y
+                lastTapX = parentX(ev, 0, scale, transX)
+                lastTapY = parentY(ev, 0, scale, transY)
             }
             else -> lastTapUpTime = 0
         }
@@ -177,7 +192,8 @@ class TouchGestureMapper(
 
     // ---------------------------------------------------------------- 2 ngón
 
-    private fun beginTwo(ev: MotionEvent) {
+    private fun beginTwo(ev: MotionEvent, scale: Float, transX: Float, transY: Float) {
+        if (ev.pointerCount < 2) return
         handler.removeCallbacks(longPress)
         if (dragging) {
             sink.send(RemoteInput.MouseButton(MouseButtonId.LEFT, false))
@@ -187,16 +203,25 @@ class TouchGestureMapper(
         two = Two.NONE
         twoMoved = false
         scrollRemX = 0f; scrollRemY = 0f
-        twoStartCx = (ev.getX(0) + ev.getX(1)) / 2
-        twoStartCy = (ev.getY(0) + ev.getY(1)) / 2
-        twoStartDist = hypot(ev.getX(0) - ev.getX(1), ev.getY(0) - ev.getY(1))
+        val x0 = parentX(ev, 0, scale, transX)
+        val y0 = parentY(ev, 0, scale, transY)
+        val x1 = parentX(ev, 1, scale, transX)
+        val y1 = parentY(ev, 1, scale, transY)
+        twoStartCx = (x0 + x1) / 2f
+        twoStartCy = (y0 + y1) / 2f
+        twoStartDist = hypot(x0 - x1, y0 - y1)
         twoLastCx = twoStartCx; twoLastCy = twoStartCy; twoLastDist = twoStartDist
     }
 
-    private fun moveTwo(ev: MotionEvent) {
-        val cx = (ev.getX(0) + ev.getX(1)) / 2
-        val cy = (ev.getY(0) + ev.getY(1)) / 2
-        val dist = hypot(ev.getX(0) - ev.getX(1), ev.getY(0) - ev.getY(1))
+    private fun moveTwo(ev: MotionEvent, scale: Float, transX: Float, transY: Float) {
+        if (ev.pointerCount < 2) return
+        val x0 = parentX(ev, 0, scale, transX)
+        val y0 = parentY(ev, 0, scale, transY)
+        val x1 = parentX(ev, 1, scale, transX)
+        val y1 = parentY(ev, 1, scale, transY)
+        val cx = (x0 + x1) / 2f
+        val cy = (y0 + y1) / 2f
+        val dist = hypot(x0 - x1, y0 - y1)
 
         if (two == Two.NONE) {
             val centroidMove = hypot(cx - twoStartCx, cy - twoStartCy)
@@ -219,8 +244,16 @@ class TouchGestureMapper(
                     sink.send(RemoteInput.MouseWheel(horizontal = ix, vertical = iy))
                 }
             }
-            Two.PINCH -> if (twoLastDist > 0f && dist > 0f) {
-                onPinchZoom(dist / twoLastDist, cx, cy)
+            Two.PINCH -> if (twoLastDist > 1f && dist > 1f) {
+                val factor = dist / twoLastDist
+                val panDx = cx - twoLastCx
+                val panDy = cy - twoLastCy
+                val cb = onPinchZoomPan
+                if (cb != null) {
+                    cb(factor, cx, cy, panDx, panDy)
+                } else {
+                    onPinchZoom(factor, cx, cy)
+                }
             }
             Two.NONE -> {}
         }
@@ -237,6 +270,12 @@ class TouchGestureMapper(
     }
 
     // ---------------------------------------------------------------- helpers
+
+    private fun parentX(ev: MotionEvent, index: Int, scale: Float, transX: Float): Float =
+        ev.getX(index) * scale + transX
+
+    private fun parentY(ev: MotionEvent, index: Int, scale: Float, transY: Float): Float =
+        ev.getY(index) * scale + transY
 
     private fun moveAbs(x: Float, y: Float, w: Int, h: Int) {
         if (w <= 0 || h <= 0) return

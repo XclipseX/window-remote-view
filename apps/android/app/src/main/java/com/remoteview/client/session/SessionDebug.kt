@@ -19,6 +19,10 @@ data class DebugSnapshot(
     val lastError: String = "",
     /** SystemClock.elapsedRealtime() lúc state ESTABLISHED lần đầu; 0 nếu chưa. */
     val establishedAtMs: Long = 0,
+    val rttMs: Float = 0f,
+    val decodeMs: Float = 0f,
+    val bitrateKbps: Int = 0,
+    val lossPercent: Float = 0f,
 )
 
 /** Số liệu cho bộ đo FPS trong phiên (cập nhật ~2 lần/giây). */
@@ -29,4 +33,8 @@ data class HudState(
     val height: Int = 0,
     /** Số khung giải mã xong nhưng bị bỏ vì có khung mới hơn (chỉ chế độ Choreographer). */
     val dropped: Long = 0,
+    val rttMs: Float = 0f,
+    val decodeMs: Float = 0f,
+    val bitrateKbps: Int = 0,
+    val lossPercent: Float = 0f,
 )

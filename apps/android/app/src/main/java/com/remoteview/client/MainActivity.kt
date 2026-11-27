@@ -106,9 +106,15 @@ class MainActivity : ComponentActivity() {
                 session?.onNativeState(state, message)
             }
             override fun onHostDiscovered(name: String, address: String) {
-                runOnUiThread { if (lanHosts.none { it.address == address }) lanHosts.add(LanHost(name, address)) }
+                runOnUiThread {
+                    val idx = lanHosts.indexOfFirst { it.address == address }
+                    if (idx < 0) lanHosts.add(LanHost(name, address))
+                    else if (lanHosts[idx].name != name) lanHosts[idx] = LanHost(name, address)
+                }
             }
-            override fun onStats(rttMs: Float, bitrateKbps: Int, lossPercent: Float) {}
+            override fun onStats(rttMs: Float, bitrateKbps: Int, lossPercent: Float) {
+                session?.onNativeStats(rttMs, bitrateKbps, lossPercent)
+            }
             override fun onAudioPacket(data: ByteArray, ptsUs: Long, codec: Int) {
                 session?.onAudio(data, codec)
             }
@@ -225,23 +231,50 @@ class MainActivity : ComponentActivity() {
                         s.attachLink(route.link)
                         screen = Screen.SESSION
                     }
-                    // Tether/LAN/server: dùng đường kết nối thường (Rust tự tìm host); phiên vẫn ở chế độ màn hình phụ.
-                    is Route.Tether -> connectTo(route.localAddress, usbDisplay = true)
+                    // Tether/LAN/server: dùng đường kết nối LAN (UDP trực tiếp); phiên vẫn ở chế độ màn hình phụ.
+                    is Route.Tether -> connectTo(
+                        route.localAddress,
+                        usbDisplay = true,
+                        otp = settings.usbOtp.takeIf { StreamSettings.isValidOtp(it) },
+                    )
                     Route.Server -> { usbError = "không tìm thấy đường kết nối USB" }
                 }
             }
         }, "rv-link-select").also { it.isDaemon = true; it.start() }
     }
 
-    private fun connectTo(target: String, usbDisplay: Boolean = false) {
-        val s = SessionController(this, settings, usbDisplay)
+    private fun connectTo(target: String, usbDisplay: Boolean = false, otp: String? = null) {
+        if (session != null) {
+            RvLog.i("connectTo($target) bỏ qua: đã có phiên đang chạy")
+            return
+        }
+        val pin = otp ?: settings.usbOtp.takeIf { StreamSettings.isValidOtp(it) }
+        if (pin == null) {
+            pinPrompt = PinPrompt(error = null, target = target, usbDisplay = usbDisplay)
+            return
+        }
+        val s = SessionController(this, settings, usbDisplay = usbDisplay, otp = pin)
+        s.onNativeFailed = { msg ->
+            runOnUiThread {
+                if (session === s) {
+                    sendLogThenEnd(s) {
+                        endSession()
+                        screen = Screen.HOME
+                        pinPrompt = PinPrompt(
+                            error = msg ?: "kết nối thất bại",
+                            target = target,
+                            usbDisplay = usbDisplay,
+                        )
+                    }
+                }
+            }
+        }
         session = s
         acquireSessionWake()
-        if (NativeBridge.available) {
-            // TODO(rust-core): cấu hình JSON theo thỏa thuận giao thức; caps nằm trong helloJson.
-            s.nativeHandle = NativeBridge.nativeConnect(target, s.helloJson)
+        s.connectLan(target)
+        if (session === s) {
+            screen = Screen.SESSION
         }
-        screen = Screen.SESSION
     }
 
     private fun rememberRecent(target: String) {
@@ -264,7 +297,9 @@ class MainActivity : ComponentActivity() {
                 HomeScreen(
                     lanHosts = lanHosts,
                     recentHosts = recents,
-                    onConnect = { target -> rememberRecent(target); connectTo(target) },
+                    onConnect = { target ->
+                        pinPrompt = PinPrompt(error = null, target = target, usbDisplay = false)
+                    },
                     widthClass = widthClass,
                     update = update,
                     contentPadding = padding,
@@ -272,9 +307,16 @@ class MainActivity : ComponentActivity() {
                     pinPrompt = pinPrompt,
                     onUsbDisplay = { pinPrompt = PinPrompt(null) },
                     onPinSubmit = { otp ->
+                        val prompt = pinPrompt
                         pinPrompt = null
                         settings = settings.copy(usbOtp = otp).also { repo.save(it) }
-                        startUsbDisplay()
+                        val target = prompt?.target
+                        if (prompt != null && target != null) {
+                            rememberRecent(target)
+                            connectTo(target, usbDisplay = prompt.usbDisplay, otp = otp)
+                        } else {
+                            startUsbDisplay()
+                        }
                     },
                     onPinDismiss = { pinPrompt = null },
                     usbHost = usbHost,

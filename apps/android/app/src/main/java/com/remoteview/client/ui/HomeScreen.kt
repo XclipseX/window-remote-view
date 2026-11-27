@@ -66,8 +66,12 @@ import com.remoteview.client.update.UpdateController
 
 data class LanHost(val name: String, val address: String)
 
-/** Hộp thoại PIN ghép đôi USB; [error] != null: lần trước lỗi (sai PIN / host không trả lời). */
-data class PinPrompt(val error: String?)
+/**
+ * Hộp thoại PIN ghép đôi (USB hoặc LAN).
+ * [error] != null: lần trước lỗi (sai PIN / host không trả lời).
+ * [target] != null: địa chỉ máy LAN/Tether đích; null = đường USB mặc định.
+ */
+data class PinPrompt(val error: String?, val target: String? = null, val usbDisplay: Boolean = false)
 
 /** Máy tính (host AOA) đang cắm cáp USB. [description] = tên máy Windows do host đặt. */
 data class UsbHostInfo(val description: String, val serial: String?)
@@ -387,20 +391,35 @@ private fun PinDialog(
     onPinSubmit: (String) -> Unit,
     onPinDismiss: () -> Unit,
 ) {
-    var pin by rememberSaveable { mutableStateOf(usbOtp) }
+    val initialPin = if (usbOtp.length in 6..9 && usbOtp.all { it in '0'..'9' }) usbOtp else ""
+    var pin by rememberSaveable(pinPrompt.target, usbOtp) { mutableStateOf(initialPin) }
     val valid = pin.length in 6..9 && pin.all { it in '0'..'9' }
+    val target = pinPrompt.target
     AlertDialog(
         onDismissRequest = onPinDismiss,
-        title = { Text(stringResource(R.string.usb_pin_title)) },
+        title = {
+            Text(if (target != null) "PIN ghép đôi — $target" else stringResource(R.string.usb_pin_title))
+        },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(Spacing.s)) {
-                Text(stringResource(R.string.usb_pin_hint), style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    if (target != null) {
+                        "Nhập mã PIN 6 chữ số hiển thị trên Remote View Windows để kết nối tới $target."
+                    } else {
+                        stringResource(R.string.usb_pin_hint)
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                )
                 OutlinedTextField(
                     value = pin,
                     onValueChange = { pin = it.filter { c -> c in '0'..'9' }.take(9) },
                     label = { Text(stringResource(R.string.usb_pin_label)) },
                     singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.NumberPassword,
+                        imeAction = ImeAction.Done,
+                    ),
+                    keyboardActions = KeyboardActions(onDone = { if (valid) onPinSubmit(pin) }),
                     isError = pinPrompt.error != null,
                     supportingText = pinPrompt.error?.let { e -> { Text(stringResource(R.string.usb_pin_error, e)) } },
                 )

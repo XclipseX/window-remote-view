@@ -25,7 +25,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -67,6 +69,7 @@ fun LogScreen(onBack: () -> Unit, sessionHandle: () -> Long = { 0L }) {
         val upOk = stringResource(R.string.log_upload_ok)
         val upFail = stringResource(R.string.log_upload_fail)
         val needSession = stringResource(R.string.log_upload_need_session)
+        var uploading by remember { mutableStateOf(false) }
         val connected = sessionHandle() != 0L
         Column(Modifier.fillMaxSize().padding(padding)) {
             Row(
@@ -80,18 +83,20 @@ fun LogScreen(onBack: () -> Unit, sessionHandle: () -> Long = { 0L }) {
                     }
                 }) { Text(stringResource(R.string.log_share)) }
                 OutlinedButton(
-                    enabled = connected,
+                    enabled = connected && !uploading,
                     onClick = {
                         val h = sessionHandle()
                         if (h == 0L) {
                             Toast.makeText(ctx, needSession, Toast.LENGTH_SHORT).show()
                         } else {
+                            uploading = true
                             Thread({
                                 val ok = LogShare.upload(h)
                                 android.os.Handler(android.os.Looper.getMainLooper()).post {
+                                    uploading = false
                                     Toast.makeText(ctx, if (ok) upOk else upFail, Toast.LENGTH_SHORT).show()
                                 }
-                            }, "rv-log-upload").start()
+                            }, "rv-log-upload").also { it.isDaemon = true; it.start() }
                         }
                     },
                 ) { Text(stringResource(R.string.log_upload)) }

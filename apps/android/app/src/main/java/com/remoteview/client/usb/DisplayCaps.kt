@@ -69,13 +69,14 @@ object DisplayCaps {
         deviceName: String = DeviceName.friendly(activity),
     ): String {
         val nd = nativeDisplay(activity)
-        val k = if (usbDisplay) 1f else settings.resolutionPercent / 100f
-        fun even(v: Float) = (v.toInt() / 2) * 2
+        val k = settings.resolutionPercent.coerceIn(25, 100) / 100f
+        val targetFps = if (nd.refreshHz > 0) minOf(settings.fps, nd.refreshHz) else settings.fps
+        fun even(v: Float) = ((v.toInt() / 2) * 2).coerceAtLeast(2)
         return JSONObject().apply {
             put("mode", if (usbDisplay) "usb_display" else "mirror")
             put("display_width", even(nd.width * k))
             put("display_height", even(nd.height * k))
-            put("display_refresh_hz", if (usbDisplay) nd.refreshHz else settings.fps)
+            put("display_refresh_hz", targetFps)
             put("create_virtual_display", usbDisplay)
             put("touch", JSONObject().put("max_points", 10).put("absolute_max", 65535))
             put("otp", otp ?: settings.usbOtp)

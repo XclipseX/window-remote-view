@@ -10,7 +10,7 @@ import com.remoteview.client.input.RemoteInput
  * Giao diện JNI tới lõi Rust (`librv_core.so`, crate `crates/android-core`): phiên Noise/E2EE, ghép gói video (FEC),
  * đóng gói input. Mỗi hàm `external` khớp một symbol `Java_com_remoteview_client_NativeBridge_<tên>`.
  * CI build bằng cargo-ndk -> app/src/main/jniLibs/arm64-v8a/librv_core.so.
- * Mới có đường USB (nativeConnectLink); [nativeConnect] (LAN/server) chưa cài trong lõi (trả 0 + state lỗi).
+ * Hỗ trợ cả đường USB ([nativeConnectLink]) và đường LAN UDP ([nativeConnect]).
  * Opus được giải mã trong Kotlin (AudioPlayer, MediaCodec), lõi Rust chỉ chuyển nguyên gói.
  * TODO: đổi frame video sang direct ByteBuffer để tránh sao chép ByteArray.
  */
@@ -51,6 +51,8 @@ object NativeBridge {
     const val STATE_DISPLAY_CONFIG = 10
     /** message = "<codec> WxH@fps <kbps>kbps", codec: h264|hevc|av1. */
     const val STATE_STREAM_CONFIG = 11
+    /** Host yêu cầu client gửi file log mới nhất lên máy tính. */
+    const val STATE_LOG_REQUEST = 12
 
     @Volatile var callbacks: Callbacks? = null
 
@@ -70,6 +72,10 @@ object NativeBridge {
     external fun nativeRequestKeyFrame(handle: Long)
     external fun nativeSetBitrate(handle: Long, kbps: Int)
     external fun nativeSetMaxFps(handle: Long, fps: Int)
+    /** Báo thời gian giải mã MediaCodec thực tế (microsecond) để lõi gửi qua FeedbackStats. */
+    external fun nativeReportDecodeUs(handle: Long, decodeUs: Int)
+    /** Yêu cầu host đổi chất lượng/độ phân giải/FPS trong phiên (width/height = 0 giữ nguyên). */
+    external fun nativeSetStreamQuality(handle: Long, quality: Int, width: Int, height: Int, fps: Int)
 
     // --- Liên kết datagram qua USB (AOA / ADB reverse): Kotlin chuyển byte, Rust lo giao thức ---
     /**

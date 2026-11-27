@@ -1,6 +1,7 @@
 package com.remoteview.client.ui
 
 import android.app.Activity
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.clickable
@@ -196,7 +197,7 @@ fun SessionScreen(
             Column(
                 modifier = Modifier
                     .align(Alignment.TopStart)
-                    .padding(top = if (hudOn) 64.dp else 8.dp, start = 8.dp)
+                    .padding(top = if (hudOn) 76.dp else 8.dp, start = 8.dp)
                     .background(Color(0xB31C1B1F), RoundedCornerShape(16.dp))
                     .border(1.dp, Color(0x33FFFFFF), RoundedCornerShape(16.dp))
                     .padding(12.dp),
@@ -208,12 +209,50 @@ fun SessionScreen(
                     fontSize = 11.sp,
                     lineHeight = 13.sp,
                 )
+                var selectedQuality by remember(controller) { mutableStateOf(controller.liveQuality) }
+                var selectedFps by remember(controller) { mutableStateOf(controller.liveFps) }
+                Row(
+                    modifier = Modifier.padding(top = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("Chất lượng:", color = Color(0xFFCFD8DC), fontSize = 12.sp)
+                    for (q in intArrayOf(60, 85, 100)) {
+                        Text(
+                            "$q%",
+                            color = if (selectedQuality == q) Color(0xFFFFE082) else Color(0xFF80CBC4),
+                            fontSize = 12.sp,
+                            modifier = Modifier
+                                .clickable {
+                                    selectedQuality = q
+                                    controller.applyStreamQuality(q, selectedFps)
+                                    Toast.makeText(ctx, "Chất lượng $q%", Toast.LENGTH_SHORT).show()
+                                }
+                                .padding(horizontal = 4.dp, vertical = 4.dp),
+                        )
+                    }
+                    Text("FPS:", color = Color(0xFFCFD8DC), fontSize = 12.sp, modifier = Modifier.padding(start = 4.dp))
+                    for (f in intArrayOf(60, 90, 120)) {
+                        Text(
+                            "$f",
+                            color = if (selectedFps == f) Color(0xFFFFE082) else Color(0xFF80CBC4),
+                            fontSize = 12.sp,
+                            modifier = Modifier
+                                .clickable {
+                                    selectedFps = f
+                                    controller.applyStreamQuality(selectedQuality, f)
+                                    Toast.makeText(ctx, "FPS $f", Toast.LENGTH_SHORT).show()
+                                }
+                                .padding(horizontal = 4.dp, vertical = 4.dp),
+                        )
+                    }
+                }
                 Text(
                     stringResource(R.string.session_fps_hud_toggle),
                     color = Color(0xFF9CFF9C),
                     fontSize = 13.sp,
                     modifier = Modifier
-                        .padding(top = 8.dp)
+                        .padding(top = 6.dp)
                         .clickable { hudOn = !hudOn; onFpsHudChanged(hudOn) }
                         .padding(vertical = 6.dp),
                 )
@@ -222,7 +261,7 @@ fun SessionScreen(
                     color = Color(0xFFFFB74D),
                     fontSize = 13.sp,
                     modifier = Modifier
-                        .padding(top = 8.dp)
+                        .padding(top = 4.dp)
                         .clickable {
                             val h = if (controller.isConnected) controller.nativeHandle else 0L
                             if (h == 0L) {
@@ -233,7 +272,7 @@ fun SessionScreen(
                                     android.os.Handler(android.os.Looper.getMainLooper()).post {
                                         Toast.makeText(ctx, if (ok) okMsg else failMsg, Toast.LENGTH_SHORT).show()
                                     }
-                                }, "rv-log-upload").start()
+                                }, "rv-log-upload").also { it.isDaemon = true; it.start() }
                             }
                         }
                         .padding(vertical = 6.dp),
@@ -272,12 +311,16 @@ private fun hudText(h: com.remoteview.client.session.HudState): String {
     val s = h.stats
     fun f1(v: Float) = String.format(java.util.Locale.US, "%.1f", v)
     val line1 = "FPS ${s.fpsNow.roundToInt()} · Avg ${f1(s.avgFps)} · 1% ${f1(s.low1Fps)} · ${f1(s.meanMs)}±${f1(s.stdMs)} ms · var ${f1(s.varianceMs2)}"
+    val mbps = f1(h.bitrateKbps / 1000f)
+    val loss = if (h.lossPercent > 0.05f) " · mất ${f1(h.lossPercent)}%" else ""
+    val line2 = "RTT ${f1(h.rttMs)}ms · Dec ${f1(h.decodeMs)}ms · $mbps Mbps$loss"
     val res = if (h.width > 0 && h.height > 0) "${h.width}x${h.height}" else "-"
     val drop = if (h.dropped > 0) " · bỏ ${h.dropped}" else ""
-    return "$line1\n${h.decoderName} · $res$drop"
+    return "$line1\n$line2\n${h.decoderName} · $res$drop"
 }
 
 private fun debugText(d: com.remoteview.client.session.DebugSnapshot, now: Long): String {
+    fun f1(v: Float) = String.format(java.util.Locale.US, "%.1f", v)
     val est = if (d.establishedAtMs > 0) "${(now - d.establishedAtMs) / 1000}s" else "chưa"
     return buildString {
         appendLine("link: ${d.linkType} mở=${if (d.linkOpen) "có" else "không"}  AOA fd: ${d.aoaOpened}")
@@ -287,6 +330,7 @@ private fun debugText(d: com.remoteview.client.session.DebugSnapshot, now: Long)
         appendLine("native: state=${d.nativeState} \"${d.nativeMessage}\"")
         appendLine("decoder: ${d.decoderName}")
         appendLine("frame nhận/giải mã: ${d.framesSubmitted} / ${d.framesDecoded}")
+        appendLine("RTT ${f1(d.rttMs)}ms · Dec ${f1(d.decodeMs)}ms · ${f1(d.bitrateKbps / 1000f)} Mbps · mất ${f1(d.lossPercent)}%")
         append("lỗi cuối: ${d.lastError.ifEmpty { "-" }}")
     }
 }

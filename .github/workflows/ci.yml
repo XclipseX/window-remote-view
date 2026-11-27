@@ -1,6 +1,6 @@
 name: CI
 permissions:
-  contents: write
+  contents: read
 
 # Bản push mới hủy bản cũ đang chạy, tránh bản cũ đăng đè APK mới lên Release.
 concurrency:
@@ -31,9 +31,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: binaries-${{ matrix.os }}
-          path: |
-            target/release/rv-signal-relay
-            target/release/rv-signal-relay.exe
+          path: target/release/rv-signal-relay
           if-no-files-found: ignore
 
   # wdi-simple.exe from libwdi (LGPL-3, the library behind Zadig): installs WinUSB
@@ -216,7 +214,7 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.14"
-      - run: gradle assembleDebug --stacktrace
+      - run: gradle testDebugUnitTest assembleDebug --stacktrace
         env:
           RV_VERSION_CODE: ${{ github.run_number }}
       - name: Verify APK signature
@@ -234,16 +232,24 @@ jobs:
     needs: [rust, android, windows-app]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dl
-      - name: Collect files
+      - name: Collect files and compute SHA-256 checksums
         run: |
-          mkdir out
+          mkdir -p out
           cp dl/android-debug-apk/*.apk out/RemoteView.apk
           cp dl/RemoteView-windows/RemoteView.exe out/RemoteView.exe
-          cp dl/binaries-windows-latest/rv-signal-relay.exe out/ || true
+          (cd out && sha256sum RemoteView.exe RemoteView.apk > SHA256SUMS.txt)
+          EXE_SHA256=$(awk '$2 == "RemoteView.exe" {print $1}' out/SHA256SUMS.txt)
+          APK_SHA256=$(awk '$2 == "RemoteView.apk" {print $1}' out/SHA256SUMS.txt)
+          test -n "$EXE_SHA256" && test -n "$APK_SHA256"
+          echo "EXE_SHA256=$EXE_SHA256" >> "$GITHUB_ENV"
+          echo "APK_SHA256=$APK_SHA256" >> "$GITHUB_ENV"
+          cat out/SHA256SUMS.txt
           ls -la out
       # softprops cannot delete assets: drop stale ones from older releases.
       - name: Remove stale release assets
@@ -261,6 +267,8 @@ jobs:
           make_latest: false
           body: |
             Bản build tự động từ commit ${{ github.sha }}.
+            - SHA256(RemoteView.exe): ${{ env.EXE_SHA256 }}
+            - SHA256(RemoteView.apk): ${{ env.APK_SHA256 }}
             - RemoteView.apk (đã ký, cài đè được bản trước): cài lên Android (Tab S10+ / S26+)
             - RemoteView.exe: app Windows duy nhất (một file, không cần file phụ). Cắm cáp USB, nhấn "Kết nối"; driver USB tự cài, không cần Zadig, không cần nhập PIN.
             - Giấy phép: trình cài driver nhúng là wdi-simple của libwdi (LGPL-3), xem NOTICE.
