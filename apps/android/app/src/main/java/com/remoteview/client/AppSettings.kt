@@ -34,7 +34,7 @@ data class StreamSettings(
     /** Tự gửi log hiện tại lên máy tính khi phiên kết thúc vì lỗi. */
     val autoSendLogOnError: Boolean = true,
     /** Hiện bộ đo FPS (FPS/Avg/1% low/ms±σ/variance) trong phiên. */
-    val showFpsHud: Boolean = false,
+    val showFpsHud: Boolean = true,
 ) {
     /** Placeholder: 5..120 Mbps tuyến tính theo chất lượng (mặc định LAN 60–120 Mbps). */
     fun targetBitrateKbps(): Int = 5_000 + ((qualityPercent.coerceIn(1, 100) - 1) / 99f * 115_000).toInt()
