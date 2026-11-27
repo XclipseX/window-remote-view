@@ -82,17 +82,22 @@ pub fn nudge_idle() {
 pub fn nudge_idle() {}
 
 /// Per-monitor DPI awareness so DXGI / cursor / injection coordinates are all physical pixels.
+/// Returns a one-line description for the log (awareness 2 = per-monitor; system DPI 96 = 100%).
 #[cfg(windows)]
-pub fn set_dpi_aware() {
+pub fn set_dpi_aware() -> String {
     use windows::Win32::UI::HiDpi::*;
     unsafe {
         // Fails harmlessly when the GUI/manifest already set it.
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let r = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let aw = GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext());
+        format!("dpi: set_per_monitor_v2={} awareness={} system_dpi={}", r.is_ok(), aw.0, GetDpiForSystem())
     }
 }
 
 #[cfg(not(windows))]
-pub fn set_dpi_aware() {}
+pub fn set_dpi_aware() -> String {
+    String::new()
+}
 
 #[cfg(test)]
 mod tests {

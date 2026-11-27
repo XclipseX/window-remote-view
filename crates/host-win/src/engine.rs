@@ -1419,7 +1419,7 @@ fn run(argv: Vec<String>) -> Result<(), String> {
         }
     };
     control::set_json_mode(a.json);
-    crate::session_state::set_dpi_aware();
+    let dpi_line = crate::session_state::set_dpi_aware();
     if !a.json && !a.list {
         // Under the GUI the GUI owns the log file (it receives these lines as JSON events).
         if let Some(p) = crate::logfile::init("remoteview-host") {
@@ -1460,6 +1460,9 @@ fn run(argv: Vec<String>) -> Result<(), String> {
 
     for line in crate::sysinfo::startup_report("rv-host") {
         info!("{line}");
+    }
+    if !dpi_line.is_empty() {
+        info!("{dpi_line}");
     }
     let outputs = list_outputs().map_err(|e| e.to_string())?;
     if a.list {
