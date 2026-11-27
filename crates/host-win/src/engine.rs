@@ -1146,6 +1146,8 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
     let mut last_tick = Instant::now();
     let mut last_stats_emit = Instant::now();
     let mut last_stats: Option<(f64, u64, f64)> = None;
+    let stats_epoch = Instant::now();
+    let mut frame_stats = crate::frame_stats::FrameStats::new();
     let mut last_rx_peer_key = rv_session::PEER_UNKNOWN;
     let mut locked_shown = false;
     let mut logs = LogAssembler::new();
@@ -1429,15 +1431,18 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                     if let Err(e) = session.send_video_frame(v.frame_id, v.ts_us, &v.data, v.key) {
                         warn!("video send ({} B, key={}): {e}", v.data.len(), v.key);
                         ctx.sh.idr.store(true, Ordering::Relaxed);
-                    } else if !streaming {
-                        streaming = true;
-                        let peer = ctx.peer.clone();
-                        let msg = if ctx.sh.locked.load(Ordering::Relaxed) {
-                            crate::session_state::LOCKED_MESSAGE
-                        } else {
-                            "Đang truyền màn hình"
-                        };
-                        ctx.set_status(State::Streaming, link, peer, msg);
+                    } else {
+                        frame_stats.record(stats_epoch.elapsed().as_secs_f64());
+                        if !streaming {
+                            streaming = true;
+                            let peer = ctx.peer.clone();
+                            let msg = if ctx.sh.locked.load(Ordering::Relaxed) {
+                                crate::session_state::LOCKED_MESSAGE
+                            } else {
+                                "Đang truyền màn hình"
+                            };
+                            ctx.set_status(State::Streaming, link, peer, msg);
+                        }
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -1460,6 +1465,7 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                         encoder: a.kind.name().to_string(),
                         width: a.width,
                         height: a.height,
+                        frame: frame_stats.summary(stats_epoch.elapsed().as_secs_f64()),
                     }));
                 }
             }

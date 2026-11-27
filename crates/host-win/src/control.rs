@@ -153,6 +153,8 @@ pub struct Stats {
     pub encoder: String,
     pub width: u32,
     pub height: u32,
+    /// Frame-time metrics of frames actually sent (see `frame_stats`).
+    pub frame: crate::frame_stats::FrameSummary,
 }
 
 pub fn stats_json(s: &Stats) -> Value {
@@ -165,6 +167,12 @@ pub fn stats_json(s: &Stats) -> Value {
         "encoder": s.encoder,
         "width": s.width,
         "height": s.height,
+        "fps_now": round1(s.frame.fps_now),
+        "fps_avg": round1(s.frame.fps_avg),
+        "fps_low1": round1(s.frame.fps_low1),
+        "frame_ms_mean": round2(s.frame.frame_ms_mean),
+        "frame_ms_std": round2(s.frame.frame_ms_std),
+        "frame_ms_var": round2(s.frame.frame_ms_var),
     })
 }
 
@@ -333,8 +341,22 @@ mod tests {
             encoder: "mf-hevc-hw".into(),
             width: 2800,
             height: 1752,
+            frame: crate::frame_stats::FrameSummary {
+                fps_now: 59.96,
+                fps_avg: 58.04,
+                fps_low1: 41.234,
+                frame_ms_mean: 17.226,
+                frame_ms_std: 3.456,
+                frame_ms_var: 11.944,
+            },
         };
         let v = stats_json(&s);
+        assert_eq!(v["fps_now"], 60.0);
+        assert_eq!(v["fps_avg"], 58.0);
+        assert_eq!(v["fps_low1"], 41.2);
+        assert_eq!(v["frame_ms_mean"], 17.23);
+        assert_eq!(v["frame_ms_std"], 3.46);
+        assert_eq!(v["frame_ms_var"], 11.94);
         assert_eq!(v["event"], "stats");
         assert_eq!(v["fps"], 60.0);
         assert_eq!(v["encode_ms"], 2.35);

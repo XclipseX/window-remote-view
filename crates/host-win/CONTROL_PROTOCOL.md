@@ -21,7 +21,7 @@ Human logs go to stderr. Closing stdin makes the host exit.
 
 ```json
 {"event":"status","state":"starting|waiting|connecting|connected|streaming|error","link":"usb|lan|adb|none","peer":"<string or null>","otp":"123456","message":"<vi text>"}
-{"event":"stats","fps":59.9,"bitrate_kbps":14000,"encode_ms":2.3,"rtt_ms":3.1,"encoder":"mf-hevc-hw|mf-h264-hw|openh264","width":2800,"height":1752}
+{"event":"stats","fps":59.9,"bitrate_kbps":14000,"encode_ms":2.3,"rtt_ms":3.1,"encoder":"mf-hevc-hw|mf-h264-hw|openh264","width":2800,"height":1752,"fps_now":59.0,"fps_avg":58.0,"fps_low1":41.2,"frame_ms_mean":17.2,"frame_ms_std":3.5,"frame_ms_var":11.9}
 {"event":"devices","items":[{"kind":"usb","name":"Galaxy Tab S10+ (SM-X826B)","serial":"1-5","vid":6353,"pid":11520,"accessory":true,"driver_ok":true,"connected":true}]}
 {"event":"log","level":"info|warn|error","msg":"..."}
 ```
@@ -30,6 +30,12 @@ Human logs go to stderr. Closing stdin makes the host exit.
   `state=error` with exit code 1 is also emitted on fatal startup failure (`otp` may be "").
   After a client disconnect the host goes back to `waiting` (it never exits by itself).
 * `stats` every 1 s while `streaming`; `rtt_ms` is `null` until the client reports one.
+  Frame-time fields (added later; clients must default them to 0 when absent) are computed over the
+  frames actually SENT to the client (after encode) in a rolling window of the last 10 s / 1200
+  frames (`frame_stats.rs`): `fps_now` = frames sent in the last second, `fps_avg` = 1000 / mean
+  frame time, `fps_low1` = 1000 / mean of the worst 1 % frame times (at least one sample),
+  `frame_ms_mean` / `frame_ms_std` (population σ) in ms and `frame_ms_var` in ms². All 0 until two
+  frames were sent. `fps` keeps its old meaning (encoder-side rate of the last window).
 * `devices` is emitted whenever the list changes (polled every 2 s). `kind` is `usb`
   (AOA candidate; `serial` = `bus-address`) or `adb` (`serial` = adb serial).
 * `peer`: `ip:port` on LAN, otherwise the first 6 bytes (hex) of the client's key; replaced by the

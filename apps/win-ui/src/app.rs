@@ -84,6 +84,10 @@ pub struct App {
     outputs: Vec<rv_host_win::capture::OutputInfo>,
     /// Result of the last "Xuất log" (success?, text).
     export_note: Option<(bool, String)>,
+    /// Start sharing automatically once the driver/service auto-install is out of the way.
+    pending_auto_share: bool,
+    /// Launched with `--minimized` (autostart): minimize the window on the first frame.
+    minimize_first_frame: bool,
 }
 
 #[derive(Default)]
@@ -111,6 +115,21 @@ fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
             ui.set_width(ui.available_width());
             add(ui)
         });
+}
+
+/// FPS the host can actually reach: the software encoder is capped at 60 by the engine.
+fn effective_target_fps(cfg_fps: u32, encoder: &str) -> f32 {
+    let cap = if encoder.to_ascii_lowercase().contains("openh264") { 60 } else { u32::MAX };
+    cfg_fps.min(cap).max(1) as f32
+}
+
+/// 1% low colour: green >= 90 % of the target fps, amber >= 60 %, red below.
+fn low1_color(low1: f32, target: f32) -> Color32 {
+    match low1 / target.max(1.0) {
+        r if r >= 0.9 => Color32::from_rgb(52, 190, 100),
+        r if r >= 0.6 => Color32::from_rgb(235, 170, 40),
+        _ => Color32::from_rgb(225, 70, 70),
+    }
 }
 
 fn heading(ui: &mut egui::Ui, text: &str) {
@@ -147,13 +166,15 @@ impl App {
         ctx.set_fonts(fonts);
     }
 
-    pub fn new(cc: &eframe::CreationContext<'_>, demo: bool) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, demo: bool, minimized: bool) -> Self {
         Self::setup_fonts(&cc.egui_ctx);
         Self::setup_style(&cc.egui_ctx);
         let (tx, rx) = new_channel();
         let (upd_tx, upd_rx) = std::sync::mpsc::channel();
+        let cfg = Config::load();
+        let pending_auto_share = !demo && (cfg.auto_share || minimized);
         let mut app = Self {
-            cfg: Config::load(),
+            cfg,
             page: Page::Home,
             rx,
             tx,
@@ -187,6 +208,8 @@ impl App {
             upd: UpdateState::Idle,
             outputs: Vec::new(),
             export_note: None,
+            pending_auto_share,
+            minimize_first_frame: minimized && !demo,
         };
         if !demo {
             app.refresh_outputs();
@@ -332,7 +355,23 @@ impl App {
         }
     }
 
+    /// Zero-click start: runs once, when nothing else (driver / service install) is in progress.
+    fn try_auto_share(&mut self) {
+        if !self.pending_auto_share || self.running || self.vdd_busy || self.demo.is_some() {
+            return;
+        }
+        // The user already said "no" to the UAC prompt: do not pop it up again on every launch.
+        let would_prompt = self.needs_vdd() && driver::vdd_bundled() && !rv_host_win::sudovda::driver_present();
+        self.pending_auto_share = false;
+        if cfg!(windows) && self.cfg.vdd_auto_declined && would_prompt {
+            return;
+        }
+        self.log(LogLevel::Info, "Tự động bắt đầu chia sẻ khi mở ứng dụng".into());
+        self.start();
+    }
+
     fn start(&mut self) {
+        self.pending_auto_share = false;
         if cfg!(windows)
             && self.demo.is_none()
             && !self.vdd_busy
@@ -565,6 +604,7 @@ impl App {
             }
         }
         self.tick_demo();
+        self.try_auto_share();
     }
 
     // ---- devices + automatic driver setup ----
@@ -730,6 +770,12 @@ impl App {
                 encoder: "NVENC HEVC".into(),
                 width: 2560,
                 height: 1600,
+                fps_now: 59.0 + w * 1.5,
+                fps_avg: 58.6,
+                fps_low1: 44.0 + w * 2.0,
+                frame_ms_mean: 17.1,
+                frame_ms_std: 2.8 + 0.4 * w.abs(),
+                frame_ms_var: 7.8 + 2.0 * w.abs(),
             }));
         }
         for e in evs {
@@ -971,20 +1017,33 @@ impl App {
     fn stats_strip(&mut self, ui: &mut egui::Ui) {
         card(ui, |ui| {
             let s = &self.stats;
+            let stat = |ui: &mut egui::Ui, label: &str, value: String, color: Option<Color32>| {
+                ui.vertical(|ui| {
+                    ui.set_min_width(96.0);
+                    let mut t = RichText::new(value).size(22.0).strong();
+                    if let Some(c) = color {
+                        t = t.color(c);
+                    }
+                    ui.label(t);
+                    ui.weak(label);
+                });
+            };
+            let have = s.fps_avg > 0.0;
+            let na = || "--".to_string();
+            let target = effective_target_fps(self.cfg.fps, &s.encoder);
             ui.horizontal_wrapped(|ui| {
-                let stat = |ui: &mut egui::Ui, label: &str, value: String| {
-                    ui.vertical(|ui| {
-                        ui.set_min_width(92.0);
-                        ui.label(RichText::new(value).size(22.0).strong());
-                        ui.weak(label);
-                    });
-                };
-                stat(ui, "FPS", format!("{:.0}", s.fps));
-                stat(ui, "Bitrate", format!("{:.1} Mbps", s.bitrate_kbps as f32 / 1000.0));
-                stat(ui, "Mã hóa", format!("{:.1} ms", s.encode_ms));
-                stat(ui, "RTT", s.rtt_ms.map(|r| format!("{r:.0} ms")).unwrap_or_else(|| "--".into()));
-                stat(ui, "Bộ mã hóa", if s.encoder.is_empty() { "--".into() } else { s.encoder.clone() });
-                stat(ui, "Độ phân giải", if s.width > 0 { format!("{}×{}", s.width, s.height) } else { "--".into() });
+                stat(ui, "FPS hiện tại", if have { format!("{:.0}", s.fps_now) } else { format!("{:.0}", s.fps) }, None);
+                stat(ui, "FPS trung bình", if have { format!("{:.1}", s.fps_avg) } else { na() }, None);
+                stat(ui, "FPS 1% thấp", if have { format!("{:.1}", s.fps_low1) } else { na() }, if have { Some(low1_color(s.fps_low1, target)) } else { None });
+                stat(ui, "Thời gian khung (ms)", if have { format!("{:.1} ± {:.1}", s.frame_ms_mean, s.frame_ms_std) } else { na() }, None);
+                stat(ui, "Phương sai (ms²)", if have { format!("{:.2}", s.frame_ms_var) } else { na() }, None);
+            });
+            ui.horizontal_wrapped(|ui| {
+                stat(ui, "Bitrate", format!("{:.1} Mbps", s.bitrate_kbps as f32 / 1000.0), None);
+                stat(ui, "Mã hóa", format!("{:.1} ms", s.encode_ms), None);
+                stat(ui, "RTT", s.rtt_ms.map(|r| format!("{r:.0} ms")).unwrap_or_else(na), None);
+                stat(ui, "Bộ mã hóa", if s.encoder.is_empty() { na() } else { s.encoder.clone() }, None);
+                stat(ui, "Độ phân giải", if s.width > 0 { format!("{}×{}", s.width, s.height) } else { na() }, None);
             });
             if ui.small_button("Gửi khung hình chính (IDR)").clicked() {
                 self.send(HostCmd::RequestIdr);
@@ -1009,6 +1068,40 @@ impl App {
         });
     }
 
+    /// Everything most people need on the main path: quality preset + start with Windows.
+    fn quick_card(&mut self, ui: &mut egui::Ui) {
+        card(ui, |ui| {
+            let before = self.cfg.clone();
+            let cur = Preset::detect(&self.cfg);
+            ui.label(RichText::new("Chất lượng").strong());
+            ui.horizontal_wrapped(|ui| {
+                for p in Preset::ALL {
+                    let sel = cur == Some(p);
+                    if ui.selectable_label(sel, p.label()).on_hover_text(p.hint()).clicked() && !sel {
+                        p.apply(&mut self.cfg);
+                    }
+                }
+                if cur.is_none() {
+                    let _ = ui.selectable_label(true, "Tùy chỉnh (Cài đặt › Nâng cao)");
+                }
+            });
+            ui.weak(match cur {
+                Some(p) => p.hint().to_string(),
+                None => format!("{} FPS, chất lượng {}%.", self.cfg.fps, self.cfg.quality),
+            });
+            if util::autostart_supported() {
+                ui.checkbox(&mut self.cfg.autostart, "Tự chạy cùng Windows")
+                    .on_hover_text("Màn hình laptop hỏng: bật mục này để cắm cáp USB là dùng được ngay sau khi khởi động máy.");
+                if let Some(m) = &self.autostart_msg {
+                    ui.colored_label(Color32::from_rgb(230, 70, 70), m);
+                }
+            }
+            if self.cfg != before {
+                self.on_cfg_changed(&before);
+            }
+        });
+    }
+
     fn page_home(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             if matches!(self.upd, UpdateState::Available(_) | UpdateState::Downloading(..) | UpdateState::Inaccessible) {
@@ -1027,6 +1120,7 @@ impl App {
                     self.start();
                 }
             }
+            self.quick_card(ui);
             if self.view() == View::Streaming {
                 self.stats_strip(ui);
             }
@@ -1044,7 +1138,11 @@ impl App {
         egui::ScrollArea::vertical().show(ui, |ui| {
             heading(ui, "Cài đặt");
             card(ui, |ui| {
-                ui.label(RichText::new("Hình ảnh").strong());
+                ui.checkbox(&mut self.cfg.auto_share, "Tự bắt đầu chia sẻ khi mở ứng dụng")
+                    .on_hover_text("Cắm cáp USB là dùng được, không cần bấm \"Bắt đầu chia sẻ\".");
+            });
+            card(ui, |ui| {
+                egui::CollapsingHeader::new(RichText::new("Nâng cao").strong()).default_open(false).show(ui, |ui| {
                 egui::Grid::new("g_video").num_columns(2).spacing([20.0, 12.0]).show(ui, |ui| {
                     ui.label("Độ phân giải");
                     let cur = RESOLUTIONS.iter().find(|(r, _)| *r == self.cfg.resolution).map(|(_, n)| *n).unwrap_or("Tùy chỉnh");
@@ -1146,6 +1244,7 @@ impl App {
                     ui.end_row();
                 });
                 ui.weak("Chất lượng, FPS và độ phân giải áp dụng ngay khi đang chia sẻ. Codec, bộ mã hóa, màn hình chia sẻ, chế độ màn hình áp dụng ở lần bắt đầu kế tiếp. Ảnh luôn giữ đúng tỉ lệ của màn hình được chia sẻ (không bị kéo giãn).");
+                });
             });
             card(ui, |ui| {
                 ui.label(RichText::new("Hệ thống").strong());
@@ -1179,20 +1278,25 @@ impl App {
             });
         });
         if self.cfg != before {
-            self.cfg.save();
-            if self.cfg.autostart != before.autostart {
-                self.autostart_msg = util::set_autostart(self.cfg.autostart).err().filter(|_| util::autostart_supported());
-            }
-            if self.cfg.quality != before.quality {
-                self.send(HostCmd::SetQuality { quality: self.cfg.quality });
-            }
-            if self.cfg.fps != before.fps {
-                self.send(HostCmd::SetFps { fps: self.cfg.fps });
-            }
-            if self.cfg.resolution != before.resolution {
-                if let Some((width, height)) = self.cfg.resolution {
-                    self.send(HostCmd::SetResolution { width, height });
-                }
+            self.on_cfg_changed(&before);
+        }
+    }
+
+    /// Saves the config and pushes the settings that can change live to the running host.
+    fn on_cfg_changed(&mut self, before: &Config) {
+        self.cfg.save();
+        if self.cfg.autostart != before.autostart {
+            self.autostart_msg = util::set_autostart(self.cfg.autostart).err().filter(|_| util::autostart_supported());
+        }
+        if self.cfg.quality != before.quality {
+            self.send(HostCmd::SetQuality { quality: self.cfg.quality });
+        }
+        if self.cfg.fps != before.fps {
+            self.send(HostCmd::SetFps { fps: self.cfg.fps });
+        }
+        if self.cfg.resolution != before.resolution {
+            if let Some((width, height)) = self.cfg.resolution {
+                self.send(HostCmd::SetResolution { width, height });
             }
         }
     }
@@ -1296,6 +1400,9 @@ fn draw_qr(ui: &mut egui::Ui, data: &str, size: f32) {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+        if std::mem::take(&mut self.minimize_first_frame) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
         if ctx.input(|i| i.viewport().close_requested()) && self.cfg.minimize_to_tray && !self.quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -1315,5 +1422,28 @@ impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.cfg.save();
         self.host = None; // Drop: stop + kill child
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn low1_color_thresholds() {
+        let g = Color32::from_rgb(52, 190, 100);
+        let a = Color32::from_rgb(235, 170, 40);
+        let r = Color32::from_rgb(225, 70, 70);
+        assert_eq!(low1_color(54.0, 60.0), g);
+        assert_eq!(low1_color(53.9, 60.0), a);
+        assert_eq!(low1_color(36.0, 60.0), a);
+        assert_eq!(low1_color(35.9, 60.0), r);
+    }
+
+    #[test]
+    fn software_encoder_caps_target() {
+        assert_eq!(effective_target_fps(120, "openh264"), 60.0);
+        assert_eq!(effective_target_fps(120, "mf-hevc-hw"), 120.0);
+        assert_eq!(effective_target_fps(30, "openh264"), 30.0);
     }
 }

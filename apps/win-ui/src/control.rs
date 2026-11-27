@@ -53,6 +53,19 @@ pub struct StatsEvent {
     pub width: u32,
     #[serde(default)]
     pub height: u32,
+    /// Frame-time metrics of frames actually sent (absent = 0 on older hosts).
+    #[serde(default)]
+    pub fps_now: f32,
+    #[serde(default)]
+    pub fps_avg: f32,
+    #[serde(default)]
+    pub fps_low1: f32,
+    #[serde(default)]
+    pub frame_ms_mean: f32,
+    #[serde(default)]
+    pub frame_ms_std: f32,
+    #[serde(default)]
+    pub frame_ms_var: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -164,6 +177,21 @@ mod tests {
                 assert_eq!(s.bitrate_kbps, 25000);
                 assert_eq!(s.rtt_ms, None);
                 assert_eq!(s.width, 2560);
+                // Older hosts do not send the frame-time fields.
+                assert_eq!(s.fps_low1, 0.0);
+                assert_eq!(s.frame_ms_var, 0.0);
+            }
+            o => panic!("{o:?}"),
+        }
+        let l = r#"{"event":"stats","fps":60.0,"fps_now":59.0,"fps_avg":58.5,"fps_low1":41.2,"frame_ms_mean":17.1,"frame_ms_std":3.4,"frame_ms_var":11.6}"#;
+        match parse_event(l) {
+            Some(HostEvent::Stats(s)) => {
+                assert_eq!(s.fps_now, 59.0);
+                assert_eq!(s.fps_avg, 58.5);
+                assert_eq!(s.fps_low1, 41.2);
+                assert_eq!(s.frame_ms_mean, 17.1);
+                assert_eq!(s.frame_ms_std, 3.4);
+                assert_eq!(s.frame_ms_var, 11.6);
             }
             o => panic!("{o:?}"),
         }

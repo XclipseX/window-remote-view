@@ -33,6 +33,8 @@ fn main() -> eframe::Result {
     init_logging();
     update::cleanup_old();
     let demo = std::env::args().any(|a| a == "--demo");
+    // Written by the "Tự chạy cùng Windows" registry entry: start minimized and share right away.
+    let minimized = std::env::args().any(|a| a == "--minimized");
     let viewport = eframe::egui::ViewportBuilder::default()
         .with_title("RemoteView")
         .with_inner_size([980.0, 680.0])
@@ -46,7 +48,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "RemoteView",
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, demo)))),
+        Box::new(move |cc| Ok(Box::new(app::App::new(cc, demo, minimized)))),
     )
 }
 

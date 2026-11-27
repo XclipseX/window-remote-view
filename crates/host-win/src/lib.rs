@@ -11,6 +11,7 @@ pub mod control;
 pub mod cursor;
 pub mod encode;
 pub mod engine;
+pub mod frame_stats;
 pub mod input;
 pub mod logfile;
 pub mod service_proto;
