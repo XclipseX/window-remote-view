@@ -12,6 +12,69 @@ use std::path::PathBuf;
 #[cfg(feature = "embed-wdi")]
 static WDI_SIMPLE: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/wdi-simple.exe"));
 
+// SudoVDA virtual display driver (MIT, signed catalog + self-signed cert from the Apollo
+// release), embedded by the `embed-vdd` feature (CI downloads it into assets/sudovda/).
+#[cfg(feature = "embed-vdd")]
+static VDD_FILES: &[(&str, &[u8])] = &[
+    ("SudoVDA.inf", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/sudovda/SudoVDA.inf"))),
+    ("SudoVDA.dll", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/sudovda/SudoVDA.dll"))),
+    ("sudovda.cat", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/sudovda/sudovda.cat"))),
+    ("sudovda.cer", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/sudovda/sudovda.cer"))),
+];
+
+/// Command-line flag of the elevated "install the virtual display driver" mode.
+pub const INSTALL_VDD_FLAG: &str = "--install-vdd";
+
+/// Folder holding the SudoVDA driver files: extracted from the exe, or `sudovda\` next to it.
+fn locate_vdd() -> Result<PathBuf, String> {
+    #[cfg(feature = "embed-vdd")]
+    {
+        let dir = std::env::temp_dir().join("RemoteView").join("sudovda");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("không tạo được {}: {e}", dir.display()))?;
+        for (name, bytes) in VDD_FILES {
+            std::fs::write(dir.join(name), bytes).map_err(|e| format!("không giải nén được {name}: {e}"))?;
+        }
+        Ok(dir)
+    }
+    #[cfg(not(feature = "embed-vdd"))]
+    {
+        let me = std::env::current_exe().map_err(|e| e.to_string())?;
+        let d = me.parent().map(|d| d.join("sudovda")).unwrap_or_default();
+        if d.join("SudoVDA.inf").exists() {
+            Ok(d)
+        } else {
+            Err("bản build này không kèm driver màn hình ảo (thiếu thư mục sudovda)".into())
+        }
+    }
+}
+
+/// Whether this build can install the virtual display driver.
+pub fn vdd_bundled() -> bool {
+    cfg!(feature = "embed-vdd")
+        || std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("sudovda").join("SudoVDA.inf").exists())).unwrap_or(false)
+}
+
+/// Installs SudoVDA: runs this exe elevated with `--install-vdd <dir>`. Blocking.
+pub fn install_vdd() -> DriverResult {
+    #[cfg(windows)]
+    {
+        let dir = match locate_vdd() {
+            Ok(d) => d,
+            Err(e) => return DriverResult::Failed(e),
+        };
+        let me = match std::env::current_exe() {
+            Ok(m) => m,
+            Err(e) => return DriverResult::Failed(e.to_string()),
+        };
+        run_elevated(&me, &format!("{INSTALL_VDD_FLAG} \"{}\"", dir.display()))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = locate_vdd as fn() -> _;
+        DriverResult::Failed("chỉ hỗ trợ cài driver trên Windows".into())
+    }
+}
+
 /// Result of one install attempt, delivered to the UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverResult {
@@ -112,7 +175,7 @@ fn run_elevated(exe: &std::path::Path, params: &str) -> DriverResult {
         if got.is_ok() && code == 0 {
             DriverResult::Installed
         } else {
-            DriverResult::Failed(format!("wdi-simple thoát với mã {code}"))
+            DriverResult::Failed(format!("trình cài driver thoát với mã {code}"))
         }
     }
 }

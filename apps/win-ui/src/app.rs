@@ -64,6 +64,10 @@ pub struct App {
     driver_busy: Option<(u16, u16)>,
     driver_tried: std::collections::HashSet<(u16, u16)>,
     driver_note: Option<(bool, String)>,
+    /// Virtual display driver install in progress / already attempted this run.
+    vdd_busy: bool,
+    vdd_tried: bool,
+    vdd_present: bool,
     /// Connect to this device as soon as its driver install succeeds.
     connect_after_driver: Option<DeviceItem>,
     local_ip: String,
@@ -166,6 +170,9 @@ impl App {
             driver_busy: None,
             driver_tried: Default::default(),
             driver_note: None,
+            vdd_busy: false,
+            vdd_tried: false,
+            vdd_present: rv_host_win::sudovda::driver_present(),
             connect_after_driver: None,
             local_ip: util::local_ip(),
             demo: None,
@@ -255,7 +262,59 @@ impl App {
 
     // ---- host control ----
 
+    /// True when the next session needs RemoteView's own virtual monitor: asked for, or the
+    /// laptop has no active display (broken panel and no TeamViewer/spacedesk monitor).
+    fn needs_vdd(&self) -> bool {
+        self.cfg.display != Display::Mirror || self.outputs.is_empty()
+    }
+
+    fn install_vdd(&mut self, then_start: bool) {
+        self.vdd_busy = true;
+        self.vdd_tried = true;
+        self.driver_note = Some((true, "Đang cài driver màn hình ảo (SudoVDA)... hãy bấm \"Có\" ở hộp thoại quyền quản trị.".into()));
+        self.log(LogLevel::Info, "Đang cài driver màn hình ảo SudoVDA".into());
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let r = driver::install_vdd();
+            let _ = tx.send(UiMsg::Vdd((r, then_start)));
+            ctx.request_repaint();
+        });
+    }
+
+    fn vdd_done(&mut self, (result, then_start): (DriverResult, bool)) {
+        self.vdd_busy = false;
+        self.vdd_present = rv_host_win::sudovda::driver_present();
+        match result {
+            DriverResult::Installed => {
+                self.log(LogLevel::Info, "Đã cài driver màn hình ảo".into());
+                self.driver_note = Some((true, "Đã cài driver màn hình ảo.".into()));
+            }
+            DriverResult::Cancelled => {
+                self.log(LogLevel::Warn, "Bạn đã từ chối quyền quản trị, chưa cài driver màn hình ảo".into());
+                self.driver_note = Some((false, "Chưa cài driver màn hình ảo vì bạn từ chối quyền quản trị.".into()));
+            }
+            DriverResult::Failed(e) => {
+                self.log(LogLevel::Error, format!("Cài driver màn hình ảo thất bại: {e}"));
+                self.driver_note = Some((false, format!("Cài driver màn hình ảo thất bại: {e}")));
+            }
+        }
+        if then_start && !self.running {
+            self.start();
+        }
+    }
+
     fn start(&mut self) {
+        if cfg!(windows)
+            && self.demo.is_none()
+            && !self.vdd_busy
+            && !self.vdd_tried
+            && self.needs_vdd()
+            && driver::vdd_bundled()
+            && !rv_host_win::sudovda::driver_present()
+        {
+            self.install_vdd(true);
+            return;
+        }
         self.running = true;
         self.status = None;
         self.error = None;
@@ -473,6 +532,7 @@ impl App {
                     }
                 }
                 UiMsg::Driver { vid, pid, result } => self.driver_done(vid, pid, result),
+                UiMsg::Vdd(result) => self.vdd_done(result),
             }
         }
         self.tick_demo();
@@ -1020,10 +1080,25 @@ impl App {
 
                     ui.label("Chế độ màn hình");
                     ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.cfg.display, Display::Virtual, "Màn hình ảo chính")
+                            .on_hover_text("RemoteView tự tạo một màn hình ảo đúng độ phân giải của máy bảng và đặt làm màn hình chính. Dùng khi màn laptop hỏng/tắt, không cần TeamViewer.");
                         ui.selectable_value(&mut self.cfg.display, Display::Mirror, "Hiển thị màn hình laptop");
-                        ui.selectable_value(&mut self.cfg.display, Display::Extend, "Mở rộng");
-                        if self.cfg.display == Display::Extend {
-                            ui.colored_label(Color32::from_rgb(230, 160, 40), "sắp có - cần driver màn hình ảo");
+                        ui.selectable_value(&mut self.cfg.display, Display::Extend, "Mở rộng (màn hình phụ)");
+                    });
+                    ui.end_row();
+
+                    ui.label("Driver màn hình ảo");
+                    ui.horizontal(|ui| {
+                        if self.vdd_present {
+                            ui.colored_label(Color32::from_rgb(60, 170, 90), "Đã cài (SudoVDA)");
+                        } else if !driver::vdd_bundled() {
+                            ui.colored_label(Color32::from_rgb(230, 160, 40), "Bản build này không kèm driver");
+                        } else {
+                            ui.colored_label(Color32::from_rgb(230, 160, 40), "Chưa cài");
+                        }
+                        let can = cfg!(windows) && driver::vdd_bundled() && !self.vdd_busy;
+                        if ui.add_enabled(can, egui::Button::new("Cài / cài lại")).clicked() {
+                            self.install_vdd(false);
                         }
                     });
                     ui.end_row();

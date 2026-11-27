@@ -110,16 +110,68 @@ jobs:
         with:
           name: wdi-simple
           path: apps/win-ui/assets
+      # SudoVDA virtual display driver (MIT): the signed SudoVDA.dll/.cat/.inf + cert ship inside
+      # the Apollo release installer; take them from there so RemoteView can create its own monitor.
+      - uses: actions/cache@v4
+        id: vddcache
+        with:
+          path: apps/win-ui/assets/sudovda
+          key: sudovda-apollo-v1
+      - name: Fetch SudoVDA driver
+        if: steps.vddcache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rel = gh api repos/ClassicOldSong/Apollo/releases/latest | ConvertFrom-Json
+          Write-Host "Apollo release $($rel.tag_name): $($rel.assets.name -join ', ')"
+          $asset = $rel.assets | Where-Object { $_.name -match '\.exe$' } | Select-Object -First 1
+          if (-not $asset) { $asset = $rel.assets | Where-Object { $_.name -match '\.msi$' } | Select-Object -First 1 }
+          if (-not $asset) { throw "no installer asset" }
+          $pkg = Join-Path $env:RUNNER_TEMP $asset.name
+          Invoke-WebRequest $asset.browser_download_url -OutFile $pkg
+          $x = Join-Path $env:RUNNER_TEMP 'apollo-x'
+          if ($asset.name -match '\.msi$') {
+            Start-Process msiexec -ArgumentList "/a `"$pkg`" /qn TARGETDIR=`"$x`"" -Wait
+          } else {
+            7z x $pkg "-o$x" -y | Out-Null
+          }
+          $dll = Get-ChildItem $x -Recurse -Filter SudoVDA.dll | Select-Object -First 1
+          if (-not $dll) { Get-ChildItem $x -Recurse | Select-Object -First 80 FullName; throw "SudoVDA.dll not found" }
+          $src = $dll.DirectoryName
+          Get-ChildItem $src | Format-Table Name, Length
+          $dst = 'apps/win-ui/assets/sudovda'
+          New-Item -ItemType Directory -Force $dst | Out-Null
+          foreach ($f in 'SudoVDA.dll','SudoVDA.inf','sudovda.cat','sudovda.cer') {
+            $m = Get-ChildItem $src -Filter $f | Select-Object -First 1
+            if (-not $m) { throw "missing $f next to SudoVDA.dll" }
+            Copy-Item $m.FullName (Join-Path $dst $f)
+          }
+          Get-AuthenticodeSignature (Join-Path $dst 'sudovda.cat') | Format-List Status, SignerCertificate
       - name: Build RemoteView.exe
         shell: pwsh
         env:
           RV_BUILD_SHA: ${{ github.sha }}
         run: |
+          $feat = @()
           if (Test-Path apps/win-ui/assets/wdi-simple.exe) {
             Write-Host "Embedding wdi-simple.exe"
-            cargo build --release -p rv-win-ui --features embed-wdi
+            $feat += 'embed-wdi'
           } else {
             Write-Host "::warning::wdi-simple.exe missing; building without the embedded driver installer"
+          }
+          $vdd = 'SudoVDA.dll','SudoVDA.inf','sudovda.cat','sudovda.cer' | ForEach-Object { Test-Path "apps/win-ui/assets/sudovda/$_" }
+          if ($vdd -notcontains $false) {
+            Write-Host "Embedding SudoVDA virtual display driver"
+            $feat += 'embed-vdd'
+          } else {
+            Write-Host "::warning::SudoVDA missing; building without the virtual display driver"
+          }
+          if ($feat.Count -gt 0) {
+            cargo build --release -p rv-win-ui --features ($feat -join ',')
+          } else {
             cargo build --release -p rv-win-ui
           }
       - uses: actions/upload-artifact@v4

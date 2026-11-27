@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 /// Messages delivered to the UI thread.
 #[derive(Debug)]
 pub enum UiMsg {
+    /// Virtual display driver install finished (result, start sharing afterwards).
+    Vdd((crate::driver::DriverResult, bool)),
     Event(HostEvent),
     /// Process ended. `restart_in` is Some when an auto-restart is scheduled.
     Exited { code: Option<i32>, restart_in: Option<Duration> },

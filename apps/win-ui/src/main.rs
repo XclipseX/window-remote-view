@@ -15,9 +15,14 @@ fn main() -> eframe::Result {
     // Single-executable layout: the host engine runs as this same exe in worker
     // mode (JSON lines on stdin/stdout), so no separate rv-host.exe is shipped.
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some(host::WORKER_FLAG) {
-        let code = rv_host_win::engine::run_cli(args.collect());
-        std::process::exit(code);
+    match args.next().as_deref() {
+        Some(host::WORKER_FLAG) => {
+            let code = rv_host_win::engine::run_cli(args.collect());
+            std::process::exit(code);
+        }
+        // Elevated helper mode (started by the GUI through UAC): install SudoVDA from <dir>.
+        Some(driver::INSTALL_VDD_FLAG) => std::process::exit(install_vdd_main(args.next())),
+        _ => {}
     }
     init_logging();
     update::cleanup_old();
@@ -37,6 +42,29 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, demo)))),
     )
+}
+
+#[cfg(windows)]
+fn install_vdd_main(dir: Option<String>) -> i32 {
+    use rv_host_win::logfile::{init, write_line, PREFIX};
+    let _ = init(PREFIX);
+    let Some(dir) = dir else { return 2 };
+    write_line("info", &format!("install-vdd: installing SudoVDA from {dir}"));
+    match rv_host_win::sudovda::install(std::path::Path::new(&dir)) {
+        Ok(()) => {
+            write_line("info", "install-vdd: done");
+            0
+        }
+        Err(e) => {
+            write_line("error", &format!("install-vdd: {e}"));
+            1
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn install_vdd_main(_dir: Option<String>) -> i32 {
+    1
 }
 
 /// Starts the log file (`%LOCALAPPDATA%\\RemoteView\\logs\\remoteview-<date-time>.log`) from app

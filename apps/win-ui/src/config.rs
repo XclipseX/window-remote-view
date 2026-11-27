@@ -71,12 +71,15 @@ pub enum Display {
     #[default]
     Mirror,
     Extend,
+    /// RemoteView's own virtual monitor (SudoVDA), made the main display.
+    Virtual,
 }
 impl Display {
     pub fn arg(self) -> &'static str {
         match self {
             Display::Mirror => "mirror",
             Display::Extend => "extend",
+            Display::Virtual => "virtual",
         }
     }
 }

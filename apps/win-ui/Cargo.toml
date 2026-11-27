@@ -13,6 +13,8 @@ path = "src/main.rs"
 # Release builds: embed wdi-simple.exe (libwdi, LGPL-3) from assets/ so the
 # driver installer needs no extra file. CI builds it into assets/ first.
 embed-wdi = []
+# Release builds: embed the SudoVDA virtual display driver from assets/sudovda/.
+embed-vdd = []
 
 [dependencies]
 rv-host-win = { path = "../../crates/host-win" }

@@ -24,7 +24,7 @@ use crate::encode::{
     HwSupervisor, VideoEncoder,
 };
 use crate::input::{InputInjector, WinInjector};
-use crate::vdisplay::{DisplayMode, ExistingOutput, IddCxDisplay, VirtualDisplay};
+use crate::vdisplay::{DisplayMode, ExistingOutput, VirtualDisplay};
 use rv_proto::ControlMessage;
 use rv_session::udp::{SharedPeer, UdpIo};
 use rv_session::{slider_to_bitrate, DatagramIo, HostSession, HostSessionEvent};
@@ -63,6 +63,8 @@ enum Mode {
 struct Args {
     mode: Mode,
     mirror: bool,
+    /// `--display virtual`: own SudoVDA monitor, made the primary display.
+    virtual_primary: bool,
     display_mode: DisplayMode,
     output: Option<usize>,
     /// GDI device name of the output to share in mirror mode (None = auto: internal panel).
@@ -85,6 +87,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     let mut a = Args {
         mode: Mode::Auto,
         mirror: false,
+        virtual_primary: false,
         display_mode: DisplayMode::TAB_S10_PLUS,
         output: None,
         monitor: None,
@@ -110,9 +113,10 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
             "--adb" => a.mode = Mode::Adb,
             "--lan" => a.mode = Mode::Lan,
             "--display" => match val("--display")?.as_str() {
-                "extend" => a.mirror = false,
-                "mirror" => a.mirror = true,
-                o => return Err(format!("--display: extend|mirror, got {o}")),
+                "extend" => (a.mirror, a.virtual_primary) = (false, false),
+                "mirror" => (a.mirror, a.virtual_primary) = (true, false),
+                "virtual" => (a.mirror, a.virtual_primary) = (false, true),
+                o => return Err(format!("--display: extend|mirror|virtual, got {o}")),
             },
             "--mode" => {
                 a.display_mode = DisplayMode::parse(&val("--mode")?).ok_or("bad --mode, want WxH@Hz")?;
@@ -1468,7 +1472,31 @@ fn run(argv: Vec<String>) -> Result<(), String> {
     }
 
     // Pick the display to capture.
-    let monitor = if a.mirror {
+    // A RemoteView-owned SudoVDA monitor is used when asked for (extend / virtual) or when the
+    // laptop has no active display at all (broken panel, no TeamViewer/spacedesk monitor):
+    // mirroring "nothing" would only ever give a black picture.
+    let any_attached = outputs.iter().any(|o| o.attached);
+    let want_vdd = !a.mirror || a.virtual_primary || !any_attached;
+    let mut _vdd_guard: Option<crate::sudovda::SudoVdaMonitor> = None;
+    let mut vdd_output = None;
+    if want_vdd {
+        match create_vdd(a.display_mode, a.virtual_primary || !any_attached) {
+            Ok((guard, out)) => {
+                _vdd_guard = Some(guard);
+                vdd_output = Some(out);
+            }
+            Err(e) => {
+                warn!("vdisplay: {e}");
+                if a.json {
+                    control::emit(&control::log_json(control::Level::Warn, &format!("Màn hình ảo: {e}")));
+                }
+            }
+        }
+    }
+    let outputs = if vdd_output.is_some() { list_outputs().map_err(|e| e.to_string())? } else { outputs };
+    let monitor = if let Some(m) = vdd_output {
+        m
+    } else if a.mirror {
         // The chosen output, else the laptop's own panel (never "first enumerated": virtual
         // drivers such as spacedesk can sort first and have a different aspect ratio).
         if let Some(m) = a.monitor.as_deref() {
@@ -1478,14 +1506,7 @@ fn run(argv: Vec<String>) -> Result<(), String> {
         }
         pick_output(&outputs, a.monitor.as_deref()).cloned().ok_or("no attached output")?
     } else {
-        let mut idd = IddCxDisplay;
-        match idd.create(a.display_mode) {
-            Ok(m) => m.output,
-            Err(e) => {
-                warn!("vdisplay: {e}; falling back to an existing output");
-                ExistingOutput { index: a.output }.create(a.display_mode).map_err(|e| e.to_string())?.output
-            }
-        }
+        ExistingOutput { index: a.output }.create(a.display_mode).map_err(|e| e.to_string())?.output
     };
     info!("capturing {} {:?} on '{}'", monitor.name, monitor.desktop_rect, monitor.adapter_name);
     info!("capture target: {}", monitor.describe());
@@ -1634,4 +1655,31 @@ mod tests {
         // only one side limited
         assert_eq!(fit_size(2000, 1000, 1000, 5000), (1000, 500));
     }
+}
+
+/// Creates RemoteView's own SudoVDA monitor and returns it with its DXGI output.
+#[cfg(windows)]
+fn create_vdd(mode: DisplayMode, primary: bool) -> std::result::Result<(crate::sudovda::SudoVdaMonitor, crate::capture::OutputInfo), String> {
+    let m = crate::sudovda::SudoVdaMonitor::create(mode)?;
+    if primary {
+        if let Err(e) = crate::sudovda::make_primary(&m.gdi_name) {
+            warn!("vdisplay: không đặt được làm màn hình chính: {e}");
+        }
+    }
+    // DXGI sees the new output a moment after the display config does.
+    for _ in 0..25 {
+        if let Ok(outs) = list_outputs() {
+            if let Some(o) = outs.into_iter().find(|o| o.attached && o.name.eq_ignore_ascii_case(&m.gdi_name)) {
+                info!("vdisplay: RemoteView virtual display {} {:?}", o.name, o.desktop_rect);
+                return Ok((m, o));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Err(format!("màn hình ảo {} không xuất hiện trong DXGI", m.gdi_name))
+}
+
+#[cfg(not(windows))]
+fn create_vdd(_mode: DisplayMode, _primary: bool) -> std::result::Result<(crate::sudovda::SudoVdaMonitor, crate::capture::OutputInfo), String> {
+    Err("virtual display needs Windows".into())
 }

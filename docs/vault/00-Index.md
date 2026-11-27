@@ -10,6 +10,7 @@ updated: 2026-11-26
 
 ## Decisions
 - [[decisions/ADR-0002-large-frames]] – protocol v2, FEC theo block
+- [[decisions/ADR-0003-sudovda-virtual-display]] – RemoteView tự tạo màn hình ảo (SudoVDA), hết màn đen khi không có TeamViewer
 
 ## Known bugs / gotchas
 - Tab S10+ Android 17 không bật được USB tethering
