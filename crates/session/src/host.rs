@@ -165,14 +165,21 @@ impl<I: DatagramIo> HostSession<I> {
                 seq: p.input_seq,
                 event: p.event,
             }),
-            Packet::Control(c) => {
-                if let ControlMessage::FeedbackStats { loss_permille, .. } = &c.message {
-                    self.loss = (f32::from(*loss_permille) / 1000.0).clamp(0.0, 1.0);
+            Packet::Control(c) => match c.message {
+                ControlMessage::Keepalive => {}
+                ControlMessage::Ping { ts_us } => {
+                    if let Ok(dg) = ch.control(ControlMessage::Pong { ts_us }) {
+                        self.io.send(&dg);
+                        self.last_tx = now;
+                    }
                 }
-                if c.message != ControlMessage::Keepalive {
-                    self.events.push_back(HostSessionEvent::Control(c.message));
+                msg => {
+                    if let ControlMessage::FeedbackStats { loss_permille, .. } = &msg {
+                        self.loss = (f32::from(*loss_permille) / 1000.0).clamp(0.0, 1.0);
+                    }
+                    self.events.push_back(HostSessionEvent::Control(msg));
                 }
-            }
+            },
             _ => {}
         }
         Ok(())

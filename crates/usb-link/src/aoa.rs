@@ -283,7 +283,7 @@ impl AoaDevice {
         }
     }
 
-    fn open(dev: Device<Context>, token: Option<&str>) -> Result<Self> {
+    fn open(dev: Device<Context>, _token: Option<&str>) -> Result<Self> {
         let cfg = dev.active_config_descriptor()?;
         let mut found = None;
         'outer: for iface in cfg.interfaces() {
@@ -317,12 +317,10 @@ impl AoaDevice {
         let _ = handle.clear_halt(ep_in);
         let _ = handle.clear_halt(ep_out);
         let (bus, address) = (dev.bus_number(), dev.address());
-        if let (Some(t), Ok(desc)) = (token, dev.device_descriptor()) {
-            let serial = handle.read_serial_number_string_ascii(&desc).ok();
-            if serial.as_deref().is_some_and(|s| s != t) {
-                eprintln!("rv-usb: accessory serial {serial:?} differs from our pairing token (left over from an older build?); unplug/replug the tablet if pairing fails");
-            }
-        }
+        // Do NOT compare the USB device descriptor's `iSerialNumber` against `_token`.
+        // AOA `SEND_STRING(5)` only sets the accessory serial visible to Android's
+        // `UsbAccessory.getSerial()`; the USB descriptor's `iSerialNumber` remains the
+        // device's hardware serial (e.g. `R52Y106D7TR`), which `adb` needs on `18D1:2D01`.
         Ok(Self {
             handle: Arc::new(handle),
             ep_in,

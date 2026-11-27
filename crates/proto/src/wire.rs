@@ -60,6 +60,13 @@ impl<'a> Reader<'a> {
         Ok(u64::from_be_bytes([0, 0, b[0], b[1], b[2], b[3], b[4], b[5]]))
     }
 
+    pub fn u64(&mut self) -> Result<u64> {
+        let b = self.take(8)?;
+        Ok(u64::from_be_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
     pub fn bool(&mut self) -> Result<bool> {
         match self.u8()? {
             0 => Ok(false),
@@ -89,6 +96,10 @@ pub(crate) fn put_i16(buf: &mut Vec<u8>, v: i16) {
 }
 
 pub(crate) fn put_u32(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_be_bytes());
+}
+
+pub(crate) fn put_u64(buf: &mut Vec<u8>, v: u64) {
     buf.extend_from_slice(&v.to_be_bytes());
 }
 

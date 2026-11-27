@@ -41,6 +41,8 @@ pub const USB_HOST_ID: &[u8] = b"rv-host-win-0001";
 pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Send a `Keepalive` when nothing else was sent for this long (from `tick`).
 pub const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Send a `Ping` RTT probe at this cadence while established (from `ClientSession::tick`).
+pub const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// Host accepts at most one new handshake (msg1) per this interval.
 pub const HANDSHAKE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 /// Peer key used by [`HostSession::handle_datagram`] when the caller has no address.

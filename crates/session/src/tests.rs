@@ -522,3 +522,113 @@ fn stream_config_roundtrip_via_session() {
     r.pump();
     assert_eq!(events_c(&mut r), vec![ClientEvent::Control(cfg)]);
 }
+
+#[test]
+fn ping_pong_measures_rtt_and_suppresses_events() {
+    let mut r = rig("123456", 0.0);
+    r.connect();
+    events_h(&mut r);
+    events_c(&mut r);
+    assert_eq!(r.client.rtt_us(), None);
+
+    // Before PING_INTERVAL, tick must not send a Ping.
+    r.advance(Duration::from_millis(500));
+    r.client.tick(r.now);
+    assert!(drain(&r.to_host).is_empty());
+
+    // At PING_INTERVAL (1s), tick sends Ping; host auto-replies Pong with no HostSessionEvent.
+    r.advance(Duration::from_millis(500));
+    r.client.tick(r.now);
+    let pings = drain(&r.to_host);
+    assert_eq!(pings.len(), 1, "expected 1 ping datagram");
+
+    // Simulate 5 ms client -> host + 7 ms host -> client = 12_000 us RTT.
+    r.advance(Duration::from_millis(5));
+    for d in pings {
+        r.host.handle_datagram_at(&d, r.now).unwrap();
+    }
+    assert!(events_h(&mut r).is_empty(), "Ping must not emit HostSessionEvent");
+    let pongs = drain(&r.to_client);
+    assert_eq!(pongs.len(), 1, "host must auto-reply Pong");
+
+    r.advance(Duration::from_millis(7));
+    for d in pongs {
+        r.client.handle_datagram_at(&d, r.now).unwrap();
+    }
+    assert!(events_c(&mut r).is_empty(), "Pong must not emit ClientEvent");
+    assert_eq!(r.client.rtt_us(), Some(12_000));
+
+    // Second RTT sample (20_000 us) after another PING_INTERVAL updates EWMA (alpha = 0.25):
+    // 0.75 * 12_000 + 0.25 * 20_000 = 14_000.
+    r.advance(PING_INTERVAL);
+    r.client.tick(r.now);
+    let pings = drain(&r.to_host);
+    assert_eq!(pings.len(), 1);
+    r.advance(Duration::from_millis(10));
+    for d in pings {
+        r.host.handle_datagram_at(&d, r.now).unwrap();
+    }
+    let pongs = drain(&r.to_client);
+    assert_eq!(pongs.len(), 1);
+    r.advance(Duration::from_millis(10));
+    for d in pongs {
+        r.client.handle_datagram_at(&d, r.now).unwrap();
+    }
+    assert_eq!(r.client.rtt_us(), Some(14_000));
+
+    // Outlier sample (> 10s) must be ignored.
+    r.host
+        .send_control(ControlMessage::Pong { ts_us: 0 })
+        .unwrap();
+    let bogus = drain(&r.to_client);
+    // Advance in small steps or just past 10s from epoch while keeping session alive via rx.
+    let future = r.now + Duration::from_secs(12);
+    for d in bogus {
+        r.client.handle_datagram_at(&d, future).unwrap();
+    }
+    assert_eq!(r.client.rtt_us(), Some(14_000));
+    assert!(events_c(&mut r).is_empty());
+}
+
+#[test]
+fn host_request_log_surfaced_to_client() {
+    let mut r = rig("123456", 0.0);
+    r.connect();
+    events_c(&mut r);
+    r.host.send_control(ControlMessage::RequestLog).unwrap();
+    r.pump();
+    assert_eq!(
+        events_c(&mut r),
+        vec![ClientEvent::Control(ControlMessage::RequestLog)]
+    );
+}
+
+#[test]
+fn client_loss_permille_tracks_completed_and_evicted_frames() {
+    let mut r = rig("123456", 0.0);
+    r.connect();
+    events_c(&mut r);
+    assert_eq!(r.client.loss_permille(), 0);
+
+    // 3 complete frames -> 0 permille loss.
+    for id in 0..3u32 {
+        let f = frame_bytes(id, 5_000);
+        r.host.send_video_frame(id, id * 16_667, &f, id == 0).unwrap();
+        r.pump();
+    }
+    assert_eq!(r.client.loss_permille(), 0);
+
+    // 4th frame: drop 1 shard with FEC disabled (loss = 0.0) so it expires after 250 ms.
+    let f = frame_bytes(3, 5_000);
+    let sent = r.host.send_video_frame(3, 3 * 16_667, &f, false).unwrap();
+    assert!(sent >= 2);
+    let mut dgs = drain(&r.to_client);
+    dgs.pop(); // drop last shard
+    for d in dgs {
+        r.client.handle_datagram_at(&d, r.now).unwrap();
+    }
+    r.advance(Duration::from_millis(300));
+    r.client.tick(r.now);
+    assert_eq!(r.client.evicted_frames(), 1);
+    assert_eq!(r.client.loss_permille(), 250);
+}

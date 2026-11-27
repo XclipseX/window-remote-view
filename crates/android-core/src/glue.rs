@@ -21,9 +21,23 @@ pub mod state {
     /// Host chose the stream parameters; message = "<codec> WxH@fps <kbps>kbps"
     /// with codec one of `h264`, `hevc`, `av1` (e.g. "hevc 2800x1752@120 80000kbps").
     pub const STREAM_CONFIG: i32 = 11;
+    /// Host requested diagnostic log upload (`ControlMessage::RequestLog`).
+    pub const LOG_REQUEST: i32 = 12;
     /// Host went silent for 5 s (or restarted). The worker keeps retrying the
     /// handshake by itself; `ESTABLISHED` follows when the host is back.
     pub const DISCONNECTED: i32 = 4;
+}
+
+/// Maps a target bitrate in kbps (clamped to `>= 500`) to a quality slider
+/// value `1..=100`, matching the inverse of `StreamSettings.targetBitrateKbps()`
+/// (`5_000..=120_000` kbps linearly mapped across `1..=100`).
+pub fn kbps_to_quality(kbps: i32) -> u8 {
+    let clamped = kbps.max(500);
+    if clamped <= 5_000 {
+        return 1;
+    }
+    let num = i64::from(clamped - 5_000) * 99 + 57_500;
+    ((num / 115_000) + 1).clamp(1, 100) as u8
 }
 
 /// Video flag bits understood by `NativeBridge` (`FLAG_KEYFRAME`, `FLAG_CONFIG`).
@@ -333,6 +347,10 @@ pub fn translate_event(ev: ClientEvent) -> Vec<Outgoing> {
         ClientEvent::Control(ControlMessage::CursorPos { x, y, visible }) => {
             vec![Outgoing::CursorPos { x: i32::from(x), y: i32::from(y), visible }]
         }
+        ClientEvent::Control(ControlMessage::RequestLog) => vec![Outgoing::State {
+            state: state::LOG_REQUEST,
+            message: None,
+        }],
         ClientEvent::Control(_) => Vec::new(),
         ClientEvent::Disconnected => vec![Outgoing::State {
             state: state::DISCONNECTED,
@@ -538,5 +556,25 @@ mod tests {
             translate_event(ClientEvent::Established { host_static: [0; 32] }),
             vec![Outgoing::State { state: state::ESTABLISHED, message: None }]
         );
+        assert_eq!(
+            translate_event(ClientEvent::Control(ControlMessage::RequestLog)),
+            vec![Outgoing::State { state: state::LOG_REQUEST, message: None }]
+        );
+        assert_eq!(state::LOG_REQUEST, 12);
+    }
+
+    #[test]
+    fn kbps_to_quality_matches_slider_inverse() {
+        assert_eq!(kbps_to_quality(-100), 1);
+        assert_eq!(kbps_to_quality(0), 1);
+        assert_eq!(kbps_to_quality(500), 1);
+        assert_eq!(kbps_to_quality(5_000), 1);
+        assert_eq!(kbps_to_quality(120_000), 100);
+        assert_eq!(kbps_to_quality(500_000), 100);
+        // Round-trip against StreamSettings.targetBitrateKbps()
+        for q in 1u8..=100 {
+            let kbps = 5_000 + (((q as f32 - 1.0) / 99.0) * 115_000.0) as i32;
+            assert_eq!(kbps_to_quality(kbps), q, "quality={q}, kbps={kbps}");
+        }
     }
 }

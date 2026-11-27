@@ -7,8 +7,16 @@ use rv_transport::fec::{FrameReassembler, Shard};
 
 use crate::channel::Channel;
 use crate::{
-    hs_packet, hs_parse, DatagramIo, Result, SessionError, IDLE_TIMEOUT, KEEPALIVE_INTERVAL, PROLOGUE,
+    hs_packet, hs_parse, DatagramIo, Result, SessionError, IDLE_TIMEOUT, KEEPALIVE_INTERVAL,
+    PING_INTERVAL, PROLOGUE,
 };
+
+/// Ignore RTT samples larger than 10 seconds as outliers.
+const MAX_RTT_SAMPLE_US: u64 = 10_000_000;
+/// EWMA smoothing factor for RTT samples (first sample is taken exact).
+const RTT_EWMA_ALPHA: f64 = 0.25;
+/// Sliding window of recent frame outcomes used for `loss_permille()`.
+const LOSS_WINDOW: usize = 100;
 
 /// A fully reassembled video frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,12 +54,18 @@ pub struct ClientSession<I: DatagramIo> {
     events: VecDeque<ClientEvent>,
     reasm: FrameReassembler,
     meta: HashMap<u32, (u32, u8)>,
+    epoch: Instant,
     last_rx: Instant,
     last_tx: Instant,
+    last_ping: Instant,
+    rtt_ewma_us: Option<f64>,
+    last_evicted: u64,
+    frame_outcomes: VecDeque<bool>,
 }
 
 impl<I: DatagramIo> ClientSession<I> {
     pub fn new(io: I, keypair: Keypair, otp: &str, host_id: &[u8]) -> Result<Self> {
+        let now = Instant::now();
         Ok(Self {
             io,
             keypair,
@@ -60,8 +74,13 @@ impl<I: DatagramIo> ClientSession<I> {
             events: VecDeque::new(),
             reasm: FrameReassembler::new(Duration::from_millis(250)),
             meta: HashMap::new(),
-            last_rx: Instant::now(),
-            last_tx: Instant::now(),
+            epoch: now,
+            last_rx: now,
+            last_tx: now,
+            last_ping: now,
+            rtt_ewma_us: None,
+            last_evicted: 0,
+            frame_outcomes: VecDeque::with_capacity(LOSS_WINDOW),
         })
     }
 
@@ -80,6 +99,22 @@ impl<I: DatagramIo> ClientSession<I> {
     /// Frames dropped because shards never completed in time.
     pub fn evicted_frames(&self) -> u64 {
         self.reasm.evicted_frames()
+    }
+
+    /// Smoothed RTT estimate in microseconds from Ping/Pong probes, or `None`
+    /// until the first valid `Pong` is received.
+    pub fn rtt_us(&self) -> Option<u32> {
+        self.rtt_ewma_us.map(|v| v.round() as u32)
+    }
+
+    /// Observed frame loss rate in permille (`0..=1000`) over recent frames.
+    pub fn loss_permille(&self) -> u16 {
+        let total = self.frame_outcomes.len();
+        if total == 0 {
+            return 0;
+        }
+        let lost = self.frame_outcomes.iter().filter(|&&ok| !ok).count();
+        ((lost * 1000) / total).min(1000) as u16
     }
 
     /// Send handshake message 1 (call again to retransmit).
@@ -104,23 +139,64 @@ impl<I: DatagramIo> ClientSession<I> {
         self.state = State::Idle;
         self.reasm = FrameReassembler::new(Duration::from_millis(250));
         self.meta.clear();
+        self.rtt_ewma_us = None;
+        self.last_evicted = 0;
+        self.frame_outcomes.clear();
         self.events.push_back(ClientEvent::Disconnected);
     }
 
-    /// Drop stale partially received frames, send keepalives and detect a dead
-    /// host ([`ClientEvent::Disconnected`] after [`IDLE_TIMEOUT`] of silence);
-    /// call every ~100 ms.
+    fn record_frame_outcome(&mut self, completed: bool) {
+        if self.frame_outcomes.len() == LOSS_WINDOW {
+            self.frame_outcomes.pop_front();
+        }
+        self.frame_outcomes.push_back(completed);
+    }
+
+    fn sync_evicted(&mut self) {
+        let evicted = self.reasm.evicted_frames();
+        let delta = evicted.saturating_sub(self.last_evicted);
+        self.last_evicted = evicted;
+        for _ in 0..delta.min(LOSS_WINDOW as u64) {
+            self.record_frame_outcome(false);
+        }
+    }
+
+    fn on_pong(&mut self, ts_us: u64, now: Instant) {
+        let now_us = now.saturating_duration_since(self.epoch).as_micros() as u64;
+        let sample = now_us.saturating_sub(ts_us);
+        if sample > MAX_RTT_SAMPLE_US {
+            return;
+        }
+        let sample_f = sample as f64;
+        self.rtt_ewma_us = Some(match self.rtt_ewma_us {
+            None => sample_f,
+            Some(prev) => prev * (1.0 - RTT_EWMA_ALPHA) + sample_f * RTT_EWMA_ALPHA,
+        });
+    }
+
+    /// Drop stale partially received frames, send periodic RTT pings and
+    /// keepalives, and detect a dead host ([`ClientEvent::Disconnected`] after
+    /// [`IDLE_TIMEOUT`] of silence); call every ~100 ms.
     pub fn tick(&mut self, now: Instant) {
         if self.is_established() {
             if now.saturating_duration_since(self.last_rx) >= IDLE_TIMEOUT {
                 self.drop_session();
                 return;
             }
-            if now.saturating_duration_since(self.last_tx) >= KEEPALIVE_INTERVAL {
-                let _ = self.send_control(ControlMessage::Keepalive);
+            if now.saturating_duration_since(self.last_ping) >= PING_INTERVAL {
+                let ts_us = now.saturating_duration_since(self.epoch).as_micros() as u64;
+                if self
+                    .send_control_at(ControlMessage::Ping { ts_us }, now)
+                    .is_ok()
+                {
+                    self.last_ping = now;
+                }
+            } else if now.saturating_duration_since(self.last_tx) >= KEEPALIVE_INTERVAL {
+                let _ = self.send_control_at(ControlMessage::Keepalive, now);
             }
         }
         self.reasm.evict_expired(now);
+        self.sync_evicted();
         if self.reasm.pending_frames() == 0 {
             self.meta.clear();
         }
@@ -141,7 +217,14 @@ impl<I: DatagramIo> ClientSession<I> {
         self.last_rx = now;
         match pkt {
             Packet::Video(vp) => self.on_video(vp, now),
-            Packet::Control(ControlPacket { message: ControlMessage::Keepalive, .. }) => {}
+            Packet::Control(ControlPacket {
+                message: ControlMessage::Keepalive,
+                ..
+            }) => {}
+            Packet::Control(ControlPacket {
+                message: ControlMessage::Pong { ts_us },
+                ..
+            }) => self.on_pong(ts_us, now),
             Packet::Control(c) => self.events.push_back(ClientEvent::Control(c.message)),
             Packet::Audio(a) => self.events.push_back(ClientEvent::Audio(a)),
             _ => {}
@@ -165,7 +248,9 @@ impl<I: DatagramIo> ClientSession<I> {
             frame_len: u32::MAX,
             data: vp.payload,
         };
-        if let Some(buf) = self.reasm.push(shard, now) {
+        let frame = self.reasm.push(shard, now);
+        self.sync_evicted();
+        if let Some(buf) = frame {
             let (ts, flags) = self.meta.remove(&id).unwrap_or((ts, flags));
             if self.meta.len() > 512 {
                 self.meta.clear();
@@ -177,6 +262,7 @@ impl<I: DatagramIo> ClientSession<I> {
             if len > buf.len() - 4 {
                 return;
             }
+            self.record_frame_outcome(true);
             self.events.push_back(ClientEvent::Frame(Frame {
                 frame_id: id,
                 capture_ts_us: ts,
@@ -213,6 +299,10 @@ impl<I: DatagramIo> ClientSession<I> {
         self.state = State::Established(Box::new(Channel::new(session, sid)));
         self.last_rx = now;
         self.last_tx = now;
+        self.last_ping = now;
+        self.rtt_ewma_us = None;
+        self.last_evicted = 0;
+        self.frame_outcomes.clear();
         self.events
             .push_back(ClientEvent::Established { host_static });
         Ok(())
@@ -233,9 +323,13 @@ impl<I: DatagramIo> ClientSession<I> {
     }
 
     pub fn send_control(&mut self, msg: ControlMessage) -> Result<()> {
+        self.send_control_at(msg, Instant::now())
+    }
+
+    fn send_control_at(&mut self, msg: ControlMessage, now: Instant) -> Result<()> {
         let dg = self.channel()?.control(msg)?;
         self.io.send(&dg);
-        self.last_tx = Instant::now();
+        self.last_tx = now;
         Ok(())
     }
 

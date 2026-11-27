@@ -2141,16 +2141,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
-name = "openh264"
-version = "0.9.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a30840cd2b2cd6ae39af2544f66adf55357f68e0e4938a096fe0e9f8f412b59"
-dependencies = [
- "openh264-sys2",
- "wide",
-]
-
-[[package]]
 name = "openh264-sys2"
 version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2649,7 +2639,9 @@ dependencies = [
  "rv-crypto",
  "rv-proto",
  "rv-session",
+ "rv-transport",
  "serde_json",
+ "socket2 0.5.10",
 ]
 
 [[package]]
@@ -2667,11 +2659,12 @@ name = "rv-host-win"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
- "openh264",
+ "openh264-sys2",
  "opus",
  "rv-crypto",
  "rv-proto",
  "rv-session",
+ "rv-transport",
  "rv-usb-link",
  "serde_json",
  "thiserror 2.0.21",
@@ -2740,18 +2733,10 @@ dependencies = [
  "rv-host-win",
  "serde",
  "serde_json",
+ "sha2",
  "ureq",
  "windows",
  "winreg",
-]
-
-[[package]]
-name = "safe_arch"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42c6efa15875e6ecb39ca61fb0b0c1a40b84fac5a5ffe71eef7d1000c8eb3f5f"
-dependencies = [
- "bytemuck",
 ]
 
 [[package]]
@@ -3827,16 +3812,6 @@ dependencies = [
  "log",
  "thiserror 2.0.21",
  "web-sys",
-]
-
-[[package]]
-name = "wide"
-version = "1.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d920ac99c3c8edce110cb8d07dbb324d6d026011dce85b1e9355b70f0adacc4f"
-dependencies = [
- "bytemuck",
- "safe_arch",
 ]
 
 [[package]]

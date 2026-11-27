@@ -245,6 +245,10 @@ fn all_controls() -> Vec<ControlMessage> {
         ControlMessage::LogChunk { name: "tab-s10.log".into(), seq: 7, last: false, data: vec![1; 1000] },
         ControlMessage::LogChunk { name: String::new(), seq: u32::MAX, last: true, data: vec![] },
         ControlMessage::LogChunk { name: "n".repeat(64), seq: 0, last: true, data: vec![9; 16 * 1024] },
+        ControlMessage::Ping { ts_us: 0 },
+        ControlMessage::Ping { ts_us: 0x0102_0304_0506_0708 },
+        ControlMessage::Pong { ts_us: u64::MAX },
+        ControlMessage::RequestLog,
     ]
 }
 
@@ -254,6 +258,19 @@ fn control_roundtrip() {
         let p = ControlPacket { ctrl_seq: i as u16, message };
         rt(&p, ControlPacket::encode, ControlPacket::decode);
     }
+    // Verify exact op codes and big-endian u64 layout for Ping/Pong/RequestLog.
+    assert_eq!(op_code::PING, 0x0F);
+    assert_eq!(op_code::PONG, 0x10);
+    assert_eq!(op_code::REQUEST_LOG, 0x11);
+    let mut b = Vec::new();
+    ControlMessage::Ping { ts_us: 0x0102_0304_0506_0708 }.encode_payload(&mut b).unwrap();
+    assert_eq!(b, [1, 2, 3, 4, 5, 6, 7, 8]);
+    b.clear();
+    ControlMessage::Pong { ts_us: 0x0102_0304_0506_0708 }.encode_payload(&mut b).unwrap();
+    assert_eq!(b, [1, 2, 3, 4, 5, 6, 7, 8]);
+    b.clear();
+    ControlMessage::RequestLog.encode_payload(&mut b).unwrap();
+    assert!(b.is_empty());
 }
 
 #[test]
@@ -276,6 +293,35 @@ fn control_rejections() {
     assert_eq!(ControlMessage::decode_payload(0xEE, &[]), Err(ProtoError::UnknownOpCode(0xEE)));
     assert!(ControlMessage::decode_payload(op_code::PAUSE_VIDEO, &[2]).is_err());
     assert!(ControlMessage::decode_payload(op_code::REQUEST_IDR, &[0]).is_err());
+    // Ping / Pong / RequestLog truncated & trailing rejections
+    assert!(matches!(
+        ControlMessage::decode_payload(op_code::PING, &[]),
+        Err(ProtoError::Truncated { .. })
+    ));
+    assert!(matches!(
+        ControlMessage::decode_payload(op_code::PING, &[0; 7]),
+        Err(ProtoError::Truncated { .. })
+    ));
+    assert!(matches!(
+        ControlMessage::decode_payload(op_code::PING, &[0; 9]),
+        Err(ProtoError::LengthMismatch { .. })
+    ));
+    assert!(matches!(
+        ControlMessage::decode_payload(op_code::PONG, &[]),
+        Err(ProtoError::Truncated { .. })
+    ));
+    assert!(matches!(
+        ControlMessage::decode_payload(op_code::PONG, &[0; 7]),
+        Err(ProtoError::Truncated { .. })
+    ));
+    assert!(matches!(
+        ControlMessage::decode_payload(op_code::PONG, &[0; 9]),
+        Err(ProtoError::LengthMismatch { .. })
+    ));
+    assert!(matches!(
+        ControlMessage::decode_payload(op_code::REQUEST_LOG, &[0]),
+        Err(ProtoError::LengthMismatch { .. })
+    ));
     assert_eq!(
         ControlMessage::decode_payload(op_code::CLIPBOARD_SYNC, &[0xC0]),
         Err(ProtoError::InvalidUtf8)
@@ -330,7 +376,7 @@ fn fuzz_random_bytes_never_panic() {
         for t in types {
             let _ = Packet::decode(t, &data);
         }
-        for sub in 0..=12u8 {
+        for sub in 0..=0x12u8 {
             let _ = InputEvent::decode_payload(sub, &data);
             let _ = ControlMessage::decode_payload(sub, &data);
         }

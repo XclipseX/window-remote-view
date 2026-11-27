@@ -17,7 +17,8 @@ use jni::{JNIEnv, JavaVM};
 use rv_proto::ControlMessage;
 use rv_session::DatagramIo;
 
-use crate::glue::{state, EventSink, HelloConfig, UiInput};
+use crate::glue::{kbps_to_quality, state, EventSink, HelloConfig, UiInput};
+use crate::lan::{self, DiscoveryHandle, UdpRecvGuard};
 use crate::worker::{self, Command, WorkerHandle};
 
 const BRIDGE_CLASS: &str = "com/remoteview/client/NativeBridge";
@@ -30,9 +31,10 @@ struct JavaCache {
     on_send: JStaticMethodID,
     on_audio: JStaticMethodID,
     on_stats: JStaticMethodID,
-    /// Optional: older `NativeBridge` builds lack the cursor callbacks.
+    /// Optional: older `NativeBridge` builds may lack cursor or discovery callbacks.
     on_cursor_shape: Option<JStaticMethodID>,
     on_cursor_pos: Option<JStaticMethodID>,
+    on_host_discovered: Option<JStaticMethodID>,
 }
 
 static CACHE: OnceLock<JavaCache> = OnceLock::new();
@@ -68,7 +70,20 @@ fn init_cache(vm: JavaVM) -> jni::errors::Result<JavaCache> {
     let on_stats = env.get_static_method_id(&class, "onStatsFromNative", "(FIF)V")?;
     let on_cursor_shape = optional_method(&mut env, &class, "onCursorShapeFromNative", "(IIII[B)V");
     let on_cursor_pos = optional_method(&mut env, &class, "onCursorPosFromNative", "(IIZ)V");
-    Ok(JavaCache { vm, class: global, on_video, on_state, on_send, on_audio, on_stats, on_cursor_shape, on_cursor_pos })
+    let on_host_discovered =
+        optional_method(&mut env, &class, "onHostDiscoveredFromNative", "(Ljava/lang/String;Ljava/lang/String;)V");
+    Ok(JavaCache {
+        vm,
+        class: global,
+        on_video,
+        on_state,
+        on_send,
+        on_audio,
+        on_stats,
+        on_cursor_shape,
+        on_cursor_pos,
+        on_host_discovered,
+    })
 }
 
 /// Resolves a callback that may be missing at runtime: logs and returns `None`
@@ -116,6 +131,20 @@ impl JavaCache {
     ) -> jni::errors::Result<()> {
         unsafe { env.call_static_method_unchecked(cls, id, ReturnType::Primitive(Primitive::Void), args) }?;
         Ok(())
+    }
+
+    fn host_discovered(&self, name: &str, address: &str) {
+        let Some(id) = self.on_host_discovered else { return };
+        self.call("host_discovered", |env, cls| {
+            let jname = env.new_string(name)?;
+            let jaddr = env.new_string(address)?;
+            JavaCache::void(
+                env,
+                cls,
+                id,
+                &[JValue::Object(&jname).as_jni(), JValue::Object(&jaddr).as_jni()],
+            )
+        });
     }
 }
 
@@ -225,16 +254,31 @@ impl EventSink for JniSink {
 
 // --- session registry: Kotlin holds an opaque id, never a raw pointer ---
 
-static SESSIONS: Mutex<Option<HashMap<i64, Arc<WorkerHandle>>>> = Mutex::new(None);
-static NEXT_ID: AtomicI64 = AtomicI64::new(1);
+struct SessionEntry {
+    worker: WorkerHandle,
+    udp_recv: Option<UdpRecvGuard>,
+}
 
-fn lookup(handle: jlong) -> Option<Arc<WorkerHandle>> {
+static SESSIONS: Mutex<Option<HashMap<i64, Arc<SessionEntry>>>> = Mutex::new(None);
+static NEXT_ID: AtomicI64 = AtomicI64::new(1);
+static DISCOVERY: Mutex<Option<DiscoveryHandle>> = Mutex::new(None);
+
+fn register_session(entry: SessionEntry) -> jlong {
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut g) = SESSIONS.lock() {
+        g.get_or_insert_with(HashMap::new).insert(id, Arc::new(entry));
+        return id;
+    }
+    0
+}
+
+fn lookup(handle: jlong) -> Option<Arc<SessionEntry>> {
     SESSIONS.lock().ok()?.as_ref()?.get(&handle).cloned()
 }
 
 fn send_cmd(handle: jlong, c: Command) {
-    if let Some(w) = lookup(handle) {
-        w.send(c);
+    if let Some(s) = lookup(handle) {
+        s.worker.send(c);
     }
 }
 
@@ -244,19 +288,47 @@ fn send_input(handle: jlong, i: UiInput) {
 
 // --- Session ---
 
-/// LAN/server sessions are not implemented in the core yet (USB only).
+/// Connect to a host over LAN UDP (`target` = `"ip:port"`, bare `"ip"` defaulting
+/// to port `47800`, or `"[ipv6]:port"`). `config_json` must parse via [`HelloConfig`]
+/// and include a valid OTP.
 #[no_mangle]
 pub extern "system" fn Java_com_remoteview_client_NativeBridge_nativeConnect<'l>(
-    _env: JNIEnv<'l>,
+    mut env: JNIEnv<'l>,
     _this: JObject<'l>,
-    _target: JString<'l>,
-    _config_json: JString<'l>,
+    target: JString<'l>,
+    config_json: JString<'l>,
 ) -> jlong {
-    log::warn!("nativeConnect: only the USB link (nativeConnectLink) is implemented");
-    if let Some(c) = CACHE.get() {
-        JniSink(c).state(state::FAILED, Some("LAN/server transport not implemented; use USB"));
+    let Some(cache) = CACHE.get() else {
+        return 0;
+    };
+    let target_str: String = match env.get_string(&target) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            let msg = format!("invalid target string: {e}");
+            log::warn!("nativeConnect: {msg}");
+            JniSink(cache).state(state::FAILED, Some(&msg));
+            return 0;
+        }
+    };
+    let json: String = match env.get_string(&config_json) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            let msg = format!("invalid config json: {e}");
+            log::warn!("nativeConnect: {msg}");
+            JniSink(cache).state(state::FAILED, Some(&msg));
+            return 0;
+        }
+    };
+    let result = HelloConfig::parse(&json)
+        .and_then(|cfg| lan::spawn_udp_session(&target_str, cfg, JniSink(cache)));
+    match result {
+        Ok((worker, udp_recv)) => register_session(SessionEntry { worker, udp_recv: Some(udp_recv) }),
+        Err(e) => {
+            log::warn!("nativeConnect: {e}");
+            JniSink(cache).state(state::FAILED, Some(&e));
+            0
+        }
     }
-    0
 }
 
 #[no_mangle]
@@ -274,14 +346,7 @@ pub extern "system" fn Java_com_remoteview_client_NativeBridge_nativeConnectLink
     };
     let result = HelloConfig::parse(&json).and_then(|cfg| worker::spawn(JniIo(cache), JniSink(cache), cfg));
     match result {
-        Ok(w) => {
-            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            if let Ok(mut g) = SESSIONS.lock() {
-                g.get_or_insert_with(HashMap::new).insert(id, Arc::new(w));
-                return id;
-            }
-            0
-        }
+        Ok(worker) => register_session(SessionEntry { worker, udp_recv: None }),
         Err(e) => {
             log::warn!("nativeConnectLink: {e}");
             JniSink(cache).state(state::FAILED, Some(&e));
@@ -296,11 +361,14 @@ pub extern "system" fn Java_com_remoteview_client_NativeBridge_nativeDisconnect<
     _this: JObject<'l>,
     handle: jlong,
 ) {
-    let w = SESSIONS.lock().ok().and_then(|mut g| g.as_mut()?.remove(&handle));
-    if let Some(w) = w {
-        // Last Arc owner joins the worker via Drop; in-flight users finish first.
-        w.send(Command::Shutdown);
-        drop(w);
+    let entry = SESSIONS.lock().ok().and_then(|mut g| g.as_mut()?.remove(&handle));
+    if let Some(entry) = entry {
+        if let Some(ref g) = entry.udp_recv {
+            g.stop();
+        }
+        // Last Arc owner joins the worker (and UDP recv thread) via Drop; in-flight users finish first.
+        entry.worker.send(Command::Shutdown);
+        drop(entry);
     }
 }
 
@@ -333,32 +401,74 @@ pub extern "system" fn Java_com_remoteview_client_NativeBridge_nativeUploadLog<'
     name: JString<'l>,
     data: JByteArray<'l>,
 ) -> jboolean {
-    let Some(w) = lookup(handle) else { return 0 };
+    let Some(s) = lookup(handle) else { return 0 };
     let name: String = match env.get_string(&name) {
         Ok(s) => s.into(),
         Err(_) => return 0,
     };
     let Ok(bytes) = env.convert_byte_array(&data) else { return 0 };
-    jboolean::from(w.send(Command::UploadLog { name, data: bytes }))
+    jboolean::from(s.worker.send(Command::UploadLog { name, data: bytes }))
 }
 
-/// Host currently ignores quality updates (fixed bitrate); not forwarded.
+/// Maps target bitrate in kbps (clamped `>= 500`) to a quality slider level (`1..=100`)
+/// and forwards `ControlMessage::QualitySliderUpdate` to the host.
 #[no_mangle]
 pub extern "system" fn Java_com_remoteview_client_NativeBridge_nativeSetBitrate<'l>(
     _env: JNIEnv<'l>,
     _this: JObject<'l>,
-    _handle: jlong,
-    _kbps: jint,
+    handle: jlong,
+    kbps: jint,
 ) {
+    let quality = kbps_to_quality(kbps);
+    send_cmd(handle, Command::SetStreamQuality { quality, width: 0, height: 0, fps: 0 });
 }
 
+/// Directly sends `ControlMessage::QualitySliderUpdate` (`quality` clamped `1..=100`,
+/// `width`/`height`/`fps` `0` = keep current).
+#[no_mangle]
+pub extern "system" fn Java_com_remoteview_client_NativeBridge_nativeSetStreamQuality<'l>(
+    _env: JNIEnv<'l>,
+    _this: JObject<'l>,
+    handle: jlong,
+    quality: jint,
+    width: jint,
+    height: jint,
+    fps: jint,
+) {
+    send_cmd(
+        handle,
+        Command::SetStreamQuality {
+            quality: quality.clamp(1, 100) as u8,
+            width: width.clamp(0, i32::from(u16::MAX)) as u16,
+            height: height.clamp(0, i32::from(u16::MAX)) as u16,
+            fps: fps.clamp(0, i32::from(u16::MAX)) as u16,
+        },
+    );
+}
+
+/// Sends `ControlMessage::QualitySliderUpdate` updating FPS (`1..=240`) while
+/// preserving the worker's current quality level.
 #[no_mangle]
 pub extern "system" fn Java_com_remoteview_client_NativeBridge_nativeSetMaxFps<'l>(
     _env: JNIEnv<'l>,
     _this: JObject<'l>,
-    _handle: jlong,
-    _fps: jint,
+    handle: jlong,
+    fps: jint,
 ) {
+    send_cmd(handle, Command::SetMaxFps(fps.clamp(1, 240) as u16));
+}
+
+/// Records the latest MediaCodec decode duration in microseconds for `FeedbackStats`.
+#[no_mangle]
+pub extern "system" fn Java_com_remoteview_client_NativeBridge_nativeReportDecodeUs<'l>(
+    _env: JNIEnv<'l>,
+    _this: JObject<'l>,
+    handle: jlong,
+    decode_us: jint,
+) {
+    if let Some(s) = lookup(handle) {
+        s.worker.report_decode_us(decode_us.max(0) as u32);
+    }
 }
 
 // --- Datagram link ---
@@ -375,13 +485,26 @@ pub extern "system" fn Java_com_remoteview_client_NativeBridge_nativePushDatagra
     }
 }
 
-// --- Discovery / network (not needed for USB) ---
+// --- Discovery / network ---
 
 #[no_mangle]
 pub extern "system" fn Java_com_remoteview_client_NativeBridge_nativeStartDiscovery<'l>(
     _env: JNIEnv<'l>,
     _this: JObject<'l>,
 ) {
+    let Some(cache) = CACHE.get() else {
+        return;
+    };
+    let Ok(mut guard) = DISCOVERY.lock() else {
+        return;
+    };
+    if guard.is_some() {
+        return;
+    }
+    match DiscoveryHandle::start(move |name, addr| cache.host_discovered(name, addr)) {
+        Ok(h) => *guard = Some(h),
+        Err(e) => log::warn!("nativeStartDiscovery failed: {e}"),
+    }
 }
 
 #[no_mangle]
@@ -389,6 +512,10 @@ pub extern "system" fn Java_com_remoteview_client_NativeBridge_nativeStopDiscove
     _env: JNIEnv<'l>,
     _this: JObject<'l>,
 ) {
+    let handle = DISCOVERY.lock().ok().and_then(|mut g| g.take());
+    if let Some(mut h) = handle {
+        h.stop();
+    }
 }
 
 #[no_mangle]

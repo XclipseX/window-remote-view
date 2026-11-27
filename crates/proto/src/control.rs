@@ -1,7 +1,7 @@
 //! Control (0x04) inner packet and typed messages.
 
 use crate::error::{ProtoError, Result};
-use crate::wire::{atomic, check_max, put_u16, put_u32, Reader};
+use crate::wire::{atomic, check_max, put_u16, put_u32, put_u64, Reader};
 
 pub const CONTROL_HEADER_LEN: usize = 6;
 /// Largest payload expressible in the u16 `payload_len` field.
@@ -22,6 +22,9 @@ pub mod op_code {
     pub const DEVICE_INFO: u8 = 0x0C;
     pub const CURSOR_POS: u8 = 0x0D;
     pub const LOG_CHUNK: u8 = 0x0E;
+    pub const PING: u8 = 0x0F;
+    pub const PONG: u8 = 0x10;
+    pub const REQUEST_LOG: u8 = 0x11;
 }
 
 /// Codec capability bits for `Hello::codecs`.
@@ -95,6 +98,12 @@ pub enum ControlMessage {
         last: bool,
         data: Vec<u8>,
     },
+    /// Client -> host RTT probe carrying the client's monotonic timestamp in microseconds.
+    Ping { ts_us: u64 },
+    /// Host -> client RTT reply echoing the client's `Ping::ts_us`.
+    Pong { ts_us: u64 },
+    /// Host -> client request to upload diagnostic logs (empty payload).
+    RequestLog,
 }
 
 /// Longest accepted `DeviceInfo` name in bytes.
@@ -130,6 +139,9 @@ impl ControlMessage {
             Self::DeviceInfo { .. } => DEVICE_INFO,
             Self::CursorPos { .. } => CURSOR_POS,
             Self::LogChunk { .. } => LOG_CHUNK,
+            Self::Ping { .. } => PING,
+            Self::Pong { .. } => PONG,
+            Self::RequestLog => REQUEST_LOG,
         }
     }
 
@@ -156,7 +168,7 @@ impl ControlMessage {
                     put_u16(buf, *h);
                     put_u16(buf, *fps);
                 }
-                Self::RequestIdr | Self::Keepalive => {}
+                Self::RequestIdr | Self::Keepalive | Self::RequestLog => {}
                 Self::CursorShape {
                     w,
                     h,
@@ -237,6 +249,7 @@ impl ControlMessage {
                     buf.push(u8::from(*last));
                     buf.extend_from_slice(data);
                 }
+                Self::Ping { ts_us } | Self::Pong { ts_us } => put_u64(buf, *ts_us),
             }
             check_max("control payload", buf.len() - start, MAX_CONTROL_PAYLOAD)
         })
@@ -332,6 +345,9 @@ impl ControlMessage {
                 let rem = r.remaining();
                 Self::LogChunk { name, seq, last, data: r.take(rem)?.to_vec() }
             }
+            PING => Self::Ping { ts_us: r.u64()? },
+            PONG => Self::Pong { ts_us: r.u64()? },
+            REQUEST_LOG => Self::RequestLog,
             other => return Err(ProtoError::UnknownOpCode(other)),
         };
         r.finish()?;
