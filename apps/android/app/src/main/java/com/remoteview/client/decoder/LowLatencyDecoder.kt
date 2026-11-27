@@ -238,24 +238,49 @@ class LowLatencyDecoder(
             val pick = CodecSelector.pick(policy, width, height, fps, failedNames)
             if (pick == null) break // hết ứng viên (phần mềm đã nằm sẵn trong danh sách sắp xếp)
             val tiers = buildTiers(pick.vendor, fps)
+            var startedCodec: MediaCodec? = null
+            var startedTier: Tier? = null
+            var startedIdx = 0
             for ((i, tier) in tiers.withIndex()) {
                 if (i < minTier && i != tiers.lastIndex) continue
                 val c = tryTier(pick, tier, surf)
                 if (c != null) {
-                    codec = c
-                    val di = DecoderInfo(pick.name, pick.mime, pick.vendor, tier.label, i)
-                    info = di
-                    val now = SystemClock.elapsedRealtime()
-                    lastInputMs = now
-                    lastOutputMs = now
-                    synchronized(lock) {
-                        pendingInputs.clear(); frames.clear(); waitingForKey = true
-                    }
-                    Log.i(TAG, "Decoder started: $di")
-                    listener.onDecoderStarted(di)
-                    listener.onKeyFrameNeeded()
-                    return true
+                    startedCodec = c
+                    startedTier = tier
+                    startedIdx = i
+                    break
                 }
+            }
+            // Codec2 HAL trên MediaTek/Exynos đôi khi giải phóng phiên cũ bất đồng bộ khi đổi độ phân giải/reconnect:
+            // đợi 80 ms rồi thử lại bậc PLAIN của chính codec phần cứng trước khi chịu rơi về CPU phần mềm.
+            if (startedCodec == null && pick.hardware) {
+                RvLog.w("decoder: ${pick.name} thất bại lượt đầu, đợi 80ms để HAL giải phóng rồi thử lại PLAIN")
+                try { Thread.sleep(80L) } catch (_: InterruptedException) {}
+                val plainTier = tiers.last()
+                val c = tryTier(pick, plainTier, surf)
+                if (c != null) {
+                    startedCodec = c
+                    startedTier = plainTier
+                    startedIdx = tiers.lastIndex
+                }
+            }
+            if (startedCodec != null && startedTier != null) {
+                codec = startedCodec
+                val di = DecoderInfo(pick.name, pick.mime, pick.vendor, startedTier.label, startedIdx)
+                info = di
+                val now = SystemClock.elapsedRealtime()
+                lastInputMs = now
+                lastOutputMs = now
+                synchronized(lock) {
+                    pendingInputs.clear(); frames.clear(); waitingForKey = true
+                }
+                Log.i(TAG, "Decoder started: $di")
+                if (!pick.hardware && policy.preferHardware) {
+                    RvLog.w("decoder: CẢNH BÁO đã rơi về giải mã phần mềm CPU (${pick.name}) dù ưu tiên phần cứng")
+                }
+                listener.onDecoderStarted(di)
+                listener.onKeyFrameNeeded()
+                return true
             }
             Log.w(TAG, "Tất cả bậc đều thất bại với ${pick.name}; thử codec khác")
             RvLog.w("decoder: tất cả bậc đều thất bại với ${pick.name}, thử codec khác")

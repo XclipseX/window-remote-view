@@ -1374,6 +1374,7 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
     // windows or hooks, so SetThreadDesktop works here (no dedicated injection thread needed).
     let mut input_follow = crate::session_state::DesktopFollower::new("input", Duration::from_millis(50), false);
     let mut last_log_flush = Instant::now();
+    let mut last_activity = Instant::now();
     let mut pending_video: Option<VideoOut> = None;
 
     loop {
@@ -1746,10 +1747,18 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
             }
         }
 
-        // Wait up to 1 ms for the next encoded video frame so video dispatch has ~0 ms latency
-        // instead of stalling on an unrelated receive timeout.
-        if !did_work {
-            match ctx.vrx.recv_timeout(Duration::from_millis(1)) {
+        // Wait for the next encoded video frame (wakes immediately on send):
+        // 1 ms when active for minimal input latency, backing off to 4 ms when the desktop
+        // has been static for > 50 ms so idle CPU wakeups drop 4x.
+        if did_work {
+            last_activity = Instant::now();
+        } else {
+            let wait = if last_activity.elapsed() < Duration::from_millis(50) {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_millis(4)
+            };
+            match ctx.vrx.recv_timeout(wait) {
                 Ok(v) => pending_video = Some(v),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Err("video thread stopped".into()),

@@ -17,7 +17,7 @@ data class StreamSettings(
     val hardwareDecode: Boolean = true,
     val allowAv1: Boolean = false,
     val rawTyping: Boolean = false,
-    val directPresent: Boolean = false,
+    val directPresent: Boolean = true,
     val touchMode: TouchMode = TouchMode.DIRECT,
     /** Phát âm thanh của host (48 kHz stereo). */
     val audioEnabled: Boolean = true,

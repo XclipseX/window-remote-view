@@ -28,7 +28,6 @@ import com.remoteview.client.input.StylusMapper
 import com.remoteview.client.input.TouchGestureMapper
 import com.remoteview.client.input.TouchMode
 import com.remoteview.client.perf.AdpfSession
-import com.remoteview.client.perf.ThermalGovernor
 import com.remoteview.client.render.DisplayLock
 import com.remoteview.client.render.FramePresenter
 import com.remoteview.client.ui.RemoteSurfaceView
@@ -191,7 +190,6 @@ class SessionController(
     private var presenter: FramePresenter? = null
     private var watchdog: StallWatchdog? = null
     @Volatile private var adpf: AdpfSession? = null
-    private var thermal: ThermalGovernor? = null
     private var surface: Surface? = null
     @Volatile private var effectiveFps = baseFps
     @Volatile private var currentQuality = settings.qualityPercent
@@ -380,21 +378,6 @@ class SessionController(
         if (streamConfig != null) startVideo(s) else armConfigFallback()
         if (adpf == null) refreshAdpf()
 
-        thermal = ThermalGovernor(activity, object : ThermalGovernor.Listener {
-            override fun onBitrateScale(scale: Float) {
-                if (NativeBridge.available && nativeHandle != 0L) {
-                    NativeBridge.nativeSetBitrate(nativeHandle, (settings.targetBitrateKbps() * scale).toInt())
-                }
-            }
-
-            override fun onFpsCap(maxFps: Int?) {
-                effectiveFps = minOf(baseFps, maxFps ?: baseFps)
-                surface?.let { DisplayLock.applyFrameRate(it, effectiveFps.toFloat()) }
-                adpf?.updateTarget(effectiveFps)
-                if (NativeBridge.available && nativeHandle != 0L) NativeBridge.nativeSetMaxFps(nativeHandle, effectiveFps)
-            }
-        }).also { it.start() }
-
         if (settings.audioEnabled && audio == null) audio = AudioPlayer().also { it.start() }
     }
 
@@ -425,10 +408,12 @@ class SessionController(
                 }
             },
         )
+        // Không hạ tần số quét nhân tạo khi tĩnh — để SurfaceFlinger và LTPO/PSR phần cứng tự tối ưu.
         val pres = FramePresenter(
             dec,
             if (settings.directPresent) FramePresenter.Mode.DIRECT else FramePresenter.Mode.CHOREOGRAPHER,
-        ) { idle -> surface?.let { DisplayLock.setIdle(it, idle, effectiveFps.toFloat()) } }
+            onIdleChanged = null,
+        )
         dec.onOutput = pres::onOutput
         dec.onDecodeTiming = { decodeUs ->
             val handle = nativeHandle
@@ -587,7 +572,6 @@ class SessionController(
 
     fun onSurfaceDestroyed() {
         mainHandler.removeCallbacks(configFallback)
-        thermal?.stop(); thermal = null
         stopVideo()
         adpf?.close(); adpf = null
         surface = null
