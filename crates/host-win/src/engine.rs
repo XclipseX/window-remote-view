@@ -592,6 +592,18 @@ fn fit_size(nw: u32, nh: u32, rw: u32, rh: u32) -> (u32, u32) {
     (((f64::from(nw) * k).round() as u32).max(2), ((f64::from(nh) * k).round() as u32).max(2))
 }
 
+fn is_gpu_frame(frame: &CapturedFrame) -> bool {
+    #[cfg(windows)]
+    {
+        frame.texture().is_some()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = frame;
+        false
+    }
+}
+
 fn video_thread(
     out_name: String,
     out_rect: crate::Rect,
@@ -603,11 +615,12 @@ fn video_thread(
 ) {
     boost_thread_priority("video");
     let mut cap = Capturer::new(Some(out_name), out_rect);
-    let thread_start = Instant::now();
+    let mut ready_since: Option<Instant> = None;
     let mut sup = HwSupervisor::new();
     let mut first_input: Option<Instant> = None;
     let mut force_sw = false;
     let mut enc: Option<Box<dyn VideoEncoder>> = None;
+    let mut enc_from_gpu = false;
     let mut active: Option<ActiveEnc> = None;
     let mut seen_gen = u32::MAX;
     let mut fail_streak: u32 = 0;
@@ -622,9 +635,11 @@ fn video_thread(
 
     while !sh.stop.load(Ordering::Relaxed) {
         if !sh.ready.load(Ordering::Relaxed) || sh.paused.load(Ordering::Relaxed) {
+            ready_since = None;
             std::thread::sleep(Duration::from_millis(5));
             continue;
         }
+        let rs = *ready_since.get_or_insert_with(Instant::now);
         // Compute target cadence before acquire so wait timeout matches the target FPS.
         let sw_mode = force_sw
             || prefs.encoder == EncoderPref::Sw
@@ -658,7 +673,7 @@ fn video_thread(
                 *g = r;
             }
         }
-        if last_frame.is_none() && (locked || thread_start.elapsed() > Duration::from_millis(1500)) {
+        if last_frame.is_none() && (locked || rs.elapsed() > Duration::from_millis(1500)) {
             // Nothing captured yet (locked at start, or capture failing): send black so the client does not time out.
             let (w, h) = ((r.width().max(2) as u32) & !1, (r.height().max(2) as u32) & !1);
             last_frame = Some(CapturedFrame::from_bgra(w, h, vec![0u8; (w * h * 4) as usize]));
@@ -681,7 +696,7 @@ fn video_thread(
             continue;
         }
 
-        // (Re)configure the encoder when settings or the capture size changed.
+        // (Re)configure the encoder when settings, capture size, or GPU-texture availability changed.
         let gen = sh.cfg_gen.load(Ordering::SeqCst);
         let (nw, nh) = (frame.width, frame.height);
         let rw = sh.width.load(Ordering::Relaxed);
@@ -710,8 +725,13 @@ fn video_thread(
         };
         let codec_mismatch = eff_codec == CodecPref::H264
             && enc.as_ref().is_some_and(|e| e.codec() == rv_proto::codec_flags::CODEC_H265);
+        let gpu_frame = is_gpu_frame(frame);
+        let gpu_upgraded = enc.is_some() && gpu_frame && !enc_from_gpu && !sw_mode && prefs.encoder != EncoderPref::Sw;
+        if gpu_upgraded {
+            info!("video: DXGI GPU frame arrived; upgrading encoder from CPU init to GPU zero-copy");
+        }
         let geometry_changed =
-            codec_mismatch || active.is_none_or(|a| (a.width, a.height, a.fps) != (tw, th, fps));
+            codec_mismatch || gpu_upgraded || active.is_none_or(|a| (a.width, a.height, a.fps) != (tw, th, fps));
         if enc.is_none() || geometry_changed || gen != seen_gen {
             seen_gen = gen;
             let mut applied_live = false;
@@ -743,6 +763,7 @@ fn video_thread(
                         };
                         info!("encoder active: {} {}x{}@{} {} kbps", a.kind.name(), tw, th, fps, a.bitrate_bps / 1000);
                         sh.codec_flag.store(e.codec() as u32, Ordering::SeqCst);
+                        enc_from_gpu = gpu_frame;
                         active = Some(a);
                         enc = Some(e);
                         empty_since = None;
