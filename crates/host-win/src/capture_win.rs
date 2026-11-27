@@ -340,7 +340,10 @@ impl DesktopDuplicator {
             if self.copy.is_none() || self.size != (desc.Width, desc.Height) {
                 let mut d = desc;
                 d.Usage = D3D11_USAGE_DEFAULT;
-                d.BindFlags = D3D11_BIND_SHADER_RESOURCE.0 as u32;
+                // RENDER_TARGET | SHADER_RESOURCE: accepted as a VideoProcessor input by all
+                // drivers we know of (SHADER_RESOURCE alone is driver-dependent); CPU readback
+                // goes through the staging copy, unaffected.
+                d.BindFlags = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
                 d.CPUAccessFlags = 0;
                 d.MiscFlags = 0;
                 let mut t = None;

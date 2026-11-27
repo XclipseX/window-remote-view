@@ -20,7 +20,7 @@ use crate::control::{self, Command, DeviceItem, Level, State, Stats};
 use crate::cursor::{CursorTracker, CursorUpdate};
 use crate::logfile::{LogAssembler, WarnGate};
 use crate::encode::{
-    cap_software, create_encoder, is_blocked, on_hw_failure, CodecPref, EncoderConfig, EncoderKind, EncoderPref, HwFailAction,
+    cap_software, create_encoder, hw_exhausted, on_hw_failure, CodecPref, EncoderConfig, EncoderKind, EncoderPref, HwFailAction,
     HwSupervisor, VideoEncoder,
 };
 use crate::input::{InputInjector, WinInjector};
@@ -320,6 +320,8 @@ struct Shared {
     ready: AtomicBool,
     idr: AtomicBool,
     paused: AtomicBool,
+    /// Make the cursor thread forget its state: shape + position are re-sent (new session, IDR request).
+    cursor_reset: AtomicBool,
     stop: AtomicBool,
     usb_present: AtomicBool,
     quality: AtomicU32,
@@ -388,11 +390,14 @@ struct VideoPrefs {
 
 /// A hardware encoder was declared broken: retry it once without D3D, else
 /// switch to OpenH264 for the rest of the process.
-fn hw_gave_up(kind: EncoderKind, uses_d3d: bool, reason: &str) {
+fn hw_gave_up(kind: EncoderKind, uses_d3d: bool, hevc_ok: bool, reason: &str) {
     warn!("video: hardware encoder {} failed ({reason})", kind.name());
-    match on_hw_failure(uses_d3d) {
+    match on_hw_failure(kind, uses_d3d, hevc_ok) {
         HwFailAction::RetryWithoutD3d => {
-            info!("video: retrying the hardware encoder in system-memory mode (no D3D11 manager)")
+            info!("video: {} will be retried in system-memory mode (no D3D11 manager) after the other encoder's D3D path", kind.name())
+        }
+        HwFailAction::NextEncoder => {
+            info!("video: {} blocked; trying the next hardware encoder", kind.name())
         }
         HwFailAction::UseSoftware => {
             warn!("video: falling back to OpenH264 (software H.264) for the rest of the session")
@@ -472,7 +477,7 @@ fn video_thread(
         // Software path (forced, or every hardware encoder blocked): <=1920x1080, <=60 fps.
         let sw_mode = force_sw
             || prefs.encoder == EncoderPref::Sw
-            || (is_blocked(EncoderKind::MfHevcHw) && is_blocked(EncoderKind::MfH264Hw));
+            || hw_exhausted(sh.client_hevc.load(Ordering::Relaxed) && prefs.codec != CodecPref::H264);
         let fps = sh.fps.load(Ordering::Relaxed).max(1);
         let fps = if sw_mode { fps.min(crate::encode::SW_MAX_FPS) } else { fps };
         let min_interval = Duration::from_micros(1_000_000 / fps as u64);
@@ -561,7 +566,8 @@ fn video_thread(
         let r = e.encode(frame, force);
         let dt = t0.elapsed();
         dirty = false;
-        last_encode = Instant::now();
+        // Pace from the start of the frame so the encode time is not added as an idle penalty.
+        last_encode = t0;
         match r {
             Ok(data) if !data.is_empty() => {
                 sup.on_output();
@@ -586,8 +592,8 @@ fn video_thread(
                 if k != EncoderKind::OpenH264 {
                     // Hardware MFT silent for >1 s after its first input: give up on it.
                     if let Some(reason) = sup.on_empty(fi.elapsed()) {
-                        hw_gave_up(k, d3d, reason);
-                        force_sw = is_blocked(EncoderKind::MfHevcHw) && is_blocked(EncoderKind::MfH264Hw);
+                        hw_gave_up(k, d3d, sh.client_hevc.load(Ordering::Relaxed) && prefs.codec != CodecPref::H264, reason);
+                        force_sw = hw_exhausted(sh.client_hevc.load(Ordering::Relaxed) && prefs.codec != CodecPref::H264);
                         sh.idr.store(true, Ordering::Relaxed);
                         empty_since = None;
                         enc = None;
@@ -613,8 +619,8 @@ fn video_thread(
                     let first = sup.on_error();
                     let reason = first.or(if fail_streak >= 3 { Some("3 consecutive errors") } else { None });
                     if let Some(reason) = reason {
-                        hw_gave_up(k, e.uses_d3d(), reason);
-                        force_sw = is_blocked(EncoderKind::MfHevcHw) && is_blocked(EncoderKind::MfH264Hw);
+                        hw_gave_up(k, e.uses_d3d(), sh.client_hevc.load(Ordering::Relaxed) && prefs.codec != CodecPref::H264, reason);
+                        force_sw = hw_exhausted(sh.client_hevc.load(Ordering::Relaxed) && prefs.codec != CodecPref::H264);
                         fail_streak = 0;
                     }
                 }
@@ -655,7 +661,8 @@ fn audio_thread(start: Instant, sh: Arc<Shared>, tx: SyncSender<AudioOut>) {
         if let Err(e) = cap.poll(&mut pcm) {
             return warn!("audio: capture error: {e}");
         }
-        if pcm.is_empty() || !sh.ready.load(Ordering::Relaxed) {
+        // Drained above; drop it while no client is ready or the client paused (backgrounded).
+        if pcm.is_empty() || !sh.ready.load(Ordering::Relaxed) || sh.paused.load(Ordering::Relaxed) {
             continue;
         }
         match enc.push(&pcm) {
@@ -705,14 +712,33 @@ fn session_monitor_thread(sh: Arc<Shared>) {
 /// Polls the mouse cursor and forwards shape / position changes.
 fn cursor_thread(sh: Arc<Shared>, tx: Sender<CursorUpdate>) {
     let mut tracker = CursorTracker::new();
+    let mut last_rect = crate::Rect::default();
+    let mut scale = 1.0f64;
     while !sh.stop.load(Ordering::Relaxed) {
         if !sh.ready.load(Ordering::Relaxed) {
             tracker.reset(); // the next client gets shape + position again
             std::thread::sleep(Duration::from_millis(50));
             continue;
         }
+        if sh.paused.load(Ordering::Relaxed) {
+            // Video is paused (client in background): nothing to draw the cursor on.
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        if sh.cursor_reset.swap(false, Ordering::Relaxed) {
+            tracker.reset();
+        }
         let rect = sh.cap_rect.lock().map(|g| *g).unwrap_or_default();
-        for u in crate::cursor::poll(&mut tracker, rect, Instant::now()) {
+        if rect != last_rect {
+            last_rect = rect;
+            let ns = crate::cursor::monitor_dpi_scale(rect);
+            if (ns - scale).abs() > 1e-6 {
+                info!("cursor: DPI scale vs system DPI {scale:.2} -> {ns:.2}");
+                scale = ns;
+                tracker.reset(); // re-render the shape at the new scale
+            }
+        }
+        for u in crate::cursor::poll(&mut tracker, rect, scale, Instant::now()) {
             if tx.send(u).is_err() {
                 return;
             }
@@ -956,7 +982,10 @@ impl Ctx {
                 sh.bump();
                 info!("resolution -> {width}x{height}");
             }
-            Command::RequestIdr => sh.idr.store(true, Ordering::Relaxed),
+            Command::RequestIdr => {
+                sh.idr.store(true, Ordering::Relaxed);
+                sh.cursor_reset.store(true, Ordering::Relaxed);
+            }
             Command::NewOtp => {
                 self.otp = control::random_otp();
                 self.emit_status();
@@ -1224,6 +1253,7 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                     ctx.set_status(State::Connected, link, Some(peer), "Đã kết nối, đang chuẩn bị truyền hình ảnh");
                     ctx.send_stream_config(&mut session);
                     ctx.sh.idr.store(true, Ordering::Relaxed);
+                    ctx.sh.cursor_reset.store(true, Ordering::Relaxed);
                     ctx.sh.ready.store(true, Ordering::Relaxed);
                 }
                 HostSessionEvent::Disconnected => {
@@ -1248,6 +1278,12 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                             warn!("input: bỏ qua thao tác vì màn hình đang khóa");
                         }
                     } else if let Some(inj) = ctx.injector.as_mut() {
+                        // The captured output's rect follows mode changes: map onto the live one.
+                        if let Ok(r) = ctx.sh.cap_rect.lock() {
+                            if r.width() > 0 && r.height() > 0 {
+                                inj.set_display(*r);
+                            }
+                        }
                         match inj.inject(&event) {
                             Ok(()) => {
                                 if let Some(n) = input_gate.recovered() {
@@ -1262,11 +1298,15 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                         }
                     }
                 }
-                HostSessionEvent::Control(ControlMessage::RequestIdr) => ctx.sh.idr.store(true, Ordering::Relaxed),
+                HostSessionEvent::Control(ControlMessage::RequestIdr) => {
+                    ctx.sh.idr.store(true, Ordering::Relaxed);
+                    ctx.sh.cursor_reset.store(true, Ordering::Relaxed);
+                }
                 HostSessionEvent::Control(ControlMessage::PauseVideo(p)) => {
                     ctx.sh.paused.store(p, Ordering::Relaxed);
                     if !p {
                         ctx.sh.idr.store(true, Ordering::Relaxed);
+                        ctx.sh.cursor_reset.store(true, Ordering::Relaxed);
                     }
                 }
                 HostSessionEvent::Control(ControlMessage::QualitySliderUpdate { quality, width, height, fps }) => {
@@ -1432,6 +1472,7 @@ fn run(argv: Vec<String>) -> Result<(), String> {
         ready: AtomicBool::new(false),
         idr: AtomicBool::new(true),
         paused: AtomicBool::new(false),
+        cursor_reset: AtomicBool::new(true),
         stop: AtomicBool::new(false),
         usb_present: AtomicBool::new(false),
         quality: AtomicU32::new(a.quality as u32),

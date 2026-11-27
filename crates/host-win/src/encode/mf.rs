@@ -136,7 +136,6 @@ fn pack(hi: u32, lo: u32) -> u64 {
 
 struct D3dPath {
     device: ID3D11Device,
-    #[allow(dead_code)]
     ctx: ID3D11DeviceContext,
     vdev: ID3D11VideoDevice,
     vctx: ID3D11VideoContext,
@@ -181,8 +180,11 @@ impl D3dPath {
             vctx.VideoProcessorSetStreamFrameFormat(&vp, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
 
             let mut pool = Vec::with_capacity(POOL);
+            // RENDER_TARGET is required for the VP output view; VIDEO_ENCODER lets the MFT read the
+            // texture directly on some drivers. Fall back to RENDER_TARGET only if refused.
+            let mut with_enc = true;
             for _ in 0..POOL {
-                let td = D3D11_TEXTURE2D_DESC {
+                let mut td = D3D11_TEXTURE2D_DESC {
                     Width: out_size.0,
                     Height: out_size.1,
                     MipLevels: 1,
@@ -190,12 +192,22 @@ impl D3dPath {
                     Format: DXGI_FORMAT_NV12,
                     SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                     Usage: D3D11_USAGE_DEFAULT,
-                    BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                    BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_VIDEO_ENCODER.0) as u32,
                     CPUAccessFlags: 0,
                     MiscFlags: 0,
                 };
                 let mut tex = None;
-                device.CreateTexture2D(&td, None, Some(&mut tex)).map_err(|e| err("NV12 CreateTexture2D", e))?;
+                if with_enc {
+                    if let Err(e) = device.CreateTexture2D(&td, None, Some(&mut tex)) {
+                        log(crate::control::Level::Warn, &format!("mf: NV12 texture with VIDEO_ENCODER bind failed ({e}); using RENDER_TARGET only"));
+                        with_enc = false;
+                        tex = None;
+                    }
+                }
+                if !with_enc {
+                    td.BindFlags = D3D11_BIND_RENDER_TARGET.0 as u32;
+                    device.CreateTexture2D(&td, None, Some(&mut tex)).map_err(|e| err("NV12 CreateTexture2D", e))?;
+                }
                 let tex = tex.ok_or_else(|| HostError::Encoder("NV12 texture null".into()))?;
                 let vd = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
                     ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
@@ -263,6 +275,8 @@ impl D3dPath {
             let r = self.vctx.VideoProcessorBlt(&self.vp, out_view, 0, &[stream.clone()]);
             drop(ManuallyDrop::into_inner(stream.pInputSurface));
             r.map_err(|e| err("VideoProcessorBlt", e))?;
+            // Submit the blit before the (async, possibly other-queue) MFT reads the texture.
+            self.ctx.Flush();
             Ok(tex.clone())
         }
     }
@@ -398,26 +412,42 @@ impl MfEncoder {
                     if let Ok(mt) = dev.cast::<ID3D11Multithread>() {
                         let _ = mt.SetMultithreadProtected(true);
                     }
+                    // Build and VALIDATE the video-processor path (input view on the captured texture,
+                    // NV12 output views, one real blit) BEFORE the MFT is touched or started: a
+                    // failure here fails this init (the caller then tries the next encoder / system
+                    // memory) instead of switching the D3D manager mid-stream.
+                    let mut path = match D3dPath::new(&dev, (sample.width, sample.height), (cfg.width, cfg.height), cfg.fps) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log(crate::control::Level::Warn, &format!("mf: {friendly}: D3D video processor setup failed: {e}"));
+                            return Err(e);
+                        }
+                    };
+                    if let Err(e) = path.convert(tex) {
+                        log(crate::control::Level::Warn, &format!("mf: {friendly}: D3D video processor validation failed: {e}"));
+                        return Err(e);
+                    }
                     let mut token = 0u32;
                     let mut m = None;
-                    if MFCreateDXGIDeviceManager(&mut token, &mut m).is_ok() {
-                        if let Some(m) = m {
-                            if m.ResetDevice(&dev, token).is_ok()
-                                && transform
-                                    .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, m.as_raw() as usize)
-                                    .is_ok()
-                            {
-                                match D3dPath::new(&dev, (sample.width, sample.height), (cfg.width, cfg.height), cfg.fps) {
-                                    Ok(p) => {
-                                        d3d = Some(p);
+                    match MFCreateDXGIDeviceManager(&mut token, &mut m) {
+                        Ok(()) => {
+                            if let Some(m) = m {
+                                let r = m.ResetDevice(&dev, token).and_then(|()| {
+                                    transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, m.as_raw() as usize)
+                                });
+                                match r {
+                                    Ok(()) => {
+                                        d3d = Some(path);
                                         mgr = Some(m);
                                     }
-                                    Err(_) => {
+                                    Err(e) => {
+                                        log(crate::control::Level::Warn, &format!("mf: {friendly}: SET_D3D_MANAGER failed: {e}; using system memory"));
                                         let _ = transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
                                     }
                                 }
                             }
                         }
+                        Err(e) => log(crate::control::Level::Warn, &format!("mf: {friendly}: MFCreateDXGIDeviceManager failed: {e}; using system memory")),
                     }
                     device = Some(dev);
                 }
@@ -602,30 +632,32 @@ impl MfEncoder {
             let mut done = None;
             if let (Some(d3d), Some(tex)) = (self.d3d.as_mut(), frame.texture()) {
                 if d3d.in_size != (frame.width, frame.height) {
+                    // Input size changed: rebuild the VP. Failure is an encoder error (the
+                    // supervisor picks the next encoder); the D3D manager is never switched mid-stream.
                     match D3dPath::new(&d3d.device, (frame.width, frame.height), d3d.out_size, self.cfg.fps) {
                         Ok(n) => *d3d = n,
-                        Err(_) => {}
+                        Err(e) => {
+                            log(crate::control::Level::Warn, &format!("mf: {}: D3D VP rebuild after size change failed: {e}", self.friendly));
+                            return Err(e);
+                        }
                     }
                 }
-                if d3d.in_size == (frame.width, frame.height) {
-                    match d3d.convert(tex) {
-                        Ok(nv12) => {
-                            let b = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, &nv12, 0, false)
-                                .map_err(|e| err("MFCreateDXGISurfaceBuffer", e))?;
-                            if let Ok(b2) = b.cast::<IMF2DBuffer>() {
-                                if let Ok(n) = b2.GetContiguousLength() {
-                                    let _ = b.SetCurrentLength(n);
-                                }
+                match d3d.convert(tex) {
+                    Ok(nv12) => {
+                        let b = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, &nv12, 0, false)
+                            .map_err(|e| err("MFCreateDXGISurfaceBuffer", e))?;
+                        if let Ok(b2) = b.cast::<IMF2DBuffer>() {
+                            if let Ok(n) = b2.GetContiguousLength() {
+                                let _ = b.SetCurrentLength(n);
                             }
-                            let s = MFCreateSample().map_err(|e| err("MFCreateSample", e))?;
-                            s.AddBuffer(&b).map_err(|e| err("AddBuffer", e))?;
-                            done = Some(s);
                         }
-                        Err(_) => {
-                            // Permanently fall back to CPU conversion.
-                            self.d3d = None;
-                            let _ = self.transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
-                        }
+                        let s = MFCreateSample().map_err(|e| err("MFCreateSample", e))?;
+                        s.AddBuffer(&b).map_err(|e| err("AddBuffer", e))?;
+                        done = Some(s);
+                    }
+                    Err(e) => {
+                        log(crate::control::Level::Warn, &format!("mf: {}: D3D convert failed: {e}", self.friendly));
+                        return Err(e);
                     }
                 }
             }

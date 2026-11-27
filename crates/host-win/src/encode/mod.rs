@@ -148,38 +148,53 @@ impl HwSupervisor {
     }
 }
 
-/// When set, MF hardware encoders are built without the D3D11 device manager
-/// (system-memory NV12 input): second hardware attempt for MFTs whose D3D path
-/// never asks for input (seen on AMD).
-static NO_D3D: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// MF kinds that must be built without the D3D11 device manager (system-memory
+/// NV12 input). Per kind, so a D3D failure of one codec does not take the other
+/// codec's (possibly working) D3D path away.
+static NO_D3D: std::sync::Mutex<Vec<EncoderKind>> = std::sync::Mutex::new(Vec::new());
 
-pub fn set_no_d3d(v: bool) {
-    NO_D3D.store(v, std::sync::atomic::Ordering::SeqCst);
+pub fn set_no_d3d(kind: EncoderKind, v: bool) {
+    if let Ok(mut b) = NO_D3D.lock() {
+        b.retain(|k| *k != kind);
+        if v {
+            b.push(kind);
+        }
+    }
 }
 
-pub fn no_d3d() -> bool {
-    NO_D3D.load(std::sync::atomic::Ordering::SeqCst)
+pub fn no_d3d(kind: EncoderKind) -> bool {
+    NO_D3D.lock().map(|b| b.contains(&kind)).unwrap_or(false)
 }
 
 /// What to do after a hardware encoder was declared broken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HwFailAction {
-    /// Rebuild the hardware encoder in system-memory mode.
+    /// This kind is rebuilt in system-memory mode (after the other kind's D3D path was tried).
     RetryWithoutD3d,
+    /// This kind is blocked; another hardware kind is still available.
+    NextEncoder,
     /// Stop using hardware encoders (OpenH264 for the rest of the process).
     UseSoftware,
 }
 
-/// Applies the policy: D3D failure -> retry without D3D once; anything else ->
-/// block all MF encoders so `create_encoder` yields OpenH264.
-pub fn on_hw_failure(uses_d3d: bool) -> HwFailAction {
-    if uses_d3d && !no_d3d() {
-        set_no_d3d(true);
-        HwFailAction::RetryWithoutD3d
-    } else {
-        block_encoder(EncoderKind::MfHevcHw);
-        block_encoder(EncoderKind::MfH264Hw);
+/// True when no MF hardware kind usable for this client is left.
+pub fn hw_exhausted(hevc_ok: bool) -> bool {
+    is_blocked(EncoderKind::MfH264Hw) && (!hevc_ok || is_blocked(EncoderKind::MfHevcHw))
+}
+
+/// Applies the per-encoder policy. The resulting order (see `create_encoder`) is
+/// HEVC D3D -> H.264 D3D -> HEVC sysmem -> H.264 sysmem -> OpenH264. `hevc_ok`
+/// is false when the client cannot decode HEVC (HEVC is then never a candidate).
+pub fn on_hw_failure(kind: EncoderKind, uses_d3d: bool, hevc_ok: bool) -> HwFailAction {
+    if uses_d3d && !no_d3d(kind) {
+        set_no_d3d(kind, true);
+        return HwFailAction::RetryWithoutD3d;
+    }
+    block_encoder(kind);
+    if hw_exhausted(hevc_ok) {
         HwFailAction::UseSoftware
+    } else {
+        HwFailAction::NextEncoder
     }
 }
 
@@ -223,18 +238,32 @@ pub fn create_encoder(
             {
                 kinds.push(EncoderKind::MfH264Hw);
             }
-            for k in kinds {
-                if is_blocked(k) {
-                    log(&format!("encoder {} skipped (failed earlier)", k.name()));
-                    continue;
-                }
-                let c = EncoderConfig { bitrate_bps: bitrate_for(k.slider_codec()), ..cfg };
-                match mf::MfEncoder::new(k, c, sample, !no_d3d()) {
-                    Ok(e) => {
-                        log(&format!("encoder: {} ({})", k.name(), e.describe()));
-                        return Ok(Box::new(e));
+            // Pass 1: every kind with its D3D path; pass 2: kinds demoted to system memory.
+            for sysmem_pass in [false, true] {
+                for &k in &kinds {
+                    if no_d3d(k) != sysmem_pass {
+                        continue;
                     }
-                    Err(e) => log(&format!("encoder {} unavailable: {e}", k.name())),
+                    if is_blocked(k) {
+                        if !sysmem_pass {
+                            log(&format!("encoder {} skipped (failed earlier)", k.name()));
+                        }
+                        continue;
+                    }
+                    let c = EncoderConfig { bitrate_bps: bitrate_for(k.slider_codec()), ..cfg };
+                    match mf::MfEncoder::new(k, c, sample, !sysmem_pass) {
+                        Ok(e) => {
+                            log(&format!("encoder: {} ({})", k.name(), e.describe()));
+                            return Ok(Box::new(e));
+                        }
+                        Err(e) => {
+                            log(&format!("encoder {} unavailable: {e}", k.name()));
+                            if !sysmem_pass && sample.texture().is_some() {
+                                // D3D init failed: try this kind again in system-memory mode after the others.
+                                set_no_d3d(k, true);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -315,6 +344,37 @@ pub fn has_sps(annexb: &[u8], hevc: bool) -> bool {
 pub fn bgra_to_i420(bgra: &[u8], w: usize, h: usize, y: &mut [u8], u: &mut [u8], v: &mut [u8]) {
     debug_assert!(w % 2 == 0 && h % 2 == 0);
     debug_assert_eq!(bgra.len(), w * h * 4);
+    // Split into bands of whole chroma rows; each band is independent (same results as serial).
+    let threads = if w * h >= 640 * 360 { std::thread::available_parallelism().map_or(1, |n| n.get()).min(4) } else { 1 };
+    let cw = w / 2;
+    let chroma_rows = h / 2;
+    if threads <= 1 || chroma_rows < threads {
+        i420_band(bgra, w, h, y, u, v);
+        return;
+    }
+    let per = chroma_rows.div_ceil(threads);
+    std::thread::scope(|sc| {
+        let (mut by, mut bu, mut bv, mut bb) = (y, u, v, bgra);
+        let mut left = chroma_rows;
+        while left > 0 {
+            let rows = per.min(left);
+            left -= rows;
+            let (y1, yr) = by.split_at_mut(rows * 2 * w);
+            let (u1, ur) = bu.split_at_mut(rows * cw);
+            let (v1, vr) = bv.split_at_mut(rows * cw);
+            let (b1, br) = bb.split_at(rows * 2 * w * 4);
+            (by, bu, bv, bb) = (yr, ur, vr, br);
+            if left == 0 {
+                i420_band(b1, w, rows * 2, y1, u1, v1);
+            } else {
+                sc.spawn(move || i420_band(b1, w, rows * 2, y1, u1, v1));
+            }
+        }
+    });
+}
+
+/// Serial BGRA -> I420 (BT.709 limited) for `h` (even) rows.
+fn i420_band(bgra: &[u8], w: usize, h: usize, y: &mut [u8], u: &mut [u8], v: &mut [u8]) {
     let cw = w / 2;
     for row in 0..h {
         for col in 0..w {
@@ -386,6 +446,31 @@ pub struct OpenH264Encoder {
     bgra: Vec<u8>,
     scaled: Vec<u8>,
     yuv: I420,
+    /// Rolling load window: (window start, frames, total encode time).
+    load: (std::time::Instant, u32, std::time::Duration),
+    /// Already stepped down to `SW_FALLBACK_W x SW_FALLBACK_H` (never steps back up).
+    downscaled: bool,
+}
+
+/// Software encode steps down to this box (aspect kept) when it cannot keep up.
+pub const SW_FALLBACK_W: u32 = 1280;
+pub const SW_FALLBACK_H: u32 = 800;
+/// How long the average encode time must exceed the frame budget before stepping down.
+pub const SW_LOAD_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Largest even size fitting `SW_FALLBACK_W x SW_FALLBACK_H` with the aspect ratio of `w x h`
+/// (never larger than the input).
+pub fn sw_fallback_size(w: u32, h: u32) -> (u32, u32) {
+    if w == 0 || h == 0 || (w <= SW_FALLBACK_W && h <= SW_FALLBACK_H) {
+        return (w & !1, h & !1);
+    }
+    let k = (SW_FALLBACK_W as f64 / w as f64).min(SW_FALLBACK_H as f64 / h as f64);
+    ((((w as f64 * k) as u32) & !1).max(2), (((h as f64 * k) as u32) & !1).max(2))
+}
+
+/// True when the average encode time over a full window exceeds the frame budget.
+pub fn sw_overloaded(frames: u32, total: std::time::Duration, fps: f32) -> bool {
+    frames > 0 && fps > 0.0 && total.as_secs_f64() * 1000.0 / frames as f64 > 1000.0 / fps as f64
 }
 
 impl OpenH264Encoder {
@@ -407,18 +492,28 @@ impl OpenH264Encoder {
             bgra: Vec::new(),
             scaled: Vec::new(),
             yuv: I420 { w: 0, h: 0, y: vec![], u: vec![], v: vec![] },
+            load: (std::time::Instant::now(), 0, std::time::Duration::ZERO),
+            downscaled: false,
         }
     }
 
     fn rebuild(&mut self, w: usize, h: usize) -> Result<()> {
-        use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, RateControlMode, UsageType};
+        use openh264::encoder::{BitRate, Complexity, Encoder, EncoderConfig, FrameRate, QpRange, RateControlMode, UsageType};
         use openh264::OpenH264API;
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8) as u16;
         let cfg = EncoderConfig::new()
             .bitrate(BitRate::from_bps(self.bitrate_bps))
             .max_frame_rate(FrameRate::from_hz(self.fps))
             .usage_type(UsageType::ScreenContentRealTime)
             .rate_control_mode(RateControlMode::Bitrate)
-            .skip_frames(false);
+            // Real time: let the rate controller drop a frame instead of blowing the budget,
+            // fastest preset, and never go to the blurry QP 40..51 range.
+            .skip_frames(true)
+            .complexity(Complexity::Low)
+            .qp(QpRange::new(0, 40))
+            // The crate always uses a single slice (OpenH264 then runs the encode on one
+            // thread regardless); the thread hint is still passed for builds that slice.
+            .num_threads(threads);
         self.enc = Some(
             Encoder::with_api_config(OpenH264API::from_source(), cfg)
                 .map_err(|e| HostError::Encoder(e.to_string()))?,
@@ -437,6 +532,43 @@ impl OpenH264Encoder {
 
 impl VideoEncoder for OpenH264Encoder {
     fn encode(&mut self, frame: &CapturedFrame, force_idr: bool) -> Result<Vec<u8>> {
+        let t_start = std::time::Instant::now();
+        let r = self.encode_inner(frame, force_idr);
+        self.load.1 += 1;
+        self.load.2 += t_start.elapsed();
+        if self.load.0.elapsed() >= SW_LOAD_WINDOW {
+            let (_, n, tot) = self.load;
+            if !self.downscaled && sw_overloaded(n, tot, self.fps) {
+                let (fw, fh) = if self.target.0 > 0 { self.target } else { (frame.width as usize, frame.height as usize) };
+                let (nw, nh) = sw_fallback_size(fw as u32, fh as u32);
+                if (nw as usize, nh as usize) != (fw, fh) {
+                    crate::control::log(
+                        crate::control::Level::Warn,
+                        &format!(
+                            "openh264: avg encode {:.1} ms > {:.1} ms budget; lowering output {fw}x{fh} -> {nw}x{nh}",
+                            tot.as_secs_f64() * 1000.0 / n as f64,
+                            1000.0 / self.fps as f64
+                        ),
+                    );
+                    self.target = (nw as usize, nh as usize);
+                    self.downscaled = true;
+                }
+            }
+            self.load = (std::time::Instant::now(), 0, std::time::Duration::ZERO);
+        }
+        r
+    }
+
+    fn codec(&self) -> u8 {
+        rv_proto::codec_flags::CODEC_H264
+    }
+    fn kind(&self) -> EncoderKind {
+        EncoderKind::OpenH264
+    }
+}
+
+impl OpenH264Encoder {
+    fn encode_inner(&mut self, frame: &CapturedFrame, force_idr: bool) -> Result<Vec<u8>> {
         let (fw, fh) = (frame.width as usize, frame.height as usize);
         let (w, h) = if self.target.0 > 0 && self.target.1 > 0 {
             (self.target.0 & !1, self.target.1 & !1)
@@ -474,13 +606,6 @@ impl VideoEncoder for OpenH264Encoder {
         }
         let bs = enc.encode(&self.yuv).map_err(|e| HostError::Encoder(e.to_string()))?;
         Ok(bs.to_vec())
-    }
-
-    fn codec(&self) -> u8 {
-        rv_proto::codec_flags::CODEC_H264
-    }
-    fn kind(&self) -> EncoderKind {
-        EncoderKind::OpenH264
     }
 }
 
@@ -577,31 +702,65 @@ mod tests {
     /// once, then replaced by OpenH264 which really produces H.264.
     #[test]
     fn failing_hw_encoder_falls_back_to_openh264() {
+        let _g = POLICY_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let f = CapturedFrame::from_bgra(64, 64, vec![90u8; 64 * 64 * 4]);
-        set_no_d3d(false);
+        clear_policy_state();
         let mut e: Box<dyn VideoEncoder> = Box::new(FailingEncoder);
         let mut sup = HwSupervisor::new();
         assert!(e.encode(&f, true).is_err());
         assert!(sup.on_error().is_some(), "first error before output must give up");
-        assert_eq!(on_hw_failure(e.uses_d3d()), HwFailAction::RetryWithoutD3d);
-        assert!(no_d3d());
+        assert_eq!(on_hw_failure(e.kind(), e.uses_d3d(), true), HwFailAction::RetryWithoutD3d);
+        assert!(no_d3d(EncoderKind::MfH264Hw));
+        assert!(!no_d3d(EncoderKind::MfHevcHw), "other codec keeps its D3D path");
+        assert!(!is_blocked(EncoderKind::MfHevcHw));
         // second attempt (also failing) -> software
         let mut sup = HwSupervisor::new();
         assert!(e.encode(&f, true).is_err());
         assert!(sup.on_error().is_some());
-        assert_eq!(on_hw_failure(true), HwFailAction::UseSoftware);
+        // H.264 blocked now, HEVC still untouched -> next encoder, not software.
+        assert_eq!(on_hw_failure(EncoderKind::MfH264Hw, true, true), HwFailAction::NextEncoder);
+        assert!(is_blocked(EncoderKind::MfH264Hw) && !is_blocked(EncoderKind::MfHevcHw));
+        assert_eq!(on_hw_failure(EncoderKind::MfHevcHw, true, true), HwFailAction::RetryWithoutD3d);
+        assert_eq!(on_hw_failure(EncoderKind::MfHevcHw, false, true), HwFailAction::UseSoftware);
         assert!(is_blocked(EncoderKind::MfH264Hw) && is_blocked(EncoderKind::MfHevcHw));
         let cfg = EncoderConfig { width: 64, height: 64, fps: 30, bitrate_bps: 1_000_000 };
         let mut sw = create_encoder(CodecPref::Auto, EncoderPref::Auto, cfg, &f, &|_| 1_000_000, &mut |_| {}).unwrap();
         assert_eq!(sw.kind(), EncoderKind::OpenH264);
         assert_eq!(sw.codec(), rv_proto::codec_flags::CODEC_H264);
         assert!(sw.encode(&f, true).unwrap().len() > 8);
-        // leave global state clean for other tests
+        clear_policy_state();
+    }
+
+    fn clear_policy_state() {
         if let Ok(mut b) = BLOCKED.lock() {
             b.clear();
         }
-        set_no_d3d(false);
+        if let Ok(mut b) = NO_D3D.lock() {
+            b.clear();
+        }
     }
+
+    /// Fallback order: HEVC D3D -> H.264 D3D -> HEVC sysmem -> H.264 sysmem -> software.
+    /// Policy state is global; tests that touch it serialize on `POLICY_TEST`.
+    #[test]
+    fn fallback_order_hevc_h264_d3d_then_sysmem() {
+        let _g = POLICY_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        clear_policy_state();
+        let (hevc, h264) = (EncoderKind::MfHevcHw, EncoderKind::MfH264Hw);
+        assert_eq!(on_hw_failure(hevc, true, true), HwFailAction::RetryWithoutD3d); // HEVC D3D failed
+        assert!(no_d3d(hevc) && !no_d3d(h264)); // H.264 D3D is next in create_encoder pass 1
+        assert_eq!(on_hw_failure(h264, true, true), HwFailAction::RetryWithoutD3d); // H.264 D3D failed
+        assert_eq!(on_hw_failure(hevc, false, true), HwFailAction::NextEncoder); // HEVC sysmem failed
+        assert_eq!(on_hw_failure(h264, false, true), HwFailAction::UseSoftware); // H.264 sysmem failed
+        // Client without HEVC: only H.264 counts.
+        clear_policy_state();
+        assert_eq!(on_hw_failure(h264, true, false), HwFailAction::RetryWithoutD3d);
+        assert_eq!(on_hw_failure(h264, false, false), HwFailAction::UseSoftware);
+        assert!(hw_exhausted(false) && !hw_exhausted(true));
+        clear_policy_state();
+    }
+
+    static POLICY_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn supervisor_silent_hw_gives_up_after_one_second() {
@@ -620,6 +779,15 @@ mod tests {
         assert_eq!(cap_software(2800, 1752, 120), (1726, 1080, 60));
         assert_eq!(cap_software(1920, 1080, 30), (1920, 1080, 30));
         assert_eq!(cap_software(1280, 721, 60), (1280, 720, 60));
+    }
+
+    #[test]
+    fn sw_fallback_math() {
+        assert_eq!(sw_fallback_size(1920, 1200), (1280, 800));
+        assert_eq!(sw_fallback_size(1920, 1080), (1280, 720));
+        assert_eq!(sw_fallback_size(1024, 768), (1024, 768));
+        assert!(sw_overloaded(60, std::time::Duration::from_millis(60 * 20), 60.0));
+        assert!(!sw_overloaded(60, std::time::Duration::from_millis(60 * 10), 60.0));
     }
 
     #[test]

@@ -61,15 +61,8 @@ pub fn composite_alpha(on_black: &[u8], on_white: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Nearest-neighbour downscale so that neither side exceeds `max`.
-/// Returns `(rgba, new_w, new_h)`; unchanged when already small enough.
-pub fn downscale_rgba(src: &[u8], w: u32, h: u32, max: u32) -> (Vec<u8>, u32, u32) {
-    if w <= max && h <= max || w == 0 || h == 0 {
-        return (src.to_vec(), w, h);
-    }
-    let k = f64::from(max) / f64::from(w.max(h));
-    let nw = ((f64::from(w) * k).round() as u32).max(1);
-    let nh = ((f64::from(h) * k).round() as u32).max(1);
+/// Nearest-neighbour resample of an RGBA image to `nw x nh`.
+pub fn resize_rgba(src: &[u8], w: u32, h: u32, nw: u32, nh: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity((nw * nh * 4) as usize);
     for y in 0..nh {
         let sy = (u64::from(y) * u64::from(h) / u64::from(nh)) as usize;
@@ -79,7 +72,42 @@ pub fn downscale_rgba(src: &[u8], w: u32, h: u32, max: u32) -> (Vec<u8>, u32, u3
             out.extend_from_slice(&src[i..i + 4]);
         }
     }
-    (out, nw, nh)
+    out
+}
+
+/// Nearest-neighbour downscale so that neither side exceeds `max`.
+/// Returns `(rgba, new_w, new_h)`; unchanged when already small enough.
+pub fn downscale_rgba(src: &[u8], w: u32, h: u32, max: u32) -> (Vec<u8>, u32, u32) {
+    if w <= max && h <= max || w == 0 || h == 0 {
+        return (src.to_vec(), w, h);
+    }
+    let k = f64::from(max) / f64::from(w.max(h));
+    let nw = ((f64::from(w) * k).round() as u32).max(1);
+    let nh = ((f64::from(h) * k).round() as u32).max(1);
+    (resize_rgba(src, w, h, nw, nh), nw, nh)
+}
+
+/// Cursor bitmaps come out at the system DPI; the captured pixels are at the
+/// monitor's DPI. Returns the factor to apply (1.0 when unknown or equal;
+/// clamped to 0.5..=4).
+pub fn dpi_scale(monitor_dpi: u32, system_dpi: u32) -> f64 {
+    if monitor_dpi == 0 || system_dpi == 0 || monitor_dpi == system_dpi {
+        return 1.0;
+    }
+    (f64::from(monitor_dpi) / f64::from(system_dpi)).clamp(0.5, 4.0)
+}
+
+/// Scaled `(w, h, hot_x, hot_y)` of a cursor for DPI factor `scale`; the hotspot is
+/// kept inside the new bitmap.
+pub fn scale_shape_dims(w: u32, h: u32, hot_x: u32, hot_y: u32, scale: f64) -> (u32, u32, u32, u32) {
+    if (scale - 1.0).abs() < 1e-3 || w == 0 || h == 0 {
+        return (w, h, hot_x, hot_y);
+    }
+    let nw = ((f64::from(w) * scale).round() as u32).max(1);
+    let nh = ((f64::from(h) * scale).round() as u32).max(1);
+    let nx = ((f64::from(hot_x) * scale).round() as u32).min(nw - 1);
+    let ny = ((f64::from(hot_y) * scale).round() as u32).min(nh - 1);
+    (nw, nh, nx, ny)
 }
 
 /// Decides what to forward given the latest raw pointer state.
@@ -241,11 +269,18 @@ pub fn read_raw() -> Option<RawCursor> {
     None
 }
 
-/// Renders a cursor handle to RGBA, capped to [`MAX_CURSOR_DIM`] (hotspot scaled with it).
-pub fn render_shape(handle: usize) -> Option<CursorUpdate> {
+/// Renders a cursor handle to RGBA, scaled by the DPI factor `scale` (see [`dpi_scale`]) and then
+/// capped to [`MAX_CURSOR_DIM`] (hotspot scaled with it).
+pub fn render_shape(handle: usize, scale: f64) -> Option<CursorUpdate> {
     #[cfg(windows)]
     {
         let (w, h, hx, hy, rgba) = win::render(handle)?;
+        let (w2, h2, hx2, hy2) = scale_shape_dims(w, h, hx, hy, scale);
+        let (rgba, w, h, hx, hy) = if (w2, h2) != (w, h) {
+            (resize_rgba(&rgba, w, h, w2, h2), w2, h2, hx2, hy2)
+        } else {
+            (rgba, w, h, hx, hy)
+        };
         let (rgba, nw, nh) = downscale_rgba(&rgba, w, h, MAX_CURSOR_DIM);
         let sx = |v: u32| (u64::from(v) * u64::from(nw) / u64::from(w)).min(u64::from(nw.saturating_sub(1))) as u16;
         let sy = |v: u32| (u64::from(v) * u64::from(nh) / u64::from(h)).min(u64::from(nh.saturating_sub(1))) as u16;
@@ -253,13 +288,35 @@ pub fn render_shape(handle: usize) -> Option<CursorUpdate> {
     }
     #[cfg(not(windows))]
     {
-        let _ = handle;
+        let _ = (handle, scale);
         None
     }
 }
 
+/// DPI factor for the monitor showing `rect` (the captured output) relative to the system DPI.
+#[cfg(windows)]
+pub fn monitor_dpi_scale(rect: Rect) -> f64 {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{MonitorFromRect, MONITOR_DEFAULTTONEAREST};
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForSystem, MDT_EFFECTIVE_DPI};
+    unsafe {
+        let r = RECT { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
+        let mon = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
+        let (mut dx, mut dy) = (0u32, 0u32);
+        if GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy).is_err() {
+            return 1.0;
+        }
+        dpi_scale(dx, GetDpiForSystem())
+    }
+}
+
+#[cfg(not(windows))]
+pub fn monitor_dpi_scale(_rect: Rect) -> f64 {
+    1.0
+}
+
 /// One poll: what to forward for the cursor over the capture `rect`.
-pub fn poll(tracker: &mut CursorTracker, rect: Rect, now: Instant) -> Vec<CursorUpdate> {
+pub fn poll(tracker: &mut CursorTracker, rect: Rect, dpi_scale: f64, now: Instant) -> Vec<CursorUpdate> {
     let mut out = Vec::new();
     let Some(raw) = read_raw() else {
         // Cursor unreadable (secure desktop, no session): hide it once.
@@ -268,7 +325,7 @@ pub fn poll(tracker: &mut CursorTracker, rect: Rect, now: Instant) -> Vec<Cursor
         return out;
     };
     if raw.showing && tracker.want_shape(raw.handle, now) {
-        if let Some(shape) = render_shape(raw.handle) {
+        if let Some(shape) = render_shape(raw.handle, dpi_scale) {
             out.push(shape);
         } else {
             tracker.last_handle = 0; // retry later
@@ -324,6 +381,20 @@ mod tests {
         assert_eq!((w, h, o.len()), (32, 32, 32 * 32 * 4));
         // payload of a capped cursor always fits one control packet
         const { assert!(8 + 64 * 64 * 4 <= rv_proto::MAX_CONTROL_PAYLOAD) };
+    }
+
+    #[test]
+    fn dpi_scaling_math() {
+        assert_eq!(dpi_scale(96, 96), 1.0);
+        assert_eq!(dpi_scale(0, 96), 1.0);
+        assert!((dpi_scale(144, 96) - 1.5).abs() < 1e-9);
+        assert!((dpi_scale(96, 192) - 0.5).abs() < 1e-9);
+        assert_eq!(dpi_scale(960, 96), 4.0); // clamped
+        assert_eq!(scale_shape_dims(32, 32, 4, 6, 1.0), (32, 32, 4, 6));
+        assert_eq!(scale_shape_dims(32, 32, 4, 6, 1.5), (48, 48, 6, 9));
+        assert_eq!(scale_shape_dims(32, 32, 31, 31, 0.5), (16, 16, 15, 15)); // hotspot stays inside
+        let img = vec![7u8; 4 * 4 * 4];
+        assert_eq!(resize_rgba(&img, 4, 4, 6, 6).len(), 6 * 6 * 4);
     }
 
     #[test]

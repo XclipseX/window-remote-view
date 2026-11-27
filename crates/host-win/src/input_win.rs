@@ -42,6 +42,11 @@ impl WinInjector {
         }
     }
 
+    /// Follows the live desktop rect of the captured output (resolution / position changes).
+    pub fn set_display(&mut self, display: Rect) {
+        self.display = display;
+    }
+
     fn map(&self, x: u16, y: u16) -> (i32, i32) {
         (
             norm_to_px(x, self.display.left, self.display.width()),
