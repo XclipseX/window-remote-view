@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -12,6 +12,14 @@ use crate::{LinkError, Result};
 
 /// Size of the bulk read buffer (large so a whole record can arrive in one transfer).
 const READ_BUF: usize = 64 * 1024;
+
+/// Writer thread coalesces queued records into one bulk write up to roughly
+/// this many bytes (the stream is length-framed, so the receiver does not care
+/// where transfer boundaries fall).
+const WRITE_BATCH: usize = 256 * 1024;
+/// Max records queued for the writer thread; a full queue blocks `send`
+/// (back-pressure, same as the old synchronous write).
+const WRITE_QUEUE: usize = 1024;
 
 /// Live counters of a [`UsbDatagramLink`], shared so a monitor thread can
 /// read them while the link is owned by a session (black-screen debugging).
@@ -52,17 +60,19 @@ impl LinkStats {
 /// Datagram link over any reliable byte stream (USB bulk pipe or TCP).
 ///
 /// A background thread reads the stream, decodes records and queues them;
-/// `send` frames and writes synchronously. Implements [`DatagramIo`] so
+/// `send` frames the record and queues it for a writer thread, which coalesces
+/// whatever is pending into few large bulk writes (a video frame is ~100+
+/// small datagrams; one blocking USB transfer each is far too slow). Implements [`DatagramIo`] so
 /// `rv_session::HostSession<UsbDatagramLink>` works unchanged. Because the
 /// underlying stream is reliable and ordered, FEC parity is wasted airtime
 /// here; that tuning is left to the session layer (`set_loss(0.0)`).
 pub struct UsbDatagramLink {
-    writer: Box<dyn Write + Send>,
+    wtx: SyncSender<Vec<u8>>,
     rx: Receiver<Vec<u8>>,
-    scratch: Vec<u8>,
-    write_error: Option<std::io::Error>,
+    broken: Arc<AtomicBool>,
     stats: Arc<LinkStats>,
     _reader: JoinHandle<()>,
+    _writer: JoinHandle<()>,
 }
 
 impl UsbDatagramLink {
@@ -74,6 +84,7 @@ impl UsbDatagramLink {
         R: Read + Send + 'static,
         W: Write + Send + 'static,
     {
+        let mut writer = writer;
         let (tx, rx) = mpsc::channel();
         let stats = Arc::new(LinkStats::default());
         let st = stats.clone();
@@ -126,13 +137,45 @@ impl UsbDatagramLink {
                 }
             })
             .expect("spawn reader thread");
+        let (wtx, wrx) = mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE);
+        let broken = Arc::new(AtomicBool::new(false));
+        let (st, br) = (stats.clone(), broken.clone());
+        let whandle = std::thread::Builder::new()
+            .name("rv-usb-write".into())
+            .spawn(move || {
+                let mut batch: Vec<u8> = Vec::with_capacity(WRITE_BATCH + crate::framing::MAX_RECORD + 4);
+                while let Ok(first) = wrx.recv() {
+                    batch.clear();
+                    batch.extend_from_slice(&first);
+                    let mut recs = 1u64;
+                    // Stop early enough that one more record still fits the cap.
+                    while batch.len() + crate::framing::MAX_RECORD + 4 <= WRITE_BATCH {
+                        match wrx.try_recv() {
+                            Ok(r) => {
+                                batch.extend_from_slice(&r);
+                                recs += 1;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if let Err(e) = writer.write_all(&batch).and_then(|_| writer.flush()) {
+                        st.write_errors.fetch_add(1, Ordering::Relaxed);
+                        st.set_err(format!("write: {e}"));
+                        br.store(true, Ordering::Release);
+                        return; // dropping wrx makes later sends fail
+                    }
+                    st.dg_out.fetch_add(recs, Ordering::Relaxed);
+                    st.raw_out_bytes.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                }
+            })
+            .expect("spawn writer thread");
         Self {
-            writer: Box::new(writer),
+            wtx,
             rx,
-            scratch: Vec::new(),
-            write_error: None,
+            broken,
             stats,
             _reader: handle,
+            _writer: whandle,
         }
     }
 
@@ -159,27 +202,20 @@ impl UsbDatagramLink {
         l
     }
 
-    /// Blocking send with error reporting (`DatagramIo::send` swallows errors).
+    /// Queues one datagram for the writer thread (blocks only when the queue
+    /// is full). Reports a previous write failure or an oversized datagram.
     pub fn try_send(&mut self, dg: &[u8]) -> Result<()> {
-        if let Some(e) = &self.write_error {
-            return Err(LinkError::Io(std::io::Error::new(e.kind(), e.to_string())));
+        if self.is_broken() {
+            return Err(LinkError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                self.stats.last_error().unwrap_or_else(|| "write failed".into()),
+            )));
         }
-        self.scratch.clear();
-        encode_record(dg, &mut self.scratch)?;
-        let r = self
-            .writer
-            .write_all(&self.scratch)
-            .and_then(|_| self.writer.flush());
-        if let Err(e) = r {
-            self.stats.write_errors.fetch_add(1, Ordering::Relaxed);
-            self.stats.set_err(format!("write: {e}"));
-            let err = std::io::Error::new(e.kind(), e.to_string());
-            self.write_error = Some(e);
-            return Err(LinkError::Io(err));
-        }
-        self.stats.dg_out.fetch_add(1, Ordering::Relaxed);
-        self.stats.raw_out_bytes.fetch_add(self.scratch.len() as u64, Ordering::Relaxed);
-        Ok(())
+        let mut rec = Vec::new();
+        encode_record(dg, &mut rec)?;
+        self.wtx
+            .send(rec)
+            .map_err(|_| LinkError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer stopped")))
     }
 
     pub fn try_recv(&self) -> Result<Option<Vec<u8>>> {
@@ -200,7 +236,7 @@ impl UsbDatagramLink {
 
     /// True after a write failed (cable pulled, tablet app closed).
     pub fn is_broken(&self) -> bool {
-        self.write_error.is_some()
+        self.broken.load(Ordering::Acquire)
     }
 }
 
@@ -227,6 +263,43 @@ mod tests {
         a.send(&vec![1u8; 60000]);
         assert_eq!(b.recv_timeout(Duration::from_secs(2)).unwrap().unwrap(), b"ping");
         assert_eq!(b.recv_timeout(Duration::from_secs(2)).unwrap().unwrap().len(), 60000);
+    }
+
+    /// Writer that records the size of every write call (slow first call so the
+    /// queue fills and later records get coalesced).
+    struct Spy(Arc<Mutex<Vec<Vec<u8>>>>);
+    impl Write for Spy {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            let mut g = self.0.lock().unwrap();
+            if g.is_empty() {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            g.push(b.to_vec());
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn writes_are_coalesced_and_stream_identical() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut l = UsbDatagramLink::from_stream(Chunked { data: vec![], pos: 0, chunk: 1, tick: false }, Spy(log.clone()));
+        let mut expect = Vec::new();
+        for i in 0..200u32 {
+            let dg = vec![i as u8; 1 + (i as usize % 50)];
+            encode_record(&dg, &mut expect).unwrap();
+            l.send(&dg);
+        }
+        let t0 = std::time::Instant::now();
+        while l.stats().raw_out_bytes.load(Ordering::Relaxed) < expect.len() as u64 && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let g = log.lock().unwrap();
+        assert!(g.len() < 20, "expected coalescing, got {} writes", g.len());
+        assert_eq!(g.concat(), expect);
+        assert_eq!(l.stats().dg_out.load(Ordering::Relaxed), 200);
     }
 
     /// Reader that hands out the wire bytes in fixed small chunks, with

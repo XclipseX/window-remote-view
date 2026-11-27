@@ -104,7 +104,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: windows-app
+          key: windows-app-nasm
+      # NASM: without it openh264-sys2 silently builds the encoder without SIMD assembly (slow, blurry fallback).
+      - name: Install NASM
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - uses: actions/download-artifact@v4
         continue-on-error: true
         with:

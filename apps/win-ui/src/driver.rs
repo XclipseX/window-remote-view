@@ -85,8 +85,14 @@ pub enum DriverResult {
 }
 
 /// Arguments for wdi-simple (pure; unit-tested).
+///
+/// 18D1:2D01 (accessory + adb) is a composite device: WinUSB must bind to the
+/// accessory interface only (AOA interface 0; adb is interface 1), so it needs
+/// `--iid 0`. 18D1:2D00 (accessory only) is a single-interface device, so
+/// `--iid` must be left out there (libwdi would look for a non-existent MI_00).
 pub fn wdi_args(vid: u16, pid: u16) -> String {
-    format!("--vid 0x{vid:04X} --pid 0x{pid:04X} --type 0 --name \"RemoteView USB\"")
+    let iid = if (vid, pid) == (0x18D1, 0x2D01) { " --iid 0" } else { "" };
+    format!("--vid 0x{vid:04X} --pid 0x{pid:04X}{iid} --type 0 --name \"RemoteView USB\"")
 }
 
 /// Where wdi-simple comes from: embedded bytes (extracted) or a sibling file.
@@ -187,7 +193,7 @@ mod tests {
     #[test]
     fn args_match_contract() {
         assert_eq!(wdi_args(0x18D1, 0x2D00), "--vid 0x18D1 --pid 0x2D00 --type 0 --name \"RemoteView USB\"");
-        assert_eq!(wdi_args(0x18D1, 0x2D01), "--vid 0x18D1 --pid 0x2D01 --type 0 --name \"RemoteView USB\"");
+        assert_eq!(wdi_args(0x18D1, 0x2D01), "--vid 0x18D1 --pid 0x2D01 --iid 0 --type 0 --name \"RemoteView USB\"");
     }
 
     #[cfg(not(windows))]

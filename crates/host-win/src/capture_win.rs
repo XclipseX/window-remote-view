@@ -178,20 +178,31 @@ pub struct GpuFrame {
     pub texture: ID3D11Texture2D,
     device: ID3D11Device,
     ctx: ID3D11DeviceContext,
+    /// CPU-readable staging texture shared by all frames of one duplicator and
+    /// reused while (width, height, format) are unchanged.
+    staging: StagingCache,
 }
+
+type StagingCache = std::sync::Arc<std::sync::Mutex<Option<(u32, u32, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, ID3D11Texture2D)>>>;
 
 impl GpuFrame {
     pub fn read_bgra(&self, w: u32, h: u32, out: &mut Vec<u8>) -> Result<()> {
         unsafe {
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             self.texture.GetDesc(&mut desc);
-            desc.Usage = D3D11_USAGE_STAGING;
-            desc.BindFlags = 0;
-            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
-            desc.MiscFlags = 0;
-            let mut staging = None;
-            self.device.CreateTexture2D(&desc, None, Some(&mut staging))?;
-            let staging = staging.ok_or_else(|| HostError::Os("CreateTexture2D returned null".into()))?;
+            let mut cache = self.staging.lock().unwrap_or_else(|p| p.into_inner());
+            let reuse = matches!(&*cache, Some((cw, ch, cf, _)) if (*cw, *ch, *cf) == (desc.Width, desc.Height, desc.Format));
+            if !reuse {
+                desc.Usage = D3D11_USAGE_STAGING;
+                desc.BindFlags = 0;
+                desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+                desc.MiscFlags = 0;
+                let mut t = None;
+                self.device.CreateTexture2D(&desc, None, Some(&mut t))?;
+                let t = t.ok_or_else(|| HostError::Os("CreateTexture2D returned null".into()))?;
+                *cache = Some((desc.Width, desc.Height, desc.Format, t));
+            }
+            let staging = cache.as_ref().map(|c| c.3.clone()).expect("staging texture");
             self.ctx.CopyResource(&staging, &self.texture);
             let mut m = D3D11_MAPPED_SUBRESOURCE::default();
             self.ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut m))?;
@@ -216,6 +227,7 @@ pub struct DesktopDuplicator {
     rect: Rect,
     size: (u32, u32),
     copy: Option<ID3D11Texture2D>,
+    staging: StagingCache,
     rects_buf: Vec<RECT>,
 }
 
@@ -265,6 +277,7 @@ impl DesktopDuplicator {
                 size: (rect.width() as u32, rect.height() as u32),
                 rect,
                 copy: None,
+                staging: Default::default(),
                 rects_buf: vec![RECT::default(); 64],
             })
         }
@@ -347,6 +360,7 @@ impl DesktopDuplicator {
                     texture: copy,
                     device: self.device.clone(),
                     ctx: self.ctx.clone(),
+                    staging: self.staging.clone(),
                 }),
             }))
         }
