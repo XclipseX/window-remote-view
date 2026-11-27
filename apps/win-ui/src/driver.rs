@@ -75,7 +75,7 @@ pub fn install_vdd() -> DriverResult {
             Ok(m) => m,
             Err(e) => return DriverResult::Failed(e.to_string()),
         };
-        run_elevated(&me, &format!("{INSTALL_ALL_FLAG} \"{}\"", dir.display()))
+        run_elevated(&me, &format!("{INSTALL_ALL_FLAG} \"{}\"", dir.display()), None, false)
     }
     #[cfg(not(windows))]
     {
@@ -89,7 +89,7 @@ pub fn install_service() -> DriverResult {
     #[cfg(windows)]
     {
         match std::env::current_exe() {
-            Ok(me) => run_elevated(&me, &format!("{INSTALL_ALL_FLAG} -")),
+            Ok(me) => run_elevated(&me, &format!("{INSTALL_ALL_FLAG} -"), None, false),
             Err(e) => DriverResult::Failed(e.to_string()),
         }
     }
@@ -108,6 +108,20 @@ pub enum DriverResult {
     Failed(String),
 }
 
+/// Writable working directory for `wdi-simple.exe` (extracted exe + CWD).
+fn wdi_extract_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("RemoteView")
+        .join("driver")
+}
+
+/// Writable destination directory passed via `--dest` to `wdi-simple.exe` so
+/// libwdi never tries to extract driver files into `C:\Windows\System32`.
+fn wdi_driver_dir() -> PathBuf {
+    wdi_extract_dir().join("usb_driver")
+}
+
 /// Arguments for wdi-simple (pure; unit-tested).
 ///
 /// 18D1:2D01 (accessory + adb) is a composite device: WinUSB must bind to the
@@ -115,16 +129,68 @@ pub enum DriverResult {
 /// `--iid 0`. 18D1:2D00 (accessory only) is a single-interface device, so
 /// `--iid` must be left out there (libwdi would look for a non-existent MI_00).
 pub fn wdi_args(vid: u16, pid: u16) -> String {
-    let iid = if (vid, pid) == (0x18D1, 0x2D01) { " --iid 0" } else { "" };
-    format!("--vid 0x{vid:04X} --pid 0x{pid:04X}{iid} --type 0 --name \"RemoteView USB\"")
+    wdi_args_with_dest(vid, pid, &wdi_driver_dir())
 }
 
+fn wdi_args_with_dest(vid: u16, pid: u16, dest: &std::path::Path) -> String {
+    let iid = if (vid, pid) == (0x18D1, 0x2D01) { " --iid 0" } else { "" };
+    format!(
+        "--vid 0x{vid:04X} --pid 0x{pid:04X}{iid} --type 0 --name \"RemoteView USB\" --dest \"{}\"",
+        dest.display()
+    )
+}
+
+/// Writes `bytes` to `path` only when the existing file is missing or differs,
+/// avoiding `ERROR_SHARING_VIOLATION` if a prior run of `wdi-simple.exe` is
+/// still releasing its file handle.
 #[cfg(any(feature = "embed-wdi", test))]
-fn wdi_extract_dir() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("RemoteView")
-        .join("driver")
+fn write_if_changed(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<bool> {
+    if let Ok(existing) = std::fs::read(path) {
+        if existing == bytes {
+            return Ok(false);
+        }
+    }
+    std::fs::write(path, bytes)?;
+    Ok(true)
+}
+
+/// Decodes a `libwdi` `enum wdi_error` return value from `wdi-simple.exe`.
+#[cfg(any(windows, test))]
+fn wdi_error_name(code: i32) -> Option<&'static str> {
+    match code {
+        -1 => Some("WDI_ERROR_IO"),
+        -2 => Some("WDI_ERROR_INVALID_PARAM"),
+        -3 => Some("WDI_ERROR_ACCESS"),
+        -4 => Some("WDI_ERROR_NO_DEVICE"),
+        -5 => Some("WDI_ERROR_NOT_FOUND"),
+        -6 => Some("WDI_ERROR_BUSY"),
+        -7 => Some("WDI_ERROR_TIMEOUT"),
+        -8 => Some("WDI_ERROR_OVERFLOW"),
+        -9 => Some("WDI_ERROR_PENDING_INSTALLATION"),
+        -10 => Some("WDI_ERROR_INTERRUPTED"),
+        -11 => Some("WDI_ERROR_RESOURCE"),
+        -12 => Some("WDI_ERROR_NOT_SUPPORTED"),
+        -13 => Some("WDI_ERROR_EXISTS"),
+        -14 => Some("WDI_ERROR_USER_CANCEL"),
+        -15 => Some("WDI_ERROR_NEEDS_ADMIN"),
+        -16 => Some("WDI_ERROR_WOW64"),
+        -17 => Some("WDI_ERROR_INF_SYNTAX"),
+        -18 => Some("WDI_ERROR_CAT_MISSING"),
+        -19 => Some("WDI_ERROR_UNSIGNED"),
+        -99 => Some("WDI_ERROR_OTHER"),
+        _ => None,
+    }
+}
+
+/// Formats a non-zero `wdi-simple.exe` exit code as signed `i32` with its
+/// `WDI_ERROR_*` label when recognized.
+#[cfg(any(windows, test))]
+fn format_wdi_exit_code(code: u32) -> String {
+    let signed = code as i32;
+    match wdi_error_name(signed) {
+        Some(name) => format!("trình cài driver thoát với mã {signed} ({name})"),
+        None => format!("trình cài driver thoát với mã {signed}"),
+    }
 }
 
 /// Where wdi-simple comes from: embedded bytes (extracted) or a sibling file.
@@ -134,7 +200,8 @@ fn locate_wdi() -> Result<PathBuf, String> {
         let dir = wdi_extract_dir();
         std::fs::create_dir_all(&dir).map_err(|e| format!("không tạo được thư mục cài driver: {e}"))?;
         let p = dir.join("wdi-simple.exe");
-        std::fs::write(&p, WDI_SIMPLE).map_err(|e| format!("không giải nén được wdi-simple.exe: {e}"))?;
+        write_if_changed(&p, WDI_SIMPLE)
+            .map_err(|e| format!("không giải nén được wdi-simple.exe: {e}"))?;
         Ok(p)
     }
     #[cfg(not(feature = "embed-wdi"))]
@@ -153,8 +220,12 @@ fn locate_wdi() -> Result<PathBuf, String> {
 pub fn install_winusb(vid: u16, pid: u16) -> DriverResult {
     #[cfg(windows)]
     {
+        let work_dir = wdi_extract_dir();
+        if let Err(e) = std::fs::create_dir_all(wdi_driver_dir()) {
+            return DriverResult::Failed(format!("không tạo được thư mục cài driver: {e}"));
+        }
         match locate_wdi() {
-            Ok(exe) => run_elevated(&exe, &wdi_args(vid, pid)),
+            Ok(exe) => run_elevated(&exe, &wdi_args(vid, pid), Some(&work_dir), true),
             Err(e) => DriverResult::Failed(e),
         }
     }
@@ -166,7 +237,12 @@ pub fn install_winusb(vid: u16, pid: u16) -> DriverResult {
 }
 
 #[cfg(windows)]
-fn run_elevated(exe: &std::path::Path, params: &str) -> DriverResult {
+fn run_elevated(
+    exe: &std::path::Path,
+    params: &str,
+    work_dir: Option<&std::path::Path>,
+    is_wdi: bool,
+) -> DriverResult {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
@@ -178,17 +254,23 @@ fn run_elevated(exe: &std::path::Path, params: &str) -> DriverResult {
     let verb = wide("runas".as_ref());
     let file = wide(exe.as_os_str());
     let args = wide(params.as_ref());
+    let dir_wide = work_dir.map(|d| wide(d.as_os_str()));
+    let lp_directory = dir_wide
+        .as_ref()
+        .map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr()));
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS,
         lpVerb: PCWSTR(verb.as_ptr()),
         lpFile: PCWSTR(file.as_ptr()),
         lpParameters: PCWSTR(args.as_ptr()),
+        lpDirectory: lp_directory,
         nShow: SW_HIDE.0,
         ..Default::default()
     };
-    // SAFETY: `info` and the wide strings it points to outlive the call; the
-    // process handle returned by SEE_MASK_NOCLOSEPROCESS is closed below.
+    // SAFETY: `info` and the wide strings it points to (`verb`, `file`, `args`,
+    // `dir_wide`) outlive the call; the process handle returned by
+    // SEE_MASK_NOCLOSEPROCESS is closed below.
     unsafe {
         if let Err(e) = ShellExecuteExW(&mut info) {
             // ERROR_CANCELLED (1223) = user said no to UAC.
@@ -215,8 +297,10 @@ fn run_elevated(exe: &std::path::Path, params: &str) -> DriverResult {
         let _ = CloseHandle(h);
         if got.is_ok() && code == 0 {
             DriverResult::Installed
+        } else if is_wdi {
+            DriverResult::Failed(format_wdi_exit_code(code))
         } else {
-            DriverResult::Failed(format!("trình cài driver thoát với mã {code}"))
+            DriverResult::Failed(format!("trình cài driver thoát với mã {}", code as i32))
         }
     }
 }
@@ -227,14 +311,75 @@ mod tests {
 
     #[test]
     fn args_match_contract() {
-        assert_eq!(wdi_args(0x18D1, 0x2D00), "--vid 0x18D1 --pid 0x2D00 --type 0 --name \"RemoteView USB\"");
-        assert_eq!(wdi_args(0x18D1, 0x2D01), "--vid 0x18D1 --pid 0x2D01 --iid 0 --type 0 --name \"RemoteView USB\"");
+        let dest = wdi_driver_dir();
+        assert_eq!(
+            wdi_args(0x18D1, 0x2D00),
+            format!(
+                "--vid 0x18D1 --pid 0x2D00 --type 0 --name \"RemoteView USB\" --dest \"{}\"",
+                dest.display()
+            )
+        );
+        assert_eq!(
+            wdi_args(0x18D1, 0x2D01),
+            format!(
+                "--vid 0x18D1 --pid 0x2D01 --iid 0 --type 0 --name \"RemoteView USB\" --dest \"{}\"",
+                dest.display()
+            )
+        );
     }
 
     #[test]
     fn wdi_dir_is_scoped() {
         let d = wdi_extract_dir();
         assert!(d.ends_with(std::path::Path::new("RemoteView").join("driver")));
+        assert_eq!(wdi_driver_dir(), d.join("usb_driver"));
+    }
+
+    #[test]
+    fn format_wdi_exit_code_decodes_signed_errors() {
+        assert_eq!(
+            format_wdi_exit_code((-11i32) as u32),
+            "trình cài driver thoát với mã -11 (WDI_ERROR_RESOURCE)"
+        );
+        assert_eq!(
+            format_wdi_exit_code((-3i32) as u32),
+            "trình cài driver thoát với mã -3 (WDI_ERROR_ACCESS)"
+        );
+        assert_eq!(
+            format_wdi_exit_code((-6i32) as u32),
+            "trình cài driver thoát với mã -6 (WDI_ERROR_BUSY)"
+        );
+        assert_eq!(
+            format_wdi_exit_code((-13i32) as u32),
+            "trình cài driver thoát với mã -13 (WDI_ERROR_EXISTS)"
+        );
+        assert_eq!(
+            format_wdi_exit_code((-14i32) as u32),
+            "trình cài driver thoát với mã -14 (WDI_ERROR_USER_CANCEL)"
+        );
+        assert_eq!(
+            format_wdi_exit_code(42),
+            "trình cài driver thoát với mã 42"
+        );
+    }
+
+    #[test]
+    fn write_if_changed_skips_identical_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "rv-driver-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("dummy.bin");
+        let _ = std::fs::remove_file(&p);
+
+        assert!(write_if_changed(&p, b"abc").unwrap());
+        assert!(!write_if_changed(&p, b"abc").unwrap());
+        assert!(write_if_changed(&p, b"abcd").unwrap());
+        assert_eq!(std::fs::read(&p).unwrap(), b"abcd");
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[cfg(not(windows))]

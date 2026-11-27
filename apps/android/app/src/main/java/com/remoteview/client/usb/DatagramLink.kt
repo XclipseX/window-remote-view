@@ -41,6 +41,9 @@ interface DatagramLink {
     /** Xếp hàng gửi một datagram (không chặn). false nếu liên kết đã đóng hoặc quá dài. */
     fun send(bytes: ByteArray): Boolean
 
+    /** Xóa sạch hàng đợi gửi đang chờ (dùng khi bắt tay lại để không gửi gói cũ). */
+    fun clearWriteQueue() {}
+
     fun close()
 }
 
@@ -51,8 +54,10 @@ abstract class FramedStreamLink(override val name: String) : DatagramLink {
     private val closed = AtomicBoolean(false)
     @Volatile private var opened = false
     private val queue = LinkedBlockingQueue<ByteArray>(QUEUE_LIMIT)
-    private var reader: Thread? = null
-    private var writer: Thread? = null
+    @Volatile private var reader: Thread? = null
+    @Volatile private var writer: Thread? = null
+
+    protected val isClosed: Boolean get() = closed.get()
 
     override val isOpen: Boolean get() = opened && !closed.get()
 
@@ -65,10 +70,19 @@ abstract class FramedStreamLink(override val name: String) : DatagramLink {
     override val datagramsIn: Long get() = cDgIn.get()
     override val datagramsOut: Long get() = cDgOut.get()
 
+    override fun clearWriteQueue() {
+        queue.clear()
+    }
+
     override fun send(bytes: ByteArray): Boolean {
         if (!isOpen || bytes.size > MAX_RECORD) {
             RvLog.w("[$name] bỏ datagram ${bytes.size}B: open=$isOpen")
             return false
+        }
+        // Gói bắt tay (0xA5): loại bỏ các gói bắt tay cũ đang tồn trong hàng đợi khi USB bị nghẽn ghi,
+        // tránh dồn nhiều msg1 cũ gây lỗi "handshake rate limited" phía host.
+        if (bytes.isNotEmpty() && bytes[0] == HANDSHAKE_MAGIC) {
+            queue.removeIf { it.isNotEmpty() && it[0] == HANDSHAKE_MAGIC }
         }
         return queue.offer(bytes)
     }
@@ -78,14 +92,27 @@ abstract class FramedStreamLink(override val name: String) : DatagramLink {
 
     /** Chạy ở thread nền khi stream đã sẵn sàng. */
     protected fun runStreams(input: InputStream, output: OutputStream) {
+        if (closed.get()) {
+            try { closeResources() } catch (_: Exception) {}
+            return
+        }
         opened = true
         RvLog.i("[$name] stream mở, bắt đầu thread ghi và tạo phiên")
         // Thread ghi phải chạy TRƯỚC onOpen (onOpen tạo phiên native và gửi Hello ngay);
         // thread đọc chạy SAU onOpen để nativeHandle đã sẵn sàng, tránh bão gói rác (handle=0).
-        writer = Thread({ writeLoop(output) }, "rv-$name-w").also { it.isDaemon = true; it.start() }
+        val w = Thread({ writeLoop(output) }, "rv-$name-w").also { it.isDaemon = true }
+        writer = w
+        w.start()
+        if (closed.get()) {
+            w.interrupt()
+            try { closeResources() } catch (_: Exception) {}
+            return
+        }
         listener?.onOpen()
         if (!closed.get()) {
-            reader = Thread({ readLoop(input) }, "rv-$name-r").also { it.isDaemon = true; it.start() }
+            val r = Thread({ readLoop(input) }, "rv-$name-r").also { it.isDaemon = true }
+            reader = r
+            r.start()
         }
     }
 
@@ -169,6 +196,9 @@ abstract class FramedStreamLink(override val name: String) : DatagramLink {
         RvLog.w("[$name] đóng liên kết: ${reason ?: "chủ động"}")
         queue.clear()
         try { closeResources() } catch (_: Exception) {}
+        val cur = Thread.currentThread()
+        reader?.let { if (it !== cur) it.interrupt() }
+        writer?.let { if (it !== cur) it.interrupt() }
         listener?.onClosed(reason)
     }
 
@@ -176,6 +206,7 @@ abstract class FramedStreamLink(override val name: String) : DatagramLink {
 
     companion object {
         const val MAX_RECORD = 64 * 1024
+        private const val HANDSHAKE_MAGIC: Byte = 0xA5.toByte()
         private const val QUEUE_LIMIT = 1024
         private const val READ_CHUNK = 16384
     }

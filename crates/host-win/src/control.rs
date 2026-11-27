@@ -217,40 +217,102 @@ pub fn random_token() -> String {
     format!("{:08}", u64::from_le_bytes(b) % 100_000_000)
 }
 
-fn token_path() -> Option<std::path::PathBuf> {
+fn user_data_dir() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("APPDATA")
+        .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
-    Some(base.join("RemoteView").join("usb_token"))
+        .or_else(|| {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from)
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|h| std::path::PathBuf::from(h).join(".config"))
+        })?;
+    Some(base.join("RemoteView"))
+}
+
+/// Shared data directory for host/service state (e.g. `usb_token`).
+///
+/// On Windows this prefers `%PROGRAMDATA%\RemoteView` (falling back to
+/// `C:\ProgramData\RemoteView`) so `RemoteViewSvc` (LocalSystem) and the user
+/// GUI share the same persistent pairing token; elsewhere it falls back to
+/// `%APPDATA%\RemoteView` / `$XDG_CONFIG_HOME/RemoteView` / `$HOME/.config/RemoteView`.
+pub fn shared_data_dir() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("PROGRAMDATA")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"));
+        Some(base.join("RemoteView"))
+    }
+    #[cfg(not(windows))]
+    {
+        user_data_dir()
+    }
 }
 
 fn valid_token(t: &str) -> bool {
     t.len() == 8 && t.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Persistent per-user 8-digit USB pairing token (`%APPDATA%\RemoteView\usb_token`),
-/// generated once. An accessory left in accessory mode by an earlier run keeps
-/// the same AOA serial, so it still matches the session OTP. Falls back to a
-/// random in-memory token if the file cannot be written.
-pub fn persistent_token() -> String {
-    let path = token_path();
-    if let Some(p) = &path {
-        if let Ok(s) = std::fs::read_to_string(p) {
-            let t = s.trim();
-            if valid_token(t) {
-                return t.to_string();
+fn read_valid_token(p: &std::path::Path) -> Option<String> {
+    let s = std::fs::read_to_string(p).ok()?;
+    let t = s.trim();
+    valid_token(t).then(|| t.to_string())
+}
+
+fn write_token(p: &std::path::Path, token: &str) -> bool {
+    if let Some(d) = p.parent() {
+        if std::fs::create_dir_all(d).is_err() {
+            return false;
+        }
+    }
+    std::fs::write(p, token).is_ok()
+}
+
+fn resolve_persistent_token(
+    primary: Option<&std::path::Path>,
+    legacy: Option<&std::path::Path>,
+) -> String {
+    if let Some(p) = primary {
+        if let Some(t) = read_valid_token(p) {
+            return t;
+        }
+    }
+    let distinct_legacy = legacy.filter(|l| primary != Some(*l));
+    if let Some(l) = distinct_legacy {
+        if let Some(t) = read_valid_token(l) {
+            if let Some(p) = primary {
+                let _ = write_token(p, &t);
             }
+            return t;
         }
     }
     let t = random_token();
-    if let Some(p) = &path {
-        if let Some(d) = p.parent() {
-            let _ = std::fs::create_dir_all(d);
+    if let Some(p) = primary {
+        if write_token(p, &t) {
+            return t;
         }
-        let _ = std::fs::write(p, &t);
+    }
+    if let Some(l) = distinct_legacy {
+        let _ = write_token(l, &t);
     }
     t
+}
+
+/// Persistent 8-digit USB pairing token (`%PROGRAMDATA%\RemoteView\usb_token` on
+/// Windows, migrating any existing `%APPDATA%\RemoteView\usb_token`), generated
+/// once. An accessory left in accessory mode by an earlier run keeps the same
+/// AOA serial, so it still matches the session OTP. Falls back to `%APPDATA%`
+/// or a random in-memory token if the file cannot be written.
+pub fn persistent_token() -> String {
+    let primary = shared_data_dir().map(|d| d.join("usb_token"));
+    let legacy = user_data_dir().map(|d| d.join("usb_token"));
+    resolve_persistent_token(primary.as_deref(), legacy.as_deref())
 }
 
 /// Windows computer name (shown to the tablet as the accessory description).
@@ -423,5 +485,46 @@ mod tests {
             assert_eq!(o.len(), 6);
             assert!(o.bytes().all(|b| b.is_ascii_digit()));
         }
+    }
+
+    #[test]
+    fn persistent_token_resolution_and_migration() {
+        let root = std::env::temp_dir().join(format!("rv-token-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let primary = root.join("programdata").join("RemoteView").join("usb_token");
+        let legacy = root.join("appdata").join("RemoteView").join("usb_token");
+
+        // 1. Legacy exists, primary absent -> migrates legacy token into primary.
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "12345678\n").unwrap();
+        let got = resolve_persistent_token(Some(&primary), Some(&legacy));
+        assert_eq!(got, "12345678");
+        assert_eq!(std::fs::read_to_string(&primary).unwrap().trim(), "12345678");
+
+        // 2. Primary takes precedence over legacy once present.
+        std::fs::write(&primary, "87654321").unwrap();
+        let got = resolve_persistent_token(Some(&primary), Some(&legacy));
+        assert_eq!(got, "87654321");
+
+        // 3. Neither exists -> generates 8-digit token and writes to primary.
+        let _ = std::fs::remove_file(&primary);
+        let _ = std::fs::remove_file(&legacy);
+        let generated = resolve_persistent_token(Some(&primary), Some(&legacy));
+        assert!(valid_token(&generated));
+        assert_eq!(std::fs::read_to_string(&primary).unwrap().trim(), generated);
+        assert!(!legacy.exists());
+
+        // 4. Primary unwritable (parent is a regular file) -> falls back to legacy.
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let blocker = root.join("not_a_dir");
+        std::fs::write(&blocker, b"file").unwrap();
+        let unwritable_primary = blocker.join("RemoteView").join("usb_token");
+        let fallback_legacy = root.join("appdata").join("RemoteView").join("usb_token");
+        let fell_back = resolve_persistent_token(Some(&unwritable_primary), Some(&fallback_legacy));
+        assert!(valid_token(&fell_back));
+        assert_eq!(std::fs::read_to_string(&fallback_legacy).unwrap().trim(), fell_back);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

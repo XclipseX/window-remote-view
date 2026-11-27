@@ -239,7 +239,7 @@ impl App {
             logs: VecDeque::new(),
             t0: Instant::now(),
             pin: None,
-            scan_on: Arc::new(AtomicBool::new(!demo)),
+            scan_on: Arc::new(AtomicBool::new(!demo && !pending_auto_share)),
             scan_lock: Arc::new(std::sync::Mutex::new(())),
             driver_busy: None,
             driver_tried: Default::default(),
@@ -475,14 +475,19 @@ impl App {
 
     fn stop(&mut self) {
         self.log(LogLevel::Info, "Dừng chia sẻ".into());
-        if let Some(h) = self.host.take() {
+        let had_host = if let Some(h) = self.host.take() {
             h.stop();
-            // Detach: dropping would block; supervisor ends itself and kills after the grace period.
+            // Detach: dropping would block; supervisor ends itself and emits UiMsg::Stopped once USB is released.
             std::thread::spawn(move || drop(h));
-        }
+            true
+        } else {
+            false
+        };
         self.demo = None;
         self.running = false;
-        self.scan_on.store(true, Ordering::Relaxed);
+        if !had_host {
+            self.scan_on.store(true, Ordering::Relaxed);
+        }
         self.status = None;
         self.pin = None;
         self.devices.clear();
@@ -757,7 +762,11 @@ impl App {
                     self.running = false;
                     self.error = Some(msg);
                 }
-                UiMsg::Stopped => {}
+                UiMsg::Stopped => {
+                    if !self.running && self.demo.is_none() {
+                        self.scan_on.store(true, Ordering::Relaxed);
+                    }
+                }
                 UiMsg::Scan(items) => {
                     if !self.running {
                         self.set_devices(items);
@@ -1644,7 +1653,12 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.cfg.save();
-        self.host = None; // Drop: stop + kill child
+        if let Some(h) = self.host.take() {
+            if self.svc_present {
+                h.detach(); // Keep always-on RemoteViewSvc streaming even when GUI closes
+            }
+            drop(h);
+        }
         self.tray = None;
     }
 }

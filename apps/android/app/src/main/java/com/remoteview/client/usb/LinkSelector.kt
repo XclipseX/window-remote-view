@@ -1,6 +1,7 @@
 package com.remoteview.client.usb
 
 import android.content.Context
+import android.hardware.usb.UsbAccessory
 import com.remoteview.client.net.UsbTetherDetector
 
 // UNBUILT: chưa biên dịch.
@@ -20,8 +21,13 @@ sealed interface Route {
  * [select] có thể thăm dò socket nên phải gọi ở thread nền.
  */
 object LinkSelector {
-    fun select(context: Context, tether: UsbTetherDetector = UsbTetherDetector()): Route {
-        if (AccessoryLink.isAttached(context)) return Route.Usb(AccessoryLink(context))
+    fun select(
+        context: Context,
+        tether: UsbTetherDetector = UsbTetherDetector(),
+        preferredAccessory: UsbAccessory? = null,
+    ): Route {
+        val acc = preferredAccessory ?: AccessoryLink.findAccessory(context)
+        if (acc != null) return Route.Usb(AccessoryLink(context, acc))
         if (AdbReverseLink.probe()) return Route.Usb(AdbReverseLink())
         tether.detect()?.let { return Route.Tether(it.localAddress) }
         return Route.Server

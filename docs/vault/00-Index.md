@@ -13,6 +13,7 @@ updated: 2026-11-27
 - [[decisions/ADR-0003-sudovda-virtual-display]] – RemoteView tự tạo màn hình ảo (SudoVDA), hết màn đen khi không có TeamViewer
 - [[decisions/ADR-0004-system-service-lock-screen]] – dịch vụ SYSTEM `RemoteViewSvc` để xem/điều khiển màn hình khóa
 - [[decisions/ADR-0005-native-amf-and-telemetry]] – AMD AMF DX11 gốc, OpenH264 đa slice, đo RTT/decode_ms, LAN UDP + discovery, SendSAS, tray/icon/SHA-256
+- [[decisions/ADR-0006-always-on-boot-daemon]] – `RemoteViewSvc` tự chạy ngay từ Winlogon lúc boot, `%ProgramData%` dùng chung, bền bỉ chuyển desktop/sleep-wake, Android tự attach & reconnect tức thì
 
 ## Known bugs / gotchas
 - Tab S10+ Android 17 không bật được USB tethering

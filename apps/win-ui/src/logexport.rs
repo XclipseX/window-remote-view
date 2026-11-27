@@ -81,21 +81,29 @@ fn target_dir() -> Option<PathBuf> {
     dirs::desktop_dir().filter(|d| d.is_dir()).or_else(dirs::home_dir)
 }
 
-/// Collects the logs from `dir` and writes the zip into `dest_dir`; returns its path.
-pub fn export_to(dir: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
+/// Collects the logs from `dirs` (deduplicating filenames) and writes the zip into `dest_dir`.
+pub fn export_from_dirs(dirs: &[PathBuf], dest_dir: &Path) -> Result<PathBuf, String> {
     let now = logfile::now();
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
     let mut info = rv_host_win::sysinfo::header_lines("RemoteView").join("\r\n");
     info.push_str("\r\n");
     entries.push(("info.txt".into(), info.into_bytes()));
-    for p in logfile::export_set(dir) {
-        // The live log is open for append; a read error just skips that file.
-        if let (Some(n), Ok(d)) = (p.file_name().and_then(|n| n.to_str()), std::fs::read(&p)) {
-            entries.push((n.to_string(), d));
+    for dir in dirs {
+        for p in logfile::export_set(dir) {
+            // The live log is open for append; a read error just skips that file.
+            if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
+                if seen.insert(n.to_string()) {
+                    if let Ok(d) = std::fs::read(&p) {
+                        entries.push((n.to_string(), d));
+                    }
+                }
+            }
         }
     }
     if entries.len() == 1 {
-        return Err(format!("Chưa có file log nào trong {}", dir.display()));
+        let first = dirs.first().map(|d| d.display().to_string()).unwrap_or_default();
+        return Err(format!("Chưa có file log nào trong {first}"));
     }
     std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
     let path = dest_dir.join(format!("RemoteView-logs-{}.zip", now.file_stamp()));
@@ -104,10 +112,22 @@ pub fn export_to(dir: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Zips the logs to the Desktop and returns the zip path.
+/// Collects the logs from `dir` and writes the zip into `dest_dir`; returns its path.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn export_to(dir: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
+    export_from_dirs(&[dir.to_path_buf()], dest_dir)
+}
+
+/// Zips the logs (both user GUI logs and machine-wide RemoteViewSvc logs) to Desktop.
 pub fn export_logs() -> Result<PathBuf, String> {
     let dest = target_dir().ok_or("Không tìm thấy thư mục Desktop")?;
-    export_to(&logfile::logs_dir(), &dest)
+    let mut dirs = vec![logfile::logs_dir()];
+    if let Some(shared) = logfile::shared_logs_dir() {
+        if shared != dirs[0] {
+            dirs.push(shared);
+        }
+    }
+    export_from_dirs(&dirs, &dest)
 }
 
 /// Opens Explorer with `path` selected (the containing folder elsewhere).

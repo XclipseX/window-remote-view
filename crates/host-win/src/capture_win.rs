@@ -1,5 +1,7 @@
 //! DXGI Desktop Duplication (Windows 8+).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use windows::core::{Interface, PCWSTR};
 use windows::Win32::Devices::Display::*;
 use windows::Win32::Foundation::{HMODULE, RECT};
@@ -8,8 +10,10 @@ use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::*;
 
-use crate::capture::{pick_output_index, CapturedFrame, FrameData, OutputInfo};
+use crate::capture::{pick_output_index_opts, CapturedFrame, FrameData, OutputInfo};
 use crate::{HostError, Rect, Result};
+
+static NEXT_DEVICE_ID: AtomicU64 = AtomicU64::new(1);
 
 fn from_rect(r: RECT) -> Rect {
     Rect {
@@ -176,6 +180,7 @@ pub fn list_outputs() -> Result<Vec<OutputInfo>> {
 /// read back) before the next `acquire`.
 pub struct GpuFrame {
     pub texture: ID3D11Texture2D,
+    pub device_id: u64,
     device: ID3D11Device,
     ctx: ID3D11DeviceContext,
     /// CPU-readable staging texture shared by all frames of one duplicator and
@@ -221,6 +226,7 @@ impl GpuFrame {
 
 pub struct DesktopDuplicator {
     name: String,
+    device_id: u64,
     device: ID3D11Device,
     ctx: ID3D11DeviceContext,
     dup: IDXGIOutputDuplication,
@@ -230,6 +236,7 @@ pub struct DesktopDuplicator {
     copy_idx: usize,
     staging: StagingCache,
     rects_buf: Vec<RECT>,
+    delivered_first: bool,
 }
 
 impl DesktopDuplicator {
@@ -238,9 +245,16 @@ impl DesktopDuplicator {
     /// attached, else the primary one, else the first attached one. The D3D11
     /// device is created on the chosen output's own adapter.
     pub fn open(prefer: Option<&str>) -> Result<Self> {
+        Self::open_opts(prefer, false)
+    }
+
+    /// Like [`open`](Self::open), with `prefer_virtual` passed to
+    /// [`pick_output_index_opts`] so virtual displays stay preferred if Windows
+    /// renumbers them across logon/session changes.
+    pub fn open_opts(prefer: Option<&str>, prefer_virtual: bool) -> Result<Self> {
         let mut all = enumerate_all()?;
         let infos: Vec<OutputInfo> = all.iter().map(|f| f.info.clone()).collect();
-        let idx = pick_output_index(&infos, prefer)
+        let idx = pick_output_index_opts(&infos, prefer, prefer_virtual)
             .ok_or_else(|| HostError::Os("no attached DXGI output".into()))?;
         let Found { adapter, output, info } = all.swap_remove(idx);
         let refresh_hz = unsafe {
@@ -252,11 +266,12 @@ impl DesktopDuplicator {
                 0
             }
         };
+        let device_id = NEXT_DEVICE_ID.fetch_add(1, Ordering::Relaxed);
         crate::control::log(
             crate::control::Level::Info,
             &format!(
-                "capture: DXGI adapter '{}' output {} {:?} @{}Hz (adapter #{} output #{})",
-                info.adapter_name, info.name, info.desktop_rect, refresh_hz, info.adapter_index, info.output_index
+                "capture: DXGI adapter '{}' output {} {:?} @{}Hz (adapter #{} output #{} dev#{})",
+                info.adapter_name, info.name, info.desktop_rect, refresh_hz, info.adapter_index, info.output_index, device_id
             ),
         );
         unsafe {
@@ -298,6 +313,7 @@ impl DesktopDuplicator {
             let rect = info.desktop_rect;
             Ok(Self {
                 name: info.name,
+                device_id,
                 device,
                 ctx,
                 dup,
@@ -307,6 +323,7 @@ impl DesktopDuplicator {
                 copy_idx: 0,
                 staging: Default::default(),
                 rects_buf: vec![RECT::default(); 64],
+                delivered_first: false,
             })
         }
     }
@@ -354,7 +371,11 @@ impl DesktopDuplicator {
                 Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
                 Err(e) => return Err(e.into()),
             }
-            if info.AccumulatedFrames == 0 {
+            // On a static desktop (e.g. Winlogon/lock screen immediately after open),
+            // DXGI may return AccumulatedFrames == 0 with a valid surface (LastPresentTime != 0).
+            // Deliver that very first frame so the screen shows up right away.
+            let initial_static = !self.delivered_first && info.LastPresentTime != 0;
+            if info.AccumulatedFrames == 0 && !initial_static {
                 // Static desktop: only pointer movement/shape changed.
                 let _ = self.dup.ReleaseFrame();
                 return Ok(None);
@@ -387,6 +408,7 @@ impl DesktopDuplicator {
             let copy = self.copies[slot].clone().expect("copy texture");
             self.ctx.CopyResource(&copy, &tex);
             self.dup.ReleaseFrame()?;
+            self.delivered_first = true;
             Ok(Some(CapturedFrame {
                 width: desc.Width,
                 height: desc.Height,
@@ -394,6 +416,7 @@ impl DesktopDuplicator {
                 accumulated_frames: info.AccumulatedFrames,
                 data: FrameData::Gpu(GpuFrame {
                     texture: copy,
+                    device_id: self.device_id,
                     device: self.device.clone(),
                     ctx: self.ctx.clone(),
                     staging: self.staging.clone(),

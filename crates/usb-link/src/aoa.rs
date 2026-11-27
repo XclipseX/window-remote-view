@@ -112,6 +112,19 @@ pub fn list_candidates(scan_all: bool) -> Result<Vec<Candidate>> {
     list_candidates_opts(scan_all, true)
 }
 
+/// Classifies a `Device::open()` failure during candidate discovery:
+/// - `None`: device vanished mid-scan (`NoDevice`), skip stale entry.
+/// - `Some(true)`: driver is bound (`Access`/`Busy` — on Windows WinUSB opens are
+///   exclusive, so an active host worker causes `Access`/`Busy`, not `NotSupported`).
+/// - `Some(false)`: driver missing or unusable (`NotSupported`, etc.).
+fn classify_open_error(err: rusb::Error) -> Option<bool> {
+    match err {
+        rusb::Error::NoDevice => None,
+        rusb::Error::Access | rusb::Error::Busy => Some(true),
+        _ => Some(false),
+    }
+}
+
 /// Like [`list_candidates`]. With `probe_accessory = false` devices already in
 /// accessory mode are not opened (they may be in use by a live link; a second
 /// open could fail or disturb it) and are reported with `can_open = true`.
@@ -126,13 +139,23 @@ pub fn list_candidates_opts(scan_all: bool, probe_accessory: bool) -> Result<Vec
             continue;
         }
         if scan_all || ANDROID_VIDS.contains(&desc.vendor_id()) {
-            let (mut manufacturer, mut product, mut can_open) = (None, None, false);
+            let (manufacturer, product, can_open);
             if !probe_accessory && is_accessory(desc.vendor_id(), desc.product_id()) {
-                can_open = true;
-            } else if let Ok(h) = d.open() {
-                can_open = true;
-                manufacturer = h.read_manufacturer_string_ascii(&desc).ok();
-                product = h.read_product_string_ascii(&desc).ok();
+                (manufacturer, product, can_open) = (None, None, true);
+            } else {
+                match d.open() {
+                    Ok(h) => {
+                        can_open = true;
+                        manufacturer = h.read_manufacturer_string_ascii(&desc).ok();
+                        product = h.read_product_string_ascii(&desc).ok();
+                    }
+                    Err(e) => match classify_open_error(e) {
+                        Some(usable) => {
+                            (manufacturer, product, can_open) = (None, None, usable);
+                        }
+                        None => continue,
+                    },
+                }
             }
             out.push(Candidate {
                 vid: desc.vendor_id(),
@@ -218,59 +241,110 @@ impl AoaDevice {
     /// logic: it could make the host read from a different device instance
     /// than the one Android opened.
     pub fn connect(info: &AccessoryInfo, scan_all: bool, timeout: Duration) -> Result<Self> {
-        let _g = usb_lock();
-        let ctx = Context::new()?;
-        if let Some(dev) = find_accessory(&ctx)? {
-            return Self::open(dev, Some(&info.serial));
+        if let Some(dev) = Self::try_open_existing_accessory(info)? {
+            return Ok(dev);
         }
-        Self::switch_normal_device(&ctx, info, scan_all, timeout)
+        Self::switch_normal_device(info, scan_all, timeout)
     }
 
-    fn switch_normal_device(ctx: &Context, info: &AccessoryInfo, scan_all: bool, timeout: Duration) -> Result<Self> {
-        let mut last_err = LinkError::NoDevice;
-        for d in ctx.devices()?.iter() {
-            let Ok(desc) = d.device_descriptor() else { continue };
-            if desc.class_code() == 9
-                || !(scan_all || ANDROID_VIDS.contains(&desc.vendor_id()))
-            {
-                continue;
-            }
-            let h = match d.open() {
-                Ok(h) => h,
-                Err(e) => {
-                    last_err = e.into();
-                    continue;
-                }
+    /// If a device is already in accessory mode (`18D1:2D00/2D01`), open it.
+    /// Retries transient `Access`/`Busy`/`NoDevice`/`Io`/`Pipe` errors for up
+    /// to ~1.5 s (every 150 ms) without holding `USB_LOCK` across sleeps to
+    /// survive brief PnP or previous-handle teardown windows.
+    fn try_open_existing_accessory(info: &AccessoryInfo) -> Result<Option<Self>> {
+        let initial = {
+            let _g = usb_lock();
+            let ctx = Context::new()?;
+            find_accessory(&ctx)?.map(|dev| Self::open(dev, Some(&info.serial)))
+        };
+        let mut last_err = match initial {
+            None => return Ok(None),
+            Some(Ok(d)) => return Ok(Some(d)),
+            Some(Err(e)) if is_transient_open_err(&e) => e,
+            Some(Err(e)) => return Err(e),
+        };
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(150));
+            let attempt = {
+                let _g = usb_lock();
+                let ctx = Context::new()?;
+                find_accessory(&ctx)?.map(|dev| Self::open(dev, Some(&info.serial)))
             };
-            match get_protocol(&h) {
-                Ok(p) if p >= 1 => {}
-                Ok(p) => {
-                    last_err = LinkError::AoaUnsupported(p);
-                    continue;
-                }
-                Err(e) => {
-                    last_err = e;
-                    continue;
+            if let Some(res) = attempt {
+                match res {
+                    Ok(d) => return Ok(Some(d)),
+                    Err(e) if is_transient_open_err(&e) => last_err = e,
+                    Err(e) => return Err(e),
                 }
             }
-            if let Err(e) = send_identity(&h, info) {
-                last_err = e;
-                continue;
-            }
-            drop(h);
-            return Self::wait_reenumerate(ctx, timeout, &info.serial);
         }
         Err(last_err)
     }
 
-    fn wait_reenumerate(ctx: &Context, timeout: Duration, token: &str) -> Result<Self> {
+    fn switch_normal_device(info: &AccessoryInfo, scan_all: bool, timeout: Duration) -> Result<Self> {
+        let switched = {
+            let _g = usb_lock();
+            let ctx = Context::new()?;
+            let mut last_err = LinkError::NoDevice;
+            let mut did_switch = false;
+            for d in ctx.devices()?.iter() {
+                let Ok(desc) = d.device_descriptor() else { continue };
+                if desc.class_code() == 9
+                    || !(scan_all || ANDROID_VIDS.contains(&desc.vendor_id()))
+                {
+                    continue;
+                }
+                let h = match d.open() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        last_err = e.into();
+                        continue;
+                    }
+                };
+                match get_protocol(&h) {
+                    Ok(p) if p >= 1 => {}
+                    Ok(p) => {
+                        last_err = LinkError::AoaUnsupported(p);
+                        continue;
+                    }
+                    Err(e) => {
+                        last_err = e;
+                        continue;
+                    }
+                }
+                if let Err(e) = send_identity(&h, info) {
+                    last_err = e;
+                    continue;
+                }
+                drop(h);
+                did_switch = true;
+                break;
+            }
+            if did_switch {
+                Ok(())
+            } else {
+                Err(last_err)
+            }
+        };
+        switched?;
+        Self::wait_reenumerate(timeout, &info.serial)
+    }
+
+    fn wait_reenumerate(timeout: Duration, token: &str) -> Result<Self> {
         let deadline = Instant::now() + timeout;
-        // Give the device a moment to detach before polling.
+        // Give the device a moment to detach before polling (without holding USB_LOCK).
         std::thread::sleep(Duration::from_millis(500));
         loop {
-            if let Some(dev) = find_accessory(ctx)? {
+            let attempt = {
+                let _g = usb_lock();
+                // Fresh libusb Context per poll so Windows PnP arrival of 18D1:2D00/2D01 is seen.
+                let ctx = Context::new()?;
+                find_accessory(&ctx)?.map(|dev| Self::open(dev, Some(token)))
+            };
+            if let Some(res) = attempt {
                 // Retry open briefly: node may exist before it is usable.
-                match Self::open(dev, Some(token)) {
+                match res {
                     Ok(d) => return Ok(d),
                     Err(e) if Instant::now() >= deadline => return Err(e),
                     Err(_) => {}
@@ -352,6 +426,19 @@ impl AoaDevice {
     }
 }
 
+fn is_transient_open_err(err: &LinkError) -> bool {
+    matches!(
+        err,
+        LinkError::Usb(
+            rusb::Error::Access
+                | rusb::Error::Busy
+                | rusb::Error::NoDevice
+                | rusb::Error::Io
+                | rusb::Error::Pipe
+        )
+    )
+}
+
 fn find_accessory(ctx: &Context) -> Result<Option<Device<Context>>> {
     for d in ctx.devices()?.iter() {
         if let Ok(desc) = d.device_descriptor() {
@@ -398,9 +485,9 @@ fn to_io(e: rusb::Error) -> std::io::Error {
 
 impl Read for BulkReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // Short timeout so the reader thread notices a dropped link promptly.
+        // Short timeout so UsbDatagramLink::drop joins promptly without racing reconnect.
         self.h
-            .read_bulk(self.ep, buf, Duration::from_millis(500))
+            .read_bulk(self.ep, buf, Duration::from_millis(150))
             .map_err(to_io)
     }
 }
@@ -416,5 +503,29 @@ impl Write for BulkWriter {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_open_error_distinguishes_driver_missing_from_in_use() {
+        assert_eq!(classify_open_error(rusb::Error::NotSupported), Some(false));
+        assert_eq!(classify_open_error(rusb::Error::Access), Some(true));
+        assert_eq!(classify_open_error(rusb::Error::Busy), Some(true));
+        assert_eq!(classify_open_error(rusb::Error::NoDevice), None);
+    }
+
+    #[test]
+    fn transient_open_errors_match_expected_variants() {
+        assert!(is_transient_open_err(&LinkError::Usb(rusb::Error::Access)));
+        assert!(is_transient_open_err(&LinkError::Usb(rusb::Error::Busy)));
+        assert!(is_transient_open_err(&LinkError::Usb(rusb::Error::NoDevice)));
+        assert!(is_transient_open_err(&LinkError::Usb(rusb::Error::Io)));
+        assert!(is_transient_open_err(&LinkError::Usb(rusb::Error::Pipe)));
+        assert!(!is_transient_open_err(&LinkError::Usb(rusb::Error::NotSupported)));
+        assert!(!is_transient_open_err(&LinkError::NoEndpoints));
     }
 }

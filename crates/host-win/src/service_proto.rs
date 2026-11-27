@@ -86,25 +86,203 @@ pub fn validate_worker_args(args: &[String]) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// The client's first line.
+/// The client's first line (legacy spawn — restarts worker if args differ or stopped).
 pub fn spawn_line(args: &[String]) -> String {
     let mut s = serde_json::json!({ "op": "spawn", "args": args }).to_string();
     s.push('\n');
     s
 }
 
+/// First line sent by a GUI attaching to the always-on daemon worker: if a worker
+/// is already running with matching `args` (or actively streaming), the service attaches
+/// seamlessly with zero disconnect and replays cached state; otherwise it starts/updates it.
+pub fn attach_line(args: &[String]) -> String {
+    let mut s = serde_json::json!({ "op": "attach", "args": args }).to_string();
+    s.push('\n');
+    s
+}
+
+/// Explicit user request to stop the daemon's worker (closing the GUI without this
+/// merely detaches so the tablet display keeps running uninterrupted).
+pub fn stop_sharing_line() -> String {
+    "{\"op\":\"stop_sharing\"}\n".to_string()
+}
+
+/// First-line operation sent by a GUI client over `\\.\pipe\RemoteViewSvc`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientOp {
+    /// Attach to running daemon worker (or start/reconfigure with `args`).
+    Attach(Vec<String>),
+    /// Legacy spawn op (starts/reconfigures with `args` and attaches).
+    Spawn(Vec<String>),
+    /// Explicitly stop the daemon's running worker.
+    StopSharing,
+}
+
+/// Parses + validates the first line from a pipe client.
+pub fn parse_client_op(line: &str) -> Result<ClientOp, String> {
+    let v: serde_json::Value = serde_json::from_str(line.trim()).map_err(|e| format!("bad op line: {e}"))?;
+    let op = v.get("op").and_then(|o| o.as_str()).ok_or("missing op field")?;
+    match op {
+        "stop_sharing" => Ok(ClientOp::StopSharing),
+        "attach" | "spawn" => {
+            let arr = v.get("args").and_then(|a| a.as_array()).ok_or("args must be an array")?;
+            let args: Vec<String> = arr
+                .iter()
+                .map(|x| x.as_str().map(str::to_string).ok_or("args must be strings"))
+                .collect::<Result<_, _>>()?;
+            let validated = validate_worker_args(&args)?;
+            if op == "attach" {
+                Ok(ClientOp::Attach(validated))
+            } else {
+                Ok(ClientOp::Spawn(validated))
+            }
+        }
+        _ => Err(format!("unsupported op: {op}")),
+    }
+}
+
 /// Parses + validates the first line from the client; returns the worker arguments.
 pub fn parse_spawn_line(line: &str) -> Result<Vec<String>, String> {
-    let v: serde_json::Value = serde_json::from_str(line.trim()).map_err(|e| format!("bad spawn line: {e}"))?;
-    if v.get("op").and_then(|o| o.as_str()) != Some("spawn") {
-        return Err("first line must be {\"op\":\"spawn\",\"args\":[...]}".into());
+    match parse_client_op(line)? {
+        ClientOp::Spawn(args) => Ok(args),
+        _ => Err("first line must be {\"op\":\"spawn\",\"args\":[...]}".into()),
     }
-    let arr = v.get("args").and_then(|a| a.as_array()).ok_or("spawn: args must be an array")?;
-    let args: Vec<String> = arr
-        .iter()
-        .map(|x| x.as_str().map(str::to_string).ok_or("spawn: args must be strings"))
-        .collect::<Result<_, _>>()?;
-    validate_worker_args(&args)
+}
+
+/// Machine-wide boot configuration persisted in `%ProgramData%\RemoteView\service_config.json`
+/// so `RemoteViewSvc` can launch the host worker autonomously at Windows boot (Winlogon)
+/// before any user signs in or opens the GUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceBootConfig {
+    /// Whether `RemoteViewSvc` automatically runs the host worker at boot/login.
+    pub enabled: bool,
+    /// Validated `rv-host` CLI flags to pass to `--host-worker`.
+    pub args: Vec<String>,
+}
+
+impl Default for ServiceBootConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            args: default_boot_args(),
+        }
+    }
+}
+
+/// Default plug-and-play USB virtual display arguments for boot-time Winlogon streaming.
+pub fn default_boot_args() -> Vec<String> {
+    [
+        "--usb",
+        "--fps",
+        "120",
+        "--quality",
+        "85",
+        "--codec",
+        "auto",
+        "--encoder",
+        "auto",
+        "--display",
+        "virtual",
+        "--json-status",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+impl ServiceBootConfig {
+    /// Loads and validates `service_config.json`, falling back to defaults if missing or corrupt.
+    pub fn load_from(path: &std::path::Path) -> Self {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return Self::default();
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return Self::default();
+        };
+        let enabled = v.get("enabled").and_then(|b| b.as_bool()).unwrap_or(true);
+        let parsed_args = v.get("args").and_then(|a| a.as_array()).and_then(|arr| {
+            arr.iter()
+                .map(|x| x.as_str().map(str::to_string))
+                .collect::<Option<Vec<String>>>()
+        });
+        let args = parsed_args
+            .and_then(|a| validate_worker_args(&a).ok())
+            .unwrap_or_else(default_boot_args);
+        Self { enabled, args }
+    }
+
+    /// Saves `service_config.json` (best effort).
+    pub fn save_to(&self, path: &std::path::Path) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let body = serde_json::to_string_pretty(&serde_json::json!({
+            "enabled": self.enabled,
+            "args": self.args,
+        }))
+        .map_err(io::Error::other)?;
+        std::fs::write(path, body)
+    }
+}
+
+/// Rolling cache of the running worker's latest JSON-line events (`status`, `devices`,
+/// `stats`, and recent `log` lines) so a GUI attaching mid-stream immediately displays
+/// live state without restarting the worker.
+#[derive(Debug, Default)]
+pub struct EventCache {
+    status: Option<Vec<u8>>,
+    devices: Option<Vec<u8>>,
+    stats: Option<Vec<u8>>,
+    logs: std::collections::VecDeque<Vec<u8>>,
+}
+
+impl EventCache {
+    const MAX_LOGS: usize = 40;
+
+    /// Records one complete `\n`-terminated stdout line from the worker.
+    pub fn record(&mut self, line: &[u8]) {
+        let Ok(s) = std::str::from_utf8(line) else { return };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(s.trim()) else { return };
+        match v.get("event").and_then(|e| e.as_str()) {
+            Some("status") => self.status = Some(line.to_vec()),
+            Some("devices") => self.devices = Some(line.to_vec()),
+            Some("stats") => self.stats = Some(line.to_vec()),
+            Some("log") => {
+                if self.logs.len() >= Self::MAX_LOGS {
+                    self.logs.pop_front();
+                }
+                self.logs.push_back(line.to_vec());
+            }
+            _ => {}
+        }
+    }
+
+    /// Returns cached state lines to replay to a newly attached GUI client.
+    pub fn snapshot(&self) -> Vec<Vec<u8>> {
+        let mut out = Vec::with_capacity(self.logs.len() + 3);
+        for l in &self.logs {
+            out.push(l.clone());
+        }
+        if let Some(d) = &self.devices {
+            out.push(d.clone());
+        }
+        if let Some(s) = &self.status {
+            out.push(s.clone());
+        }
+        if let Some(st) = &self.stats {
+            out.push(st.clone());
+        }
+        out
+    }
+
+    /// Clears cached events (e.g. when the worker is stopped or respawned).
+    pub fn clear(&mut self) {
+        self.status = None;
+        self.devices = None;
+        self.stats = None;
+        self.logs.clear();
+    }
 }
 
 /// Collects bytes from `rx` until the first `\n`. Returns the line (without the newline) and any
@@ -374,5 +552,43 @@ mod tests {
         drop(otx);
         assert!(pump(&mut mem, &orx, &itx, &AtomicBool::new(false)).is_ok());
         assert_eq!(&*written.lock().unwrap(), b"bye\n");
+    }
+
+    #[test]
+    fn client_ops_roundtrip() {
+        let a = attach_line(&v(&["--usb", "--fps", "120"]));
+        assert_eq!(
+            parse_client_op(&a).unwrap(),
+            ClientOp::Attach(v(&["--usb", "--fps", "120", "--json-status"]))
+        );
+        let s = stop_sharing_line();
+        assert_eq!(parse_client_op(&s).unwrap(), ClientOp::StopSharing);
+        assert!(parse_client_op("{\"op\":\"bogus\"}").is_err());
+    }
+
+    #[test]
+    fn boot_config_roundtrip_and_cache_snapshot() {
+        let p = std::env::temp_dir().join(format!("rv-svc-cfg-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let def = ServiceBootConfig::load_from(&p);
+        assert!(def.enabled);
+        assert!(def.args.contains(&"--usb".to_string()));
+        let custom = ServiceBootConfig {
+            enabled: false,
+            args: v(&["--usb", "--fps", "90", "--display", "virtual", "--json-status"]),
+        };
+        custom.save_to(&p).unwrap();
+        assert_eq!(ServiceBootConfig::load_from(&p), custom);
+        let _ = std::fs::remove_file(&p);
+
+        let mut cache = EventCache::default();
+        cache.record(b"{\"event\":\"log\",\"level\":\"info\",\"msg\":\"boot\"}\n");
+        cache.record(b"{\"event\":\"status\",\"state\":\"streaming\"}\n");
+        cache.record(b"{\"event\":\"stats\",\"fps\":120}\n");
+        let snap = cache.snapshot();
+        assert_eq!(snap.len(), 3);
+        assert!(String::from_utf8_lossy(&snap[0]).contains("boot"));
+        assert!(String::from_utf8_lossy(&snap[1]).contains("streaming"));
+        assert!(String::from_utf8_lossy(&snap[2]).contains("120"));
     }
 }

@@ -37,6 +37,7 @@ import com.remoteview.client.usb.DeviceName
 import com.remoteview.client.usb.DisplayCaps
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import java.util.concurrent.atomic.AtomicLong
 
 // UNBUILT: chưa biên dịch.
 
@@ -49,7 +50,8 @@ class SessionController(
     /** OTP tự động (accessory.serial); null = dùng PIN đã lưu trong cài đặt. */
     private val otp: String? = null,
 ) {
-    @Volatile var nativeHandle: Long = 0L
+    private val nativeHandleAtomic = AtomicLong(0L)
+    val nativeHandle: Long get() = nativeHandleAtomic.get()
     @Volatile var rttMs: Float = 0f
     @Volatile var bitrateKbps: Int = 0
     @Volatile var lossPercent: Float = 0f
@@ -76,6 +78,8 @@ class SessionController(
     var onLinkClosed: ((String?) -> Unit)? = null
     /** Lõi Rust báo phiên lỗi (sai PIN, host không trả lời...). Gọi từ thread nền. */
     var onNativeFailed: ((String?) -> Unit)? = null
+    /** Phiên đã bắt tay xong (STATE_ESTABLISHED). Gọi từ main thread. */
+    var onEstablished: (() -> Unit)? = null
 
     @Volatile private var established = false
     /** true khi đã bắt tay xong (có handle + state ESTABLISHED): dùng cho nút "Gửi log lên máy tính". */
@@ -164,8 +168,10 @@ class SessionController(
     }
 
     private val _reconnecting = MutableStateFlow(false)
-    /** true khi host im lặng (state 4): UI hiện lớp phủ "đang kết nối lại", không thoát phiên. */
+    /** true khi host im lặng (state 4) cho đến khi khung hình mới sau kết nối lại được giải mã: UI hiện lớp phủ "đang kết nối lại". */
     val reconnecting: StateFlow<Boolean> = _reconnecting
+    /** Chặn các khung cũ còn sót trong pipeline MediaCodec tắt nhãn "đang kết nối lại" trước khi khung mới sau reconnect tới. */
+    @Volatile private var reconnectFrameBarrier = false
 
     /** Cấu hình luồng do host báo (state 11). */
     private data class StreamConfig(val mime: String, val width: Int, val height: Int, val fps: Int)
@@ -205,7 +211,7 @@ class SessionController(
     @Volatile private var dbgLastError = ""
     @Volatile private var dbgEstablishedAt = 0L
     @Volatile private var dbgHandshake = "chưa mở liên kết"
-    private val dbgFramesSubmitted = java.util.concurrent.atomic.AtomicLong()
+    private val dbgFramesSubmitted = AtomicLong()
 
     fun debugSnapshot(): DebugSnapshot {
         val l = link
@@ -245,36 +251,73 @@ class SessionController(
         capture = PointerCaptureController(v, sink) { dx, dy -> onLocalCursorDelta(dx, dy) }.also { it.enable() }
     }
 
+    /** Đóng phiên native một lần duy nhất trên thread nền (không chặn UI thread). */
+    private fun disconnectNativeAsync() {
+        val h = nativeHandleAtomic.getAndSet(0L)
+        if (h != 0L && NativeBridge.available) {
+            Thread({
+                try {
+                    NativeBridge.nativeDisconnect(h)
+                } catch (t: Throwable) {
+                    RvLog.w("nativeDisconnect($h) lỗi", t)
+                }
+            }, "rv-native-disconnect").also { it.isDaemon = true; it.start() }
+        }
+    }
+
     /**
      * Gắn liên kết USB (AOA / ADB reverse): datagram vào -> Rust, Rust ra -> liên kết.
      * Khi liên kết mở, tạo phiên native với caps (độ phân giải gốc + tần số quét) trong Hello.
      */
     fun attachLink(l: DatagramLink) {
+        if (released) {
+            l.close()
+            return
+        }
         link = l
         RvLog.i("attachLink: ${l.name}, native=${NativeBridge.available}, otp=${if (otp != null) "tự động" else "PIN lưu"}")
-        // Gói Rust gửi ra phải được ghi vào liên kết NGAY từ khi phiên native tạo xong: đặt sender trước.
-        NativeBridge.datagramSender = { bytes ->
+        // Gói Rust gửi ra phải được ghi vào liên kết NGAY từ khi phiên native tạo xong: đặt sender trước và gắn chủ sở hữu.
+        NativeBridge.setDatagramSender(this) { bytes ->
+            if (released || !NativeBridge.isDatagramSenderOwner(this)) return@setDatagramSender
             val ok = l.send(bytes)
             if (!ok) RvLog.w("datagramSender: liên kết từ chối ${bytes.size}B")
         }
         l.listener = object : DatagramLink.Listener {
             override fun onOpen() {
+                if (released) {
+                    RvLog.i("liên kết ${l.name} mở sau khi phiên đã release -> bỏ qua")
+                    return
+                }
                 RvLog.i("liên kết ${l.name} đã mở -> tạo phiên native")
                 if (!NativeBridge.available) {
                     recordError("librv_core.so chưa nạp, không thể bắt tay")
                     dbgHandshake = "không có lõi native"
                     return
                 }
-                try {
-                    nativeHandle = NativeBridge.nativeConnectLink(helloJson)
+                val h = try {
+                    NativeBridge.nativeConnectLink(helloJson)
                 } catch (t: Throwable) {
+                    if (released) return
                     recordError("nativeConnectLink ném lỗi: ${t.javaClass.simpleName}: ${t.message}")
                     dbgHandshake = "lỗi native"
                     onNativeFailed?.invoke(t.message)
                     return
                 }
-                RvLog.i("nativeConnectLink -> handle=$nativeHandle")
-                if (nativeHandle == 0L) {
+                if (released) {
+                    RvLog.w("nativeConnectLink trả handle=$h sau khi phiên đã release -> hủy trên nền")
+                    if (h != 0L) {
+                        Thread({ runCatching { NativeBridge.nativeDisconnect(h) } }, "rv-native-disconnect")
+                            .also { it.isDaemon = true; it.start() }
+                    }
+                    return
+                }
+                nativeHandleAtomic.set(h)
+                if (released) {
+                    disconnectNativeAsync()
+                    return
+                }
+                RvLog.i("nativeConnectLink -> handle=$h")
+                if (h == 0L) {
                     recordError("nativeConnectLink trả 0 (hello/OTP không hợp lệ?)")
                     dbgHandshake = "native từ chối tạo phiên"
                     onNativeFailed?.invoke("lõi từ chối tạo phiên (OTP?)")
@@ -283,6 +326,7 @@ class SessionController(
                 }
             }
             override fun onDatagram(data: ByteArray) {
+                if (released) return
                 val h = nativeHandle
                 if (NativeBridge.available && h != 0L) {
                     try { NativeBridge.nativePushDatagram(h, data) } catch (t: Throwable) {
@@ -297,6 +341,7 @@ class SessionController(
                 }
             }
             override fun onClosed(reason: String?) {
+                if (released) return
                 RvLog.w("liên kết ${l.name} đóng: ${reason ?: "-"}")
                 if (reason != null) dbgLastError = reason
                 dbgHandshake = "liên kết đã đóng"
@@ -311,6 +356,7 @@ class SessionController(
      * Dùng [otp] đã truyền vào constructor (gửi trong [helloJson]).
      */
     fun connectLan(target: String) {
+        if (released) return
         lanTarget = target
         RvLog.i("connectLan: target=$target, native=${NativeBridge.available}, otp=${if (otp != null) "đã nhập" else "PIN lưu"}")
         if (!NativeBridge.available) {
@@ -324,12 +370,24 @@ class SessionController(
         val h = try {
             NativeBridge.nativeConnect(target, helloJson)
         } catch (t: Throwable) {
+            if (released) return
             recordError("nativeConnect ném lỗi: ${t.javaClass.simpleName}: ${t.message}")
             dbgHandshake = "lỗi native"
             onNativeFailed?.invoke(t.message ?: "lỗi nativeConnect")
             return
         }
-        nativeHandle = h
+        if (released) {
+            if (h != 0L) {
+                Thread({ runCatching { NativeBridge.nativeDisconnect(h) } }, "rv-native-disconnect")
+                    .also { it.isDaemon = true; it.start() }
+            }
+            return
+        }
+        nativeHandleAtomic.set(h)
+        if (released) {
+            disconnectNativeAsync()
+            return
+        }
         RvLog.i("nativeConnect($target) -> handle=$h")
         if (h == 0L) {
             recordError("nativeConnect trả 0 (địa chỉ hoặc PIN không hợp lệ?)")
@@ -397,7 +455,10 @@ class SessionController(
         val w = cfg?.width ?: dw
         val h = cfg?.height ?: dh
         val fps = cfg?.fps ?: effectiveFps
-        val keyFrame = { if (NativeBridge.available && nativeHandle != 0L) NativeBridge.nativeRequestKeyFrame(nativeHandle) }
+        val keyFrame = {
+            val handle = nativeHandle
+            if (NativeBridge.available && handle != 0L) NativeBridge.nativeRequestKeyFrame(handle)
+        }
         val dec = LowLatencyDecoder(
             w, h, fps,
             DecoderPolicy(settings.codec, settings.allowAv1, settings.hardwareDecode, forcedMime = cfg?.mime),
@@ -414,7 +475,12 @@ class SessionController(
             if (settings.directPresent) FramePresenter.Mode.DIRECT else FramePresenter.Mode.CHOREOGRAPHER,
             onIdleChanged = null,
         )
-        dec.onOutput = pres::onOutput
+        dec.onOutput = { index, ptsUs ->
+            if (established && _reconnecting.value && !reconnectFrameBarrier) {
+                _reconnecting.value = false
+            }
+            pres.onOutput(index, ptsUs)
+        }
         dec.onDecodeTiming = { decodeUs ->
             val handle = nativeHandle
             if (NativeBridge.available && handle != 0L) {
@@ -477,7 +543,7 @@ class SessionController(
      */
     fun onNativeState(state: Int, message: String?) {
         if (Looper.myLooper() == Looper.getMainLooper()) {
-            handleNativeState(state, message)
+            if (!released) handleNativeState(state, message)
         } else {
             mainHandler.post { if (!released) handleNativeState(state, message) }
         }
@@ -493,6 +559,12 @@ class SessionController(
             NativeBridge.STATE_FAILED -> { established = false; dbgHandshake = "thất bại"; dbgLastError = message ?: "native FAILED" }
             NativeBridge.STATE_DISCONNECTED -> { established = false; dbgHandshake = "host im lặng" }
             NativeBridge.STATE_ESTABLISHED -> {
+                if (_reconnecting.value) {
+                    // Nối lại: giữ lớp phủ "đang kết nối lại" qua ESTABLISHED tới khi khung hình mới giải mã xong.
+                    reconnectFrameBarrier = true
+                    presenter?.clear()
+                    decoder?.flush()
+                }
                 established = true
                 dbgHandshake = "đã bắt tay"
                 if (dbgEstablishedAt == 0L) dbgEstablishedAt = SystemClock.elapsedRealtime()
@@ -500,17 +572,16 @@ class SessionController(
         }
         when (state) {
             NativeBridge.STATE_FAILED -> onNativeFailed?.invoke(message)
-            NativeBridge.STATE_DISCONNECTED -> _reconnecting.value = true
+            NativeBridge.STATE_DISCONNECTED -> {
+                link?.clearWriteQueue()
+                reconnectFrameBarrier = true
+                _reconnecting.value = true
+            }
             NativeBridge.STATE_ESTABLISHED -> {
-                if (NativeBridge.available && nativeHandle != 0L) NativeBridge.nativeRequestKeyFrame(nativeHandle)
+                val h = nativeHandle
+                if (NativeBridge.available && h != 0L) NativeBridge.nativeRequestKeyFrame(h)
                 armConfigFallback()
-                val was = _reconnecting.value
-                _reconnecting.value = false
-                if (was) {
-                    // Nối lại: bỏ dữ liệu cũ, chờ keyframe tiếp theo.
-                    presenter?.clear()
-                    decoder?.flush()
-                }
+                onEstablished?.invoke()
             }
             NativeBridge.STATE_DISPLAY_CONFIG -> {
                 // Chỉ dùng làm tỉ lệ tạm khi chưa có StreamConfig.
@@ -553,6 +624,9 @@ class SessionController(
     fun submitFrame(data: ByteArray, ptsUs: Long, flags: Int) {
         dbgFramesSubmitted.incrementAndGet()
         val dec = decoder ?: return
+        if (established && reconnectFrameBarrier) {
+            reconnectFrameBarrier = false
+        }
         val mime = dec.info?.mime ?: "video/hevc"
         val key = (flags and NativeBridge.FLAG_KEYFRAME) != 0 || AnnexB.containsKeyFrame(data, mime)
         dec.submit(EncodedFrame(data, ptsUs, key, (flags and NativeBridge.FLAG_CONFIG) != 0))
@@ -585,7 +659,8 @@ class SessionController(
         audio?.stop(); audio = null
         link?.let { it.listener = null; it.close() }
         link = null
-        NativeBridge.datagramSender = null
+        NativeBridge.clearDatagramSender(this)
+        disconnectNativeAsync()
         capture?.disable(); capture = null
         view = null
     }

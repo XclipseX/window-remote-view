@@ -81,14 +81,42 @@ impl Drop for WorkerHandle {
     }
 }
 
-/// Start a session worker. Fails synchronously on a bad OTP / key generation.
-pub fn spawn<I, S>(io: I, mut sink: S, cfg: HelloConfig) -> Result<WorkerHandle, String>
+/// Start a session worker (default unreliable/LAN mode). Fails synchronously on
+/// a bad OTP / key generation.
+pub fn spawn<I, S>(io: I, sink: S, cfg: HelloConfig) -> Result<WorkerHandle, String>
+where
+    I: DatagramIo + Send + 'static,
+    S: EventSink + Send + 'static,
+{
+    spawn_with_reliability(io, sink, cfg, false)
+}
+
+/// Start a session worker configured for a reliable point-to-point link
+/// (USB AOA / ADB), enabling fast idle timeouts and `HS_STEP_RESET` recovery.
+pub fn spawn_reliable<I, S>(io: I, sink: S, cfg: HelloConfig) -> Result<WorkerHandle, String>
+where
+    I: DatagramIo + Send + 'static,
+    S: EventSink + Send + 'static,
+{
+    spawn_with_reliability(io, sink, cfg, true)
+}
+
+fn spawn_with_reliability<I, S>(
+    io: I,
+    mut sink: S,
+    cfg: HelloConfig,
+    reliable: bool,
+) -> Result<WorkerHandle, String>
 where
     I: DatagramIo + Send + 'static,
     S: EventSink + Send + 'static,
 {
     let kp = Keypair::generate().map_err(|e| e.to_string())?;
-    let client = ClientSession::new(io, kp, &cfg.otp, USB_HOST_ID).map_err(|e| format!("invalid PIN: {e}"))?;
+    let mut client =
+        ClientSession::new(io, kp, &cfg.otp, USB_HOST_ID).map_err(|e| format!("invalid PIN: {e}"))?;
+    if reliable {
+        client.set_reliable(true);
+    }
     let (tx, rx) = mpsc::channel();
     let decode_us = Arc::new(AtomicU32::new(0));
     let decode_us_worker = Arc::clone(&decode_us);
@@ -121,9 +149,10 @@ fn handle_cmd<I: DatagramIo>(
         Command::Datagram(d) => {
             st.rx_bytes += d.len() as u64;
             let was_established = client.is_established();
+            let is_hs = d.first() == Some(&rv_session::HS_MAGIC);
             if let Err(e) = client.handle_datagram(&d) {
                 log::debug!("datagram dropped: {e}");
-            } else if was_established {
+            } else if was_established && client.is_established() && !is_hs {
                 st.heard_since_established = true;
             }
         }
@@ -252,6 +281,7 @@ fn run<I: DatagramIo, S: EventSink>(
                     // Host vanished/restarted: go back to handshaking (retried by the tick below).
                     established_at = None;
                     st.heard_since_established = false;
+                    st.upload.clear();
                     failed = false;
                     last_start = Instant::now();
                     let _ = client.start();
@@ -309,18 +339,24 @@ fn run<I: DatagramIo, S: EventSink>(
         }
     }
 
-    // Shutdown must not cut a log upload short: flush what is still queued (bounded wait, lightly paced).
-    let deadline = Instant::now() + LOG_FLUSH_ON_SHUTDOWN;
-    while !st.upload.is_empty() && Instant::now() < deadline {
-        for _ in 0..LOG_CHUNKS_PER_PASS {
-            let Some(c) = st.upload.pop_front() else { break };
-            if let Err(e) = client.send_control(c) {
-                log::warn!("log flush aborted: {e}");
-                st.upload.clear();
-                break;
+    // Shutdown must not cut an active log upload short: flush what is still
+    // queued (bounded wait, lightly paced), but skip immediately when nothing
+    // is queued or the session is disconnected.
+    if !st.upload.is_empty() && client.is_established() {
+        let deadline = Instant::now() + LOG_FLUSH_ON_SHUTDOWN;
+        while !st.upload.is_empty() && client.is_established() && Instant::now() < deadline {
+            for _ in 0..LOG_CHUNKS_PER_PASS {
+                let Some(c) = st.upload.pop_front() else { break };
+                if let Err(e) = client.send_control(c) {
+                    log::warn!("log flush aborted: {e}");
+                    st.upload.clear();
+                    break;
+                }
+            }
+            if !st.upload.is_empty() {
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
-        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -632,6 +668,80 @@ mod tests {
         assert!(
             stats.iter().any(|&(rtt_ms, kbps, _loss)| rtt_ms >= 5.0 && kbps > 0),
             "expected sink.stats to receive real RTT and kbps, got {stats:?}"
+        );
+    }
+
+    #[test]
+    fn reliable_worker_reconnects_immediately_on_host_reset_hint() {
+        let (to_host, to_client) = (queue(), queue());
+        let mut host = HostSession::new(
+            MemIo::new(to_client.clone(), 0.0, 1),
+            Keypair::generate().unwrap(),
+            "654321",
+            USB_HOST_ID,
+        )
+        .unwrap();
+        host.set_reliable(true);
+
+        let rec = Rec::default();
+        let mut w = spawn_reliable(MemIo::new(to_host.clone(), 0.0, 2), rec.clone(), cfg("654321")).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !host.is_established() {
+            for d in drain(&to_host) {
+                let _ = host.handle_datagram(&d);
+            }
+            for d in drain(&to_client) {
+                w.send(Command::Datagram(d));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(host.is_established(), "initial reliable handshake failed");
+
+        // Replace host with a fresh idle reliable host (simulating host restart on USB).
+        let mut host2 = HostSession::new(
+            MemIo::new(to_client.clone(), 0.0, 3),
+            Keypair::generate().unwrap(),
+            "654321",
+            USB_HOST_ID,
+        )
+        .unwrap();
+        host2.set_reliable(true);
+
+        let start = Instant::now();
+        // Trigger stale encrypted traffic from client -> host2 replies HS_STEP_RESET -> instant reconnect.
+        w.send(Command::Input(UiInput::Sas));
+        let reconnect_deadline = start + Duration::from_secs(2);
+        while Instant::now() < reconnect_deadline && !host2.is_established() {
+            for d in drain(&to_host) {
+                let _ = host2.handle_datagram(&d);
+            }
+            for d in drain(&to_client) {
+                w.send(Command::Datagram(d));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            host2.is_established(),
+            "reliable worker failed to recover via HS_STEP_RESET within 2s"
+        );
+        w.shutdown();
+    }
+
+    #[test]
+    fn shutdown_does_not_stall_when_disconnected_with_queued_log() {
+        let rec = Rec::default();
+        let mut w = spawn_reliable(MemIo::new(queue(), 0.0, 1), rec, cfg("654321")).unwrap();
+        w.send(Command::UploadLog {
+            name: "big.log".into(),
+            data: vec![b'x'; 256 * 1024],
+        });
+        let t0 = Instant::now();
+        w.shutdown();
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "disconnected shutdown stalled for {:?}",
+            t0.elapsed()
         );
     }
 }

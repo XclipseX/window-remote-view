@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rv_crypto::{derive_psk, AttemptLimiter, HandshakeKind, Keypair, Psk, Responder};
 use rv_proto::{codec_flags, AudioPacket, ControlMessage, InputEvent, Packet, VideoPacket};
@@ -7,9 +7,13 @@ use rv_transport::fec;
 
 use crate::channel::{random_session_id, Channel};
 use crate::{
-    hs_packet, hs_parse, DatagramIo, Result, SessionError, HANDSHAKE_MIN_INTERVAL, IDLE_TIMEOUT,
-    KEEPALIVE_INTERVAL, PEER_UNKNOWN, PROLOGUE,
+    hs_packet, hs_parse, DatagramIo, Result, SessionError, HANDSHAKE_MIN_INTERVAL, HS_STEP_RESET,
+    IDLE_TIMEOUT, KEEPALIVE_INTERVAL, PEER_UNKNOWN, PROLOGUE, USB_HANDSHAKE_MIN_INTERVAL,
+    USB_IDLE_TIMEOUT,
 };
+
+/// Minimum interval between host-to-client reset hints on reliable links.
+const RESET_HINT_MIN_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostEvent {
@@ -63,6 +67,7 @@ pub struct HostSession<I: DatagramIo> {
     keypair: Keypair,
     psk: Psk,
     session_id: u32,
+    reliable: bool,
     state: State,
     pending: Option<Pending>,
     events: VecDeque<HostSessionEvent>,
@@ -70,6 +75,7 @@ pub struct HostSession<I: DatagramIo> {
     codec: u8,
     epoch: Instant,
     last_msg1: Option<Instant>,
+    last_reset_hint: Option<Instant>,
     limiter: AttemptLimiter<u64>,
     last_rx: Instant,
     last_tx: Instant,
@@ -85,6 +91,7 @@ impl<I: DatagramIo> HostSession<I> {
             keypair,
             psk: derive_psk(otp, host_id)?,
             session_id: random_session_id()?,
+            reliable: false,
             state: State::Idle,
             pending: None,
             events: VecDeque::new(),
@@ -92,10 +99,19 @@ impl<I: DatagramIo> HostSession<I> {
             codec: codec_flags::CODEC_H265,
             epoch: now,
             last_msg1: None,
+            last_reset_hint: None,
             limiter: AttemptLimiter::default(),
             last_rx: now,
             last_tx: now,
         })
+    }
+
+    /// Mark whether this session runs over a reliable point-to-point link
+    /// (e.g. USB AOA / ADB) rather than untrusted LAN UDP. Enables fast
+    /// [`USB_IDLE_TIMEOUT`], [`USB_HANDSHAKE_MIN_INTERVAL`], and host-to-client
+    /// [`HS_STEP_RESET`] hints when stale encrypted data arrives while idle.
+    pub fn set_reliable(&mut self, reliable: bool) {
+        self.reliable = reliable;
     }
 
     pub fn session_id(&self) -> u32 {
@@ -156,6 +172,14 @@ impl<I: DatagramIo> HostSession<I> {
             return self.handle_handshake(peer, data, now);
         }
         let State::Established(ch) = &mut self.state else {
+            if self.reliable
+                && self
+                    .last_reset_hint
+                    .is_none_or(|t| now.saturating_duration_since(t) >= RESET_HINT_MIN_INTERVAL)
+            {
+                self.io.send(&hs_packet(HS_STEP_RESET, 0, &[]));
+                self.last_reset_hint = Some(now);
+            }
             return Err(SessionError::NotEstablished);
         };
         let pkt = ch.open(data)?;
@@ -187,10 +211,16 @@ impl<I: DatagramIo> HostSession<I> {
 
     /// Drive timers; call every ~100 ms. Sends keepalives while established and
     /// emits [`HostEvent::Disconnected`] (returning to the waiting state, ready
-    /// for a new handshake) after [`IDLE_TIMEOUT`] without an authenticated packet.
+    /// for a new handshake) after [`IDLE_TIMEOUT`] (or [`USB_IDLE_TIMEOUT`] on
+    /// reliable links) without an authenticated packet.
     pub fn tick(&mut self, now: Instant) {
         if self.is_established() {
-            if now.saturating_duration_since(self.last_rx) >= IDLE_TIMEOUT {
+            let idle_timeout = if self.reliable {
+                USB_IDLE_TIMEOUT
+            } else {
+                IDLE_TIMEOUT
+            };
+            if now.saturating_duration_since(self.last_rx) >= idle_timeout {
                 self.state = State::Idle;
                 self.events.push_back(HostSessionEvent::Disconnected);
             } else if now.saturating_duration_since(self.last_tx) >= KEEPALIVE_INTERVAL {
@@ -207,8 +237,13 @@ impl<I: DatagramIo> HostSession<I> {
         let (step, sid, msg) = hs_parse(data)?;
         match step {
             1 => {
+                let min_interval = if self.reliable {
+                    USB_HANDSHAKE_MIN_INTERVAL
+                } else {
+                    HANDSHAKE_MIN_INTERVAL
+                };
                 if let Some(t) = self.last_msg1 {
-                    if now.saturating_duration_since(t) < HANDSHAKE_MIN_INTERVAL {
+                    if now.saturating_duration_since(t) < min_interval {
                         return Err(SessionError::RateLimited);
                     }
                 }
@@ -260,6 +295,7 @@ impl<I: DatagramIo> HostSession<I> {
                 }
                 self.session_id = p.session_id;
                 self.state = State::Established(Box::new(Channel::new(session, p.session_id)));
+                self.last_reset_hint = None;
                 self.last_rx = now;
                 self.last_tx = now;
                 self.events

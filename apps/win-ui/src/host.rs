@@ -48,11 +48,12 @@ type CmdWriter = Box<dyn Write + Send>;
 pub struct HostProcess {
     stdin: Arc<Mutex<Option<CmdWriter>>>,
     stop: Arc<AtomicBool>,
+    detach_only: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl HostProcess {
-    /// Starts a supervisor thread that runs and restarts the host until `stop()`.
+    /// Starts a supervisor thread that runs and restarts the host until `stop()` or `detach()`.
     pub fn start(
         exe: PathBuf,
         args: Vec<String>,
@@ -61,10 +62,11 @@ impl HostProcess {
     ) -> Self {
         let stdin = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
-        let (s2, st2) = (stdin.clone(), stop.clone());
+        let detach_only = Arc::new(AtomicBool::new(false));
+        let (s2, st2, dt2) = (stdin.clone(), stop.clone(), detach_only.clone());
         let repaint = Arc::new(repaint);
-        let thread = thread::spawn(move || supervise(exe, args, tx, s2, st2, repaint));
-        Self { stdin, stop, thread: Some(thread) }
+        let thread = thread::spawn(move || supervise(exe, args, tx, s2, st2, dt2, repaint));
+        Self { stdin, stop, detach_only, thread: Some(thread) }
     }
 
     pub fn send(&self, cmd: &HostCmd) {
@@ -78,16 +80,27 @@ impl HostProcess {
 
     /// Graceful stop (sends `stop`, kills after a grace period). Non-blocking.
     pub fn stop(&self) {
+        self.detach_only.store(false, Ordering::SeqCst);
         self.stop.store(true, Ordering::SeqCst);
         self.send(&HostCmd::Stop);
+    }
+
+    /// Detaches from the always-on `RemoteViewSvc` pipe WITHOUT stopping the daemon worker
+    /// (closing the GUI window keeps the tablet display alive). For a non-service child process
+    /// this still stops the child cleanly.
+    pub fn detach(&self) {
+        self.detach_only.store(true, Ordering::SeqCst);
+        self.stop.store(true, Ordering::SeqCst);
     }
 }
 
 impl Drop for HostProcess {
     fn drop(&mut self) {
-        self.stop();
+        if !self.detach_only.load(Ordering::SeqCst) {
+            self.stop();
+        }
         if let Some(t) = self.thread.take() {
-            let _ = t.join(); // supervisor kills the child after ~2 s at most
+            let _ = t.join(); // supervisor detaches immediately or kills child after ~2 s
         }
     }
 }
@@ -130,7 +143,7 @@ impl LinkEnd {
         }
     }
 
-    /// Hard stop after the grace period (the service stops its worker when the pipe closes).
+    /// Hard stop after the grace period (or immediate pipe close on detach).
     fn kill(&mut self) -> Option<i32> {
         match self {
             LinkEnd::Child { child, .. } => {
@@ -154,24 +167,34 @@ fn is_self_worker(args: &[String]) -> bool {
     args.first().map(String::as_str) == Some(WORKER_FLAG)
 }
 
-/// Connects to the RemoteView service (lock-screen capable, runs the engine as SYSTEM).
-/// `None` when the service is not installed / not reachable.
-fn connect_service(worker_args: &[String]) -> Option<Link> {
+enum ServiceAttempt {
+    Connected(Link),
+    NotInstalled,
+    TemporarilyUnavailable,
+}
+
+/// Connects to the always-on RemoteView service (lock-screen capable, runs the engine as SYSTEM).
+fn connect_service(worker_args: &[String]) -> ServiceAttempt {
     let mut c = match crate::service::connect() {
         Ok(c) => c,
         Err(e) => {
-            if e.kind() != std::io::ErrorKind::NotFound && e.kind() != std::io::ErrorKind::Unsupported {
-                rv_host_win::logfile::write_line("warn", &format!("host: service pipe unusable ({e}); using a child process"));
+            if e.kind() == std::io::ErrorKind::NotFound || e.kind() == std::io::ErrorKind::Unsupported {
+                return if crate::service::service_installed() {
+                    ServiceAttempt::TemporarilyUnavailable
+                } else {
+                    ServiceAttempt::NotInstalled
+                };
             }
-            return None;
+            rv_host_win::logfile::write_line("warn", &format!("host: service pipe busy/unusable ({e})"));
+            return ServiceAttempt::TemporarilyUnavailable;
         }
     };
-    let line = rv_host_win::service_proto::spawn_line(worker_args);
+    let line = rv_host_win::service_proto::attach_line(worker_args);
     if c.writer.write_all(line.as_bytes()).is_err() {
         c.close.store(true, Ordering::SeqCst);
-        return None;
+        return ServiceAttempt::TemporarilyUnavailable;
     }
-    Some(Link {
+    ServiceAttempt::Connected(Link {
         stdout: Box::new(c.reader),
         stderr: None,
         stdin: Box::new(c.writer),
@@ -179,12 +202,25 @@ fn connect_service(worker_args: &[String]) -> Option<Link> {
     })
 }
 
-/// Starts the engine: through the service when this is the self-worker and the service answers,
-/// otherwise as a child process. Returns the link and a log line naming the transport.
-fn open_link(exe: &PathBuf, args: &[String], allow_service: bool) -> std::io::Result<(Link, &'static str)> {
+/// Starts the engine: attaches to the always-on service when installed, retrying briefly if
+/// the service is restarting so we never spawn a conflicting non-SYSTEM child process.
+fn open_link(exe: &PathBuf, args: &[String], allow_service: bool, stop: &AtomicBool) -> std::io::Result<(Link, &'static str)> {
     if allow_service && is_self_worker(args) {
-        if let Some(l) = connect_service(&args[1..]) {
-            return Ok((l, "host: dịch vụ RemoteView (SYSTEM) qua pipe — hiển thị được cả màn hình khóa"));
+        for attempt in 0..8 {
+            match connect_service(&args[1..]) {
+                ServiceAttempt::Connected(l) => {
+                    return Ok((l, "host: dịch vụ RemoteView (SYSTEM) qua pipe — chạy ngay từ màn hình khóa"));
+                }
+                ServiceAttempt::NotInstalled => break,
+                ServiceAttempt::TemporarilyUnavailable => {
+                    if stop.load(Ordering::SeqCst) {
+                        return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "stopped"));
+                    }
+                    if attempt < 7 {
+                        thread::sleep(Duration::from_millis(500));
+                    }
+                }
+            }
         }
     }
     let mut child = spawn_child(exe, args)?;
@@ -207,6 +243,7 @@ fn supervise(
     tx: Sender<UiMsg>,
     stdin_slot: Arc<Mutex<Option<CmdWriter>>>,
     stop: Arc<AtomicBool>,
+    detach_only: Arc<AtomicBool>,
     repaint: Arc<dyn Fn() + Send + Sync>,
 ) {
     let send = |m: UiMsg| {
@@ -220,9 +257,13 @@ fn supervise(
     let mut allow_service = true;
     while !stop.load(Ordering::SeqCst) {
         let started = Instant::now();
-        let (mut link, transport) = match open_link(&exe, &args, allow_service) {
+        let (mut link, transport) = match open_link(&exe, &args, allow_service, &stop) {
             Ok(l) => l,
             Err(e) => {
+                if stop.load(Ordering::SeqCst) {
+                    send(UiMsg::Stopped);
+                    return;
+                }
                 send(UiMsg::SpawnFailed(format!("{}: {e}", exe.display())));
                 // Missing executable will not fix itself: do not loop.
                 return;
@@ -269,8 +310,28 @@ fn supervise(
                 break code;
             }
             if stop.load(Ordering::SeqCst) {
+                if detach_only.load(Ordering::SeqCst) && matches!(link.end, LinkEnd::Pipe { .. }) {
+                    // Close the pipe immediately without sending `stop` so the service worker keeps streaming.
+                    break link.end.kill();
+                }
+                if detach_only.load(Ordering::SeqCst) && matches!(link.end, LinkEnd::Child { .. }) {
+                    // Non-service child process: still send stop cleanly on GUI exit.
+                    if stop_at.is_none() {
+                        if let Ok(mut g) = stdin_slot.lock() {
+                            if let Some(w) = g.as_mut() {
+                                let _ = w.write_all(HostCmd::Stop.to_line().as_bytes());
+                                let _ = w.flush();
+                            }
+                        }
+                    }
+                }
                 let t = *stop_at.get_or_insert_with(Instant::now);
-                if t.elapsed() > Duration::from_secs(2) {
+                let grace = if matches!(link.end, LinkEnd::Pipe { .. }) {
+                    Duration::from_secs(4)
+                } else {
+                    Duration::from_secs(2)
+                };
+                if t.elapsed() > grace {
                     break link.end.kill();
                 }
             }

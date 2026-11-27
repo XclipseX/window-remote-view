@@ -344,7 +344,7 @@ pub extern "system" fn Java_com_remoteview_client_NativeBridge_nativeConnectLink
         Ok(s) => s.into(),
         Err(_) => return 0,
     };
-    let result = HelloConfig::parse(&json).and_then(|cfg| worker::spawn(JniIo(cache), JniSink(cache), cfg));
+    let result = HelloConfig::parse(&json).and_then(|cfg| worker::spawn_reliable(JniIo(cache), JniSink(cache), cfg));
     match result {
         Ok(worker) => register_session(SessionEntry { worker, udp_recv: None }),
         Err(e) => {

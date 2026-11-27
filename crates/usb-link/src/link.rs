@@ -67,12 +67,13 @@ impl LinkStats {
 /// underlying stream is reliable and ordered, FEC parity is wasted airtime
 /// here; that tuning is left to the session layer (`set_loss(0.0)`).
 pub struct UsbDatagramLink {
-    wtx: SyncSender<Vec<u8>>,
+    wtx: Option<SyncSender<Vec<u8>>>,
     rx: Receiver<Vec<u8>>,
+    stop: Arc<AtomicBool>,
     broken: Arc<AtomicBool>,
     stats: Arc<LinkStats>,
-    _reader: JoinHandle<()>,
-    _writer: JoinHandle<()>,
+    _reader: Option<JoinHandle<()>>,
+    _writer: Option<JoinHandle<()>>,
 }
 
 impl UsbDatagramLink {
@@ -94,14 +95,19 @@ impl UsbDatagramLink {
     {
         let mut writer = writer;
         let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(LinkStats::default());
         let st = stats.clone();
+        let stop_r = stop.clone();
         let handle = std::thread::Builder::new()
             .name("rv-usb-read".into())
             .spawn(move || {
                 let mut dec = RecordDecoder::new();
                 let mut buf = vec![0u8; READ_BUF];
                 loop {
+                    if stop_r.load(Ordering::Acquire) {
+                        return;
+                    }
                     match reader.read(&mut buf) {
                         Ok(0) => {
                             st.set_err("read: end of stream".into());
@@ -138,7 +144,12 @@ impl UsbDatagramLink {
                         Err(e) => match e.kind() {
                             std::io::ErrorKind::TimedOut
                             | std::io::ErrorKind::WouldBlock
-                            | std::io::ErrorKind::Interrupted => continue,
+                            | std::io::ErrorKind::Interrupted => {
+                                if stop_r.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                continue;
+                            }
                             _ => {
                                 st.set_err(format!("read: {e}"));
                                 return;
@@ -150,13 +161,16 @@ impl UsbDatagramLink {
             .expect("spawn reader thread");
         let (wtx, wrx) = mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE);
         let broken = Arc::new(AtomicBool::new(false));
-        let (st, br) = (stats.clone(), broken.clone());
+        let (st, br, stop_w) = (stats.clone(), broken.clone(), stop.clone());
         let whandle = std::thread::Builder::new()
             .name("rv-usb-write".into())
             .spawn(move || {
                 let mut batch: Vec<u8> = Vec::with_capacity(WRITE_BATCH + crate::framing::MAX_RECORD + 8);
                 let mut pending: Option<Vec<u8>> = None;
                 loop {
+                    if stop_w.load(Ordering::Acquire) {
+                        return;
+                    }
                     let first = match pending.take() {
                         Some(r) => r,
                         None => match wrx.recv() {
@@ -164,6 +178,9 @@ impl UsbDatagramLink {
                             Err(_) => break,
                         },
                     };
+                    if stop_w.load(Ordering::Acquire) {
+                        return;
+                    }
                     batch.clear();
                     batch.extend_from_slice(&first);
                     let mut recs = 1u64;
@@ -184,7 +201,7 @@ impl UsbDatagramLink {
                     // Avoid USB 2.0 (512B) / USB 3.x (1024B) short-packet stall in Android
                     // `f_accessory.c`: if a transfer is an exact multiple of 512 bytes, append a
                     // 4-byte zero-length pad record so `acc_read()` wakes up immediately.
-                    if pad_usb_short_packet && !batch.is_empty() && batch.len() % 512 == 0 {
+                    if pad_usb_short_packet && !batch.is_empty() && batch.len().is_multiple_of(512) {
                         batch.extend_from_slice(&[0u8; 4]);
                     }
                     if let Err(e) = writer.write_all(&batch).and_then(|_| writer.flush()) {
@@ -199,12 +216,13 @@ impl UsbDatagramLink {
             })
             .expect("spawn writer thread");
         Self {
-            wtx,
+            wtx: Some(wtx),
             rx,
+            stop,
             broken,
             stats,
-            _reader: handle,
-            _writer: whandle,
+            _reader: Some(handle),
+            _writer: Some(whandle),
         }
     }
 
@@ -216,6 +234,8 @@ impl UsbDatagramLink {
     /// TCP link (ADB reverse fallback or LAN-over-TCP).
     pub fn from_tcp(stream: std::net::TcpStream) -> Result<Self> {
         stream.set_nodelay(true)?;
+        // Short read timeout so `Drop` joins `rv-usb-read` promptly even if the peer stays open.
+        stream.set_read_timeout(Some(Duration::from_millis(150)))?;
         let r = stream.try_clone()?;
         Ok(Self::from_stream(r, stream))
     }
@@ -242,8 +262,13 @@ impl UsbDatagramLink {
         }
         let mut rec = Vec::new();
         encode_record(dg, &mut rec)?;
-        self.wtx
-            .send(rec)
+        let Some(wtx) = self.wtx.as_ref() else {
+            return Err(LinkError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "writer stopped",
+            )));
+        };
+        wtx.send(rec)
             .map_err(|_| LinkError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer stopped")))
     }
 
@@ -266,6 +291,22 @@ impl UsbDatagramLink {
     /// True after a write failed (cable pulled, tablet app closed).
     pub fn is_broken(&self) -> bool {
         self.broken.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for UsbDatagramLink {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        // Dropping the sender wakes `wrx.recv()` so `rv-usb-write` exits promptly.
+        drop(self.wtx.take());
+        // Join both threads so `AoaDevice`'s `Release::drop()` has released the
+        // WinUSB handle before any reconnect attempts `AoaDevice::connect()`.
+        if let Some(h) = self._reader.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self._writer.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -401,5 +442,53 @@ mod tests {
         );
         assert_eq!(r.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(), payload);
         assert_eq!(r.recv_timeout(Duration::from_millis(80)).unwrap(), None);
+    }
+
+    #[test]
+    fn drop_stops_and_joins_reader_on_timeout() {
+        struct DropTrackerReader {
+            dropped: Arc<AtomicBool>,
+            reads: Arc<AtomicU64>,
+        }
+        impl Read for DropTrackerReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(20));
+                Err(std::io::ErrorKind::TimedOut.into())
+            }
+        }
+        impl Drop for DropTrackerReader {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::Release);
+            }
+        }
+
+        let reader_dropped = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(AtomicU64::new(0));
+        let link = UsbDatagramLink::from_stream(
+            DropTrackerReader {
+                dropped: reader_dropped.clone(),
+                reads: reads.clone(),
+            },
+            std::io::sink(),
+        );
+        let wait_start = std::time::Instant::now();
+        while reads.load(Ordering::Relaxed) == 0 && wait_start.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(reads.load(Ordering::Relaxed) > 0, "reader thread did not start");
+
+        let t0 = std::time::Instant::now();
+        drop(link);
+        let elapsed = t0.elapsed();
+
+        assert!(
+            reader_dropped.load(Ordering::Acquire),
+            "reader was not dropped before UsbDatagramLink::drop returned"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "UsbDatagramLink::drop took too long: {elapsed:?}"
+        );
     }
 }

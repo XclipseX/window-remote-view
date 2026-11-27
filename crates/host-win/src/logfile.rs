@@ -101,6 +101,20 @@ pub fn logs_dir() -> PathBuf {
     base.join("RemoteView").join("logs")
 }
 
+/// Machine-shared log directory (`%PROGRAMDATA%\RemoteView\logs`) on Windows so
+/// `RemoteViewSvc` (LocalSystem) writes logs readable/exportable by normal users.
+/// Returns `None` on non-Windows platforms.
+pub fn shared_logs_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        crate::control::shared_data_dir().map(|d| d.join("logs"))
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 fn is_log_of(name: &str, prefix: &str) -> bool {
     name.strip_prefix(prefix)
         .and_then(|rest| rest.strip_prefix('-'))
@@ -148,13 +162,12 @@ fn rotate_android(dir: &Path, keep: usize) {
     }
 }
 
-/// Creates `remoteview-<date-time>.log` (after rotating old ones) and routes
-/// [`write_line`] to it. Returns the path, or `None` when no log directory is
-/// writable (logging then silently stays on stderr / the GUI).
-pub fn init(prefix: &str) -> Option<PathBuf> {
-    let dir = logs_dir();
-    fs::create_dir_all(&dir).ok()?;
-    rotate(&dir, prefix, KEEP.saturating_sub(1));
+/// Creates `<prefix>-<date-time>.log` inside `dir` (after rotating old ones)
+/// and routes [`write_line`] to it. Returns the path, or `None` when `dir` is
+/// not writable (logging then silently stays on stderr / the GUI).
+pub fn init_in(dir: &Path, prefix: &str) -> Option<PathBuf> {
+    fs::create_dir_all(dir).ok()?;
+    rotate(dir, prefix, KEEP.saturating_sub(1));
     let mut path = dir.join(format!("{prefix}-{}.log", now().file_stamp()));
     let mut n = 1;
     while path.exists() {
@@ -164,6 +177,13 @@ pub fn init(prefix: &str) -> Option<PathBuf> {
     let file = OpenOptions::new().create(true).append(true).open(&path).ok()?;
     *CURRENT.lock().ok()? = Some((path.clone(), file));
     Some(path)
+}
+
+/// Creates `remoteview-<date-time>.log` (after rotating old ones) and routes
+/// [`write_line`] to it. Returns the path, or `None` when no log directory is
+/// writable (logging then silently stays on stderr / the GUI).
+pub fn init(prefix: &str) -> Option<PathBuf> {
+    init_in(&logs_dir(), prefix)
 }
 
 /// Path of the log file opened by [`init`].

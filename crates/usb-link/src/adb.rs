@@ -11,8 +11,15 @@ use std::time::{Duration, Instant};
 use crate::{LinkError, Result, UsbDatagramLink, ADB_PORT};
 
 fn run_adb(args: &[&str]) -> Result<String> {
-    let out = Command::new("adb")
-        .args(args)
+    let mut cmd = Command::new("adb");
+    cmd.args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: prevent console window flash when polling/probing adb.
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd
         .output()
         .map_err(|e| LinkError::Adb(format!("cannot run adb: {e}")))?;
     if !out.status.success() {

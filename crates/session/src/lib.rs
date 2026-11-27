@@ -39,12 +39,16 @@ pub const USB_HOST_ID: &[u8] = b"rv-host-win-0001";
 
 /// Silence (no authenticated packet) after which a session is declared dead.
 pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Silence (no authenticated packet) after which a reliable (USB) session is declared dead.
+pub const USB_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2500);
 /// Send a `Keepalive` when nothing else was sent for this long (from `tick`).
 pub const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// Send a `Ping` RTT probe at this cadence while established (from `ClientSession::tick`).
 pub const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// Host accepts at most one new handshake (msg1) per this interval.
 pub const HANDSHAKE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// Host accepts at most one new handshake (msg1) per this interval on reliable (USB) links.
+pub const USB_HANDSHAKE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 /// Peer key used by [`HostSession::handle_datagram`] when the caller has no address.
 pub const PEER_UNKNOWN: u64 = 0;
 
@@ -58,6 +62,9 @@ pub fn peer_key(addr: &std::net::SocketAddr) -> u64 {
 
 /// First byte of every handshake datagram (data packets start with 0x1X).
 pub const HS_MAGIC: u8 = 0xA5;
+/// Host -> client reset hint on reliable (USB) links when the host is `Idle`
+/// and receives encrypted data from a client holding a stale session.
+pub const HS_STEP_RESET: u8 = 0xFF;
 pub(crate) const HS_HEADER_LEN: usize = 6;
 pub(crate) const PROLOGUE: &[u8] = b"rv-session-v1";
 
@@ -72,13 +79,18 @@ pub(crate) fn hs_packet(step: u8, session_id: u32, msg: &[u8]) -> Vec<u8> {
 
 /// Returns (step, session_id, noise message).
 pub(crate) fn hs_parse(d: &[u8]) -> Result<(u8, u32, &[u8])> {
-    if d.len() <= HS_HEADER_LEN || d[0] != HS_MAGIC {
+    if d.len() < HS_HEADER_LEN || d[0] != HS_MAGIC {
+        return Err(SessionError::Malformed);
+    }
+    let step = d[1];
+    let payload = &d[HS_HEADER_LEN..];
+    if payload.is_empty() && step != HS_STEP_RESET {
         return Err(SessionError::Malformed);
     }
     Ok((
-        d[1],
+        step,
         u32::from_be_bytes([d[2], d[3], d[4], d[5]]),
-        &d[HS_HEADER_LEN..],
+        payload,
     ))
 }
 

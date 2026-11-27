@@ -7,8 +7,8 @@ use rv_transport::fec::{FrameReassembler, Shard};
 
 use crate::channel::Channel;
 use crate::{
-    hs_packet, hs_parse, DatagramIo, Result, SessionError, IDLE_TIMEOUT, KEEPALIVE_INTERVAL,
-    PING_INTERVAL, PROLOGUE,
+    hs_packet, hs_parse, DatagramIo, Result, SessionError, HS_STEP_RESET, IDLE_TIMEOUT,
+    KEEPALIVE_INTERVAL, PING_INTERVAL, PROLOGUE, USB_IDLE_TIMEOUT,
 };
 
 /// Ignore RTT samples larger than 10 seconds as outliers.
@@ -41,7 +41,10 @@ pub enum ClientEvent {
 
 enum State {
     Idle,
-    WaitMsg2(Box<Initiator>),
+    WaitMsg2 {
+        initiator: Box<Initiator>,
+        m1: Vec<u8>,
+    },
     Established(Box<Channel>),
 }
 
@@ -50,6 +53,7 @@ pub struct ClientSession<I: DatagramIo> {
     io: I,
     keypair: Keypair,
     psk: Psk,
+    reliable: bool,
     state: State,
     events: VecDeque<ClientEvent>,
     reasm: FrameReassembler,
@@ -70,6 +74,7 @@ impl<I: DatagramIo> ClientSession<I> {
             io,
             keypair,
             psk: derive_psk(otp, host_id)?,
+            reliable: false,
             state: State::Idle,
             events: VecDeque::new(),
             reasm: FrameReassembler::new(Duration::from_millis(250)),
@@ -82,6 +87,13 @@ impl<I: DatagramIo> ClientSession<I> {
             last_evicted: 0,
             frame_outcomes: VecDeque::with_capacity(LOSS_WINDOW),
         })
+    }
+
+    /// Mark whether this session runs over a reliable point-to-point link
+    /// (e.g. USB AOA / ADB) rather than untrusted LAN UDP. Enables fast
+    /// [`USB_IDLE_TIMEOUT`] and honoring host-to-client [`HS_STEP_RESET`] hints.
+    pub fn set_reliable(&mut self, reliable: bool) {
+        self.reliable = reliable;
     }
 
     pub fn is_established(&self) -> bool {
@@ -119,6 +131,10 @@ impl<I: DatagramIo> ClientSession<I> {
 
     /// Send handshake message 1 (call again to retransmit).
     pub fn start(&mut self) -> Result<()> {
+        if let State::WaitMsg2 { m1, .. } = &self.state {
+            self.io.send(&hs_packet(1, 0, m1));
+            return Ok(());
+        }
         if self.is_established() {
             self.drop_session();
         }
@@ -131,7 +147,10 @@ impl<I: DatagramIo> ClientSession<I> {
         )?;
         let m1 = i.write_message(&[])?;
         self.io.send(&hs_packet(1, 0, &m1));
-        self.state = State::WaitMsg2(Box::new(i));
+        self.state = State::WaitMsg2 {
+            initiator: Box::new(i),
+            m1,
+        };
         Ok(())
     }
 
@@ -176,10 +195,15 @@ impl<I: DatagramIo> ClientSession<I> {
 
     /// Drop stale partially received frames, send periodic RTT pings and
     /// keepalives, and detect a dead host ([`ClientEvent::Disconnected`] after
-    /// [`IDLE_TIMEOUT`] of silence); call every ~100 ms.
+    /// [`IDLE_TIMEOUT`] or [`USB_IDLE_TIMEOUT`] on reliable links); call every ~100 ms.
     pub fn tick(&mut self, now: Instant) {
         if self.is_established() {
-            if now.saturating_duration_since(self.last_rx) >= IDLE_TIMEOUT {
+            let idle_timeout = if self.reliable {
+                USB_IDLE_TIMEOUT
+            } else {
+                IDLE_TIMEOUT
+            };
+            if now.saturating_duration_since(self.last_rx) >= idle_timeout {
                 self.drop_session();
                 return;
             }
@@ -275,17 +299,27 @@ impl<I: DatagramIo> ClientSession<I> {
 
     fn handle_handshake(&mut self, data: &[u8], now: Instant) -> Result<()> {
         let (step, sid, msg) = hs_parse(data)?;
+        if step == HS_STEP_RESET {
+            if self.reliable && self.is_established() {
+                self.drop_session();
+            }
+            return Ok(());
+        }
         if step != 2 {
             return Err(SessionError::Handshake("unexpected step"));
         }
         // A stray msg2 (e.g. answer to someone else's msg1) must not kill a live session.
-        if !matches!(self.state, State::WaitMsg2(_)) {
+        if !matches!(self.state, State::WaitMsg2 { .. }) {
             return Err(SessionError::Handshake("unexpected msg2"));
         }
-        let State::WaitMsg2(i) = std::mem::replace(&mut self.state, State::Idle) else {
+        if sid == 0 {
+            return Err(SessionError::SessionId);
+        }
+        let State::WaitMsg2 { initiator, .. } = std::mem::replace(&mut self.state, State::Idle)
+        else {
             unreachable!()
         };
-        let mut i = *i;
+        let mut i = *initiator;
         let payload = i.read_message(msg)?;
         if payload.as_slice() != sid.to_be_bytes() {
             return Err(SessionError::SessionId);

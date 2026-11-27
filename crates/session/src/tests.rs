@@ -632,3 +632,168 @@ fn client_loss_permille_tracks_completed_and_evicted_frames() {
     assert_eq!(r.client.evicted_frames(), 1);
     assert_eq!(r.client.loss_permille(), 250);
 }
+
+#[test]
+fn start_retransmit_reuses_m1_so_earlier_msg2_completes_handshake() {
+    let mut r = rig("123456", 0.0);
+    r.client.start().unwrap();
+    let m1_first = drain(&r.to_host).pop().unwrap();
+
+    // Host processes the first msg1 and replies with msg2.
+    r.host.handle_datagram_at(&m1_first, r.now).unwrap();
+    let m2_first = drain(&r.to_client).pop().unwrap();
+
+    // Client retries start() before msg2 arrives: must retransmit exact same m1
+    // without overwriting the active Initiator ephemeral keypair.
+    r.client.start().unwrap();
+    let m1_retry = drain(&r.to_host).pop().unwrap();
+    assert_eq!(m1_first, m1_retry, "retransmitted msg1 must match initial msg1");
+
+    // A malformed msg2 with session_id == 0 must not destroy WaitMsg2.
+    let bad_sid_msg2 = hs_packet(2, 0, &[1, 2, 3, 4]);
+    assert!(matches!(
+        r.client.handle_datagram_at(&bad_sid_msg2, r.now),
+        Err(SessionError::SessionId)
+    ));
+
+    // Now the earlier msg2 arrives and completes the handshake cleanly.
+    r.client.handle_datagram_at(&m2_first, r.now).unwrap();
+    r.pump();
+    assert!(r.client.is_established() && r.host.is_established());
+}
+
+#[test]
+fn reliable_reset_hint_reconnects_immediately_and_lan_ignores_it() {
+    let mut r = rig("123456", 0.0);
+    r.host.set_reliable(true);
+    r.client.set_reliable(true);
+    r.connect();
+    events_h(&mut r);
+    events_c(&mut r);
+    let old_sid = r.host.session_id();
+
+    // Reliable host times out at USB_IDLE_TIMEOUT (2.5s), leaving client thinking it is live.
+    r.advance(USB_IDLE_TIMEOUT);
+    r.host.tick(r.now);
+    assert!(!r.host.is_established());
+    assert_eq!(events_h(&mut r), vec![HostSessionEvent::Disconnected]);
+    assert!(r.client.is_established());
+
+    // Client sends encrypted data to the now-idle reliable host -> host replies HS_STEP_RESET.
+    r.client.send_input(InputEvent::SecureAttention).unwrap();
+    let stale_dg = drain(&r.to_host).pop().unwrap();
+    assert!(matches!(
+        r.host.handle_datagram_at(&stale_dg, r.now),
+        Err(SessionError::NotEstablished)
+    ));
+    let hints = drain(&r.to_client);
+    assert_eq!(hints.len(), 1);
+    assert_eq!(hints[0], hs_packet(HS_STEP_RESET, 0, &[]));
+    assert_eq!(hs_parse(&hints[0]).unwrap(), (HS_STEP_RESET, 0, &[][..]));
+
+    // Second stale datagram within 250 ms is throttled (no duplicate reset hint).
+    r.advance(Duration::from_millis(100));
+    assert!(matches!(
+        r.host.handle_datagram_at(&stale_dg, r.now),
+        Err(SessionError::NotEstablished)
+    ));
+    assert!(drain(&r.to_client).is_empty());
+
+    // After 250 ms another stale datagram emits a fresh reset hint.
+    r.advance(Duration::from_millis(150));
+    assert!(matches!(
+        r.host.handle_datagram_at(&stale_dg, r.now),
+        Err(SessionError::NotEstablished)
+    ));
+    assert_eq!(drain(&r.to_client).len(), 1);
+
+    // Reliable client honors HS_STEP_RESET: drops immediately and re-handshakes cleanly.
+    r.client.handle_datagram_at(&hints[0], r.now).unwrap();
+    assert!(!r.client.is_established());
+    assert_eq!(events_c(&mut r), vec![ClientEvent::Disconnected]);
+
+    r.client.start().unwrap();
+    r.pump();
+    assert!(r.client.is_established() && r.host.is_established());
+    assert_ne!(r.host.session_id(), old_sid);
+
+    // Reliable client also honors USB_IDLE_TIMEOUT (2.5s) in tick().
+    events_c(&mut r);
+    r.advance(USB_IDLE_TIMEOUT);
+    r.client.tick(r.now);
+    assert!(!r.client.is_established());
+    assert_eq!(events_c(&mut r), vec![ClientEvent::Disconnected]);
+
+    // Unreliable (LAN) client ignores HS_STEP_RESET and keeps full 5s IDLE_TIMEOUT;
+    // unreliable (LAN) host never emits HS_STEP_RESET when idle.
+    let mut lan = rig("123456", 0.0);
+    lan.connect();
+    events_h(&mut lan);
+    events_c(&mut lan);
+
+    let reset = hs_packet(HS_STEP_RESET, 0, &[]);
+    lan.client.handle_datagram_at(&reset, lan.now).unwrap();
+    assert!(lan.client.is_established());
+    assert!(events_c(&mut lan).is_empty());
+
+    // At USB_IDLE_TIMEOUT (2.5s), LAN client and LAN host are still established.
+    lan.advance(USB_IDLE_TIMEOUT);
+    lan.client.tick(lan.now);
+    lan.host.tick(lan.now);
+    assert!(lan.client.is_established() && lan.host.is_established());
+
+    // Once LAN host times out after full IDLE_TIMEOUT, stale data must not emit HS_STEP_RESET.
+    lan.advance(IDLE_TIMEOUT);
+    lan.host.tick(lan.now);
+    assert!(!lan.host.is_established());
+    drain(&lan.to_client);
+    lan.client.send_input(InputEvent::SecureAttention).unwrap();
+    let lan_stale = drain(&lan.to_host).pop().unwrap();
+    assert!(matches!(
+        lan.host.handle_datagram_at(&lan_stale, lan.now),
+        Err(SessionError::NotEstablished)
+    ));
+    assert!(
+        drain(&lan.to_client).is_empty(),
+        "unreliable host must not send HS_STEP_RESET"
+    );
+}
+
+#[test]
+fn reliable_host_allows_50ms_msg1_retry_while_lan_keeps_500ms() {
+    let t0 = Instant::now();
+
+    // Reliable host: 50 ms minimum interval.
+    let mut usb = rig("123456", 0.0);
+    usb.host.set_reliable(true);
+    usb.client.start().unwrap();
+    let usb_m1 = drain(&usb.to_host).pop().unwrap();
+    usb.host.handle_datagram_from(1, &usb_m1, t0).unwrap();
+    assert!(matches!(
+        usb.host
+            .handle_datagram_from(1, &usb_m1, t0 + Duration::from_millis(25)),
+        Err(SessionError::RateLimited)
+    ));
+    usb.host
+        .handle_datagram_from(1, &usb_m1, t0 + USB_HANDSHAKE_MIN_INTERVAL)
+        .unwrap();
+
+    // Unreliable (LAN) host: keeps 500 ms minimum interval.
+    let mut lan = rig("123456", 0.0);
+    lan.client.start().unwrap();
+    let lan_m1 = drain(&lan.to_host).pop().unwrap();
+    lan.host.handle_datagram_from(1, &lan_m1, t0).unwrap();
+    assert!(matches!(
+        lan.host
+            .handle_datagram_from(1, &lan_m1, t0 + USB_HANDSHAKE_MIN_INTERVAL),
+        Err(SessionError::RateLimited)
+    ));
+    assert!(matches!(
+        lan.host
+            .handle_datagram_from(1, &lan_m1, t0 + Duration::from_millis(499)),
+        Err(SessionError::RateLimited)
+    ));
+    lan.host
+        .handle_datagram_from(1, &lan_m1, t0 + HANDSHAKE_MIN_INTERVAL)
+        .unwrap();
+}

@@ -32,6 +32,12 @@ fn main() -> eframe::Result {
         Some(service::SERVICE_FLAG) => std::process::exit(service::run_service()),
         _ => {}
     }
+    // Prevent launching two GUI instances simultaneously (which would race on USB/SudoVDA/pipe).
+    // If another GUI is already open (e.g. minimized to tray), bring it to the foreground and exit.
+    let _single_instance = match acquire_gui_single_instance() {
+        Some(g) => g,
+        None => std::process::exit(0),
+    };
     let dpi_info = rv_host_win::session_state::set_dpi_aware();
     init_logging(&dpi_info);
     let just_updated = update::cleanup_old();
@@ -53,6 +59,52 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, demo, minimized, just_updated)))),
     )
+}
+
+#[cfg(windows)]
+struct SingleInstanceGuard(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn acquire_gui_single_instance() -> Option<SingleInstanceGuard> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
+    let name: Vec<u16> = "Local\\RemoteViewGUI_SingleInstance\0".encode_utf16().collect();
+    unsafe {
+        let Ok(h) = CreateMutexW(None, false, PCWSTR(name.as_ptr())) else {
+            return Some(SingleInstanceGuard(windows::Win32::Foundation::HANDLE::default()));
+        };
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let title: Vec<u16> = "RemoteView\0".encode_utf16().collect();
+            if let Ok(hwnd) = FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr())) {
+                if !hwnd.0.is_null() {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                    let _ = SetForegroundWindow(hwnd);
+                }
+            }
+            let _ = windows::Win32::Foundation::CloseHandle(h);
+            return None;
+        }
+        Some(SingleInstanceGuard(h))
+    }
+}
+
+#[cfg(not(windows))]
+struct SingleInstanceGuard;
+
+#[cfg(not(windows))]
+fn acquire_gui_single_instance() -> Option<SingleInstanceGuard> {
+    Some(SingleInstanceGuard)
 }
 
 #[cfg(windows)]

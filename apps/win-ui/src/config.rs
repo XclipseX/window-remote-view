@@ -217,6 +217,15 @@ impl Config {
                 let _ = std::fs::write(p, s);
             }
         }
+        // Best-effort sync to machine-wide ProgramData so RemoteViewSvc uses the user's
+        // preferred display/FPS/mode at Windows boot (Winlogon) before user login.
+        if let Some(shared) = rv_host_win::control::shared_data_dir() {
+            let boot_cfg = rv_host_win::service_proto::ServiceBootConfig {
+                enabled: self.auto_share,
+                args: self.host_args(),
+            };
+            let _ = boot_cfg.save_to(&shared.join("service_config.json"));
+        }
     }
 
     /// Command-line arguments for rv-host.

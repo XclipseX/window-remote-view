@@ -104,31 +104,33 @@ fun SessionScreen(
     }
     val streamSize by controller.streamSize.collectAsState()
     val aspect = if (streamSize.second > 0) streamSize.first.toFloat() / streamSize.second.toFloat() else 16f / 9f
-    var zoomState by remember { mutableStateOf(Triple(1f, 0f, 0f)) }
+    var zoomState by remember(controller) { mutableStateOf(Triple(1f, 0f, 0f)) }
     var hudOn by remember { mutableStateOf(showFpsHud) }
-    LaunchedEffect(hudOn) { controller.setHudEnabled(hudOn) }
+    LaunchedEffect(controller, hudOn) { controller.setHudEnabled(hudOn) }
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         // Khung video đúng tỉ lệ luồng, căn giữa; phần còn lại đen (letterbox/pillarbox) và không nhận chạm.
         // Toàn bộ ánh xạ chạm/bút dùng kích thước của View này = content rect.
         Box(Modifier.align(Alignment.Center).aspectRatio(aspect)) {
-            AndroidView(
-                modifier = Modifier.fillMaxSize(),
-                factory = { ctx ->
-                    RemoteSurfaceView(ctx).also { v ->
-                        controller.bindView(v)
-                        v.onZoomChanged = { z, px, py -> zoomState = Triple(z, px, py) }
-                        v.surfaceListener = object : RemoteSurfaceView.SurfaceListener {
-                            override fun onSurfaceReady(holder: SurfaceHolder) {
-                                controller.onSurfaceDestroyed() // tránh tạo trùng khi surfaceChanged lặp lại
-                                controller.onSurfaceReady(holder.surface)
+            androidx.compose.runtime.key(controller) {
+                AndroidView(
+                    modifier = Modifier.fillMaxSize(),
+                    factory = { ctx ->
+                        RemoteSurfaceView(ctx).also { v ->
+                            controller.bindView(v)
+                            v.onZoomChanged = { z, px, py -> zoomState = Triple(z, px, py) }
+                            v.surfaceListener = object : RemoteSurfaceView.SurfaceListener {
+                                override fun onSurfaceReady(holder: SurfaceHolder) {
+                                    controller.onSurfaceDestroyed() // tránh tạo trùng khi surfaceChanged lặp lại
+                                    controller.onSurfaceReady(holder.surface)
+                                }
+                                override fun onSurfaceDestroyed() = controller.onSurfaceDestroyed()
                             }
-                            override fun onSurfaceDestroyed() = controller.onSurfaceDestroyed()
+                            v.requestFocus()
                         }
-                        v.requestFocus()
-                    }
-                },
-                onRelease = { controller.release() },
-            )
+                    },
+                    onRelease = { controller.release() },
+                )
+            }
             CursorOverlay(controller, zoomState, Modifier.fillMaxSize())
         }
         val reconnecting by controller.reconnecting.collectAsState()
@@ -169,9 +171,9 @@ fun SessionScreen(
             )
         }
         // --- Gỡ lỗi + chờ hình ---
-        var tick by remember { mutableStateOf(0) }
-        LaunchedEffect(Unit) { while (true) { tick++; delay(500) } }
-        val snap = remember(tick) { controller.debugSnapshot() }
+        var tick by remember(controller) { mutableStateOf(0) }
+        LaunchedEffect(controller) { while (true) { tick++; delay(500) } }
+        val snap = remember(controller, tick) { controller.debugSnapshot() }
         val now = SystemClock.elapsedRealtime()
         val streaming = snap.framesDecoded > 0
         val waitingFrame = snap.establishedAtMs > 0 && !streaming && now - snap.establishedAtMs > 3000
@@ -297,7 +299,7 @@ fun SessionScreen(
             )
         }
     }
-    DisposableEffect(Unit) { onDispose { controller.release() } }
+    DisposableEffect(controller) { onDispose { controller.release() } }
 }
 
 @Suppress("unused")

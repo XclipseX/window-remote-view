@@ -164,6 +164,15 @@ impl CapturedFrame {
             _ => None,
         }
     }
+
+    /// Unique D3D11 device id assigned when the duplicator opened (`None` for CPU frames).
+    pub fn device_id(&self) -> Option<u64> {
+        match &self.data {
+            FrameData::Cpu(_) => None,
+            #[cfg(windows)]
+            FrameData::Gpu(g) => Some(g.device_id),
+        }
+    }
 }
 
 /// Index of the output to capture: the one named `prefer` if still attached,
@@ -172,8 +181,30 @@ impl CapturedFrame {
 /// indirect displays (spacedesk, IddCx ...) are only chosen when nothing else
 /// is attached. Pure so it can be unit-tested.
 pub fn pick_output_index(outs: &[OutputInfo], prefer: Option<&str>) -> Option<usize> {
+    pick_output_index_opts(outs, prefer, false)
+}
+
+/// Like [`pick_output_index`], with `prefer_virtual`: when `prefer` is no
+/// longer attached (e.g. Windows renumbered the SudoVDA virtual display
+/// `DISPLAY7 -> DISPLAY8` across logon) and `prefer_virtual` is `true`, pick
+/// an attached [`OutputKind::Virtual`] output (primary virtual first, then any
+/// virtual) instead of falling back to a physical panel.
+pub fn pick_output_index_opts(
+    outs: &[OutputInfo],
+    prefer: Option<&str>,
+    prefer_virtual: bool,
+) -> Option<usize> {
     if let Some(n) = prefer {
         if let Some(i) = outs.iter().position(|o| o.attached && o.name.eq_ignore_ascii_case(n)) {
+            return Some(i);
+        }
+    }
+    if prefer_virtual {
+        if let Some(i) = outs
+            .iter()
+            .position(|o| o.attached && o.kind() == OutputKind::Virtual && o.is_primary())
+            .or_else(|| outs.iter().position(|o| o.attached && o.kind() == OutputKind::Virtual))
+        {
             return Some(i);
         }
     }
@@ -192,6 +223,15 @@ pub fn pick_output<'a>(outs: &'a [OutputInfo], prefer: Option<&str>) -> Option<&
     pick_output_index(outs, prefer).map(|i| &outs[i])
 }
 
+/// Convenience over [`pick_output_index_opts`].
+pub fn pick_output_opts<'a>(
+    outs: &'a [OutputInfo],
+    prefer: Option<&str>,
+    prefer_virtual: bool,
+) -> Option<&'a OutputInfo> {
+    pick_output_index_opts(outs, prefer, prefer_virtual).map(|i| &outs[i])
+}
+
 /// After this long without a working DXGI duplication, frames come from GDI.
 const GDI_AFTER: Duration = Duration::from_secs(3);
 
@@ -200,6 +240,8 @@ const GDI_AFTER: Duration = Duration::from_secs(3);
 /// a GDI BitBlt fallback so frames keep flowing while DXGI is unavailable.
 pub struct Capturer {
     prefer: Option<String>,
+    prefer_virtual: bool,
+    switched_or_reopened: bool,
     dup: Option<DesktopDuplicator>,
     #[cfg(windows)]
     gdi: Option<crate::capture_win::GdiCapture>,
@@ -222,8 +264,16 @@ pub struct Capturer {
 
 impl Capturer {
     pub fn new(prefer: Option<String>, rect: Rect) -> Self {
+        let prefer_virtual = prefer.as_deref().is_some_and(|name| {
+            list_outputs()
+                .ok()
+                .and_then(|outs| outs.into_iter().find(|o| o.attached && o.name.eq_ignore_ascii_case(name)))
+                .is_some_and(|o| o.kind() == OutputKind::Virtual)
+        });
         Self {
             prefer,
+            prefer_virtual,
+            switched_or_reopened: false,
             dup: None,
             #[cfg(windows)]
             gdi: None,
@@ -243,14 +293,39 @@ impl Capturer {
         }
     }
 
-    #[cfg(windows)]
-    fn has_gdi(&self) -> bool {
-        self.gdi.is_some()
+    /// Whether re-enumeration should prefer an attached virtual output if `prefer`
+    /// disappeared or was renumbered by Windows.
+    pub fn set_prefer_virtual(&mut self, v: bool) {
+        self.prefer_virtual = v;
     }
 
-    #[cfg(not(windows))]
-    fn has_gdi(&self) -> bool {
-        false
+    /// Updates the preferred GDI device name (e.g. when SudoVDA's monitor is
+    /// renumbered across logon). If duplication is currently open on a different
+    /// output, drops it so the next `acquire()` switches immediately.
+    pub fn set_preferred_name(&mut self, name: String) {
+        let mismatch = self
+            .dup
+            .as_ref()
+            .is_some_and(|d| !d.device_name().eq_ignore_ascii_case(&name));
+        self.prefer = Some(name);
+        if mismatch {
+            self.dup = None;
+            #[cfg(windows)]
+            {
+                self.gdi = None;
+            }
+            self.retry_at = Instant::now();
+            self.backoff = Duration::from_millis(50);
+            self.fail_since = None;
+            self.switched_or_reopened = true;
+        }
+    }
+
+    /// Returns `true` (and clears the flag) if the input desktop switched or DXGI
+    /// duplication was (re)opened since the last call, so the video loop can drop
+    /// any cached frame from the previous device and request an IDR keyframe.
+    pub fn take_reset_flag(&mut self) -> bool {
+        std::mem::replace(&mut self.switched_or_reopened, false)
     }
 
     /// Output rectangle in virtual-desktop coordinates of the current source.
@@ -284,7 +359,7 @@ impl Capturer {
     pub fn acquire(&mut self, timeout_ms: u32) -> Result<Option<CapturedFrame>> {
         // SYSTEM only: the input desktop changed (Default <-> Winlogon). A duplication / DC made on
         // the old desktop is useless, so drop both and re-open at once on the new one.
-        if self.follower.poll() && (self.dup.is_some() || self.has_gdi()) {
+        if self.follower.poll() {
             Self::log(crate::control::Level::Info, "capture: input desktop changed; re-opening capture".into());
             self.dup = None;
             #[cfg(windows)]
@@ -294,6 +369,7 @@ impl Capturer {
             self.retry_at = Instant::now();
             self.backoff = Duration::from_millis(50);
             self.fail_since = None;
+            self.switched_or_reopened = true;
         }
         if let Some(d) = self.dup.as_mut() {
             match d.acquire(timeout_ms) {
@@ -310,6 +386,7 @@ impl Capturer {
                     self.warn_once(format!("capture: DXGI error: {e}; re-enumerating outputs"));
                     self.prefer = self.dup.as_ref().map(|d| d.device_name().to_string());
                     self.dup = None;
+                    self.follower.force_poll();
                     self.fail_since.get_or_insert_with(Instant::now);
                     self.retry_at = Instant::now() + self.backoff;
                 }
@@ -317,7 +394,7 @@ impl Capturer {
         }
         if Instant::now() >= self.retry_at {
             self.follower.poll_now(); // be on the right desktop before duplicating
-            match DesktopDuplicator::open(self.prefer.as_deref()) {
+            match DesktopDuplicator::open_opts(self.prefer.as_deref(), self.prefer_virtual) {
                 Ok(d) => {
                     self.rect = d.desktop_rect();
                     self.prefer = Some(d.device_name().to_string());
@@ -330,11 +407,18 @@ impl Capturer {
                     }
                     self.dup = Some(d);
                     self.fail_since = None;
+                    self.switched_or_reopened = true;
                     return Ok(None);
                 }
                 Err(e) => {
                     self.fails += 1;
                     self.warn_once(format!("capture: DXGI unavailable: {e}"));
+                    #[cfg(windows)]
+                    if self.gdi.is_none() {
+                        self.follower.force_poll();
+                    }
+                    #[cfg(not(windows))]
+                    self.follower.force_poll();
                     self.fail_since.get_or_insert_with(Instant::now);
                     let cap = if self.fail_since.is_some_and(|t| t.elapsed() > GDI_AFTER) { 2000 } else { 500 };
                     self.backoff = (self.backoff * 2).min(Duration::from_millis(cap));
@@ -367,13 +451,15 @@ impl Capturer {
             self.last_enum = Some(Instant::now());
             let want = list_outputs()
                 .ok()
-                .and_then(|o| pick_output(&o, self.prefer.as_deref()).cloned());
+                .and_then(|o| pick_output_opts(&o, self.prefer.as_deref(), self.prefer_virtual).cloned());
             if let Some(o) = &want {
                 self.prefer = Some(o.name.clone());
                 self.rect = o.desktop_rect;
             }
         }
         if self.gdi.as_ref().is_none_or(|g| g.rect() != self.rect) {
+            self.gdi = None;
+            self.follower.poll_now();
             match crate::capture_win::GdiCapture::new(self.rect) {
                 Ok(g) => {
                     if !self.gdi_announced {
@@ -392,6 +478,7 @@ impl Capturer {
                 Err(e) => {
                     self.warn_once(format!("capture: GDI init failed: {e}"));
                     self.gdi = None;
+                    self.follower.force_poll();
                     std::thread::sleep(Duration::from_millis(200));
                     return Ok(None);
                 }
@@ -405,6 +492,7 @@ impl Capturer {
             Some(Err(e)) => {
                 self.warn_once(format!("capture: GDI grab failed: {e}"));
                 self.gdi = None;
+                self.follower.force_poll();
                 // The grab keeps failing while the session is locked: do not spin.
                 std::thread::sleep(Duration::from_millis(100));
                 Ok(None)
@@ -446,6 +534,9 @@ pub struct DesktopDuplicator;
 impl DesktopDuplicator {
     pub fn open(_prefer: Option<&str>) -> Result<Self> {
         Err(HostError::Unsupported("DXGI Desktop Duplication needs Windows"))
+    }
+    pub fn open_opts(prefer: Option<&str>, _prefer_virtual: bool) -> Result<Self> {
+        Self::open(prefer)
     }
     pub fn device_name(&self) -> &str {
         ""
@@ -527,5 +618,26 @@ mod tests {
         hinted.adapter_name = "SpaceDesk Graphics Adapter".into();
         assert_eq!(hinted.kind(), OutputKind::Virtual);
         assert!(outs[1].label().contains("laptop"));
+    }
+
+    #[test]
+    fn prefer_virtual_survives_renumbering() {
+        let outs = vec![
+            with(o("\\\\.\\DISPLAY1", (0, 0, 1920, 1080), true), "Generic PnP Monitor", Some(i32::MIN)),
+            with(o("\\\\.\\DISPLAY8", (1920, 0, 4720, 1752), true), "RemoteView", Some(17)),
+        ];
+        // Without prefer_virtual, stale DISPLAY7 falls back to the internal laptop panel.
+        assert_eq!(pick_output_index_opts(&outs, Some("\\\\.\\DISPLAY7"), false), Some(0));
+        // With prefer_virtual, stale DISPLAY7 picks the renumbered virtual DISPLAY8.
+        assert_eq!(pick_output_index_opts(&outs, Some("\\\\.\\DISPLAY7"), true), Some(1));
+        // If no virtual output is attached, prefer_virtual still falls back to physical.
+        let phys_only = vec![outs[0].clone()];
+        assert_eq!(pick_output_index_opts(&phys_only, Some("\\\\.\\DISPLAY7"), true), Some(0));
+    }
+
+    #[test]
+    fn cpu_frame_has_no_device_id() {
+        let f = CapturedFrame::from_bgra(2, 2, vec![0u8; 16]);
+        assert_eq!(f.device_id(), None);
     }
 }

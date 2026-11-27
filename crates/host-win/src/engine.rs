@@ -512,6 +512,8 @@ struct Shared {
     locked: AtomicBool,
     /// Desktop rectangle of the display being captured (follows mode changes).
     cap_rect: Mutex<crate::Rect>,
+    /// Updated GDI output name if SudoVDA is renumbered after Winlogon -> Default or sleep/wake.
+    preferred_output: Mutex<Option<String>>,
 }
 
 impl Shared {
@@ -552,6 +554,7 @@ enum VideoEvent {
 struct VideoPrefs {
     codec: CodecPref,
     encoder: EncoderPref,
+    prefer_virtual: bool,
 }
 
 /// A hardware encoder was declared broken: retry it once without D3D, else
@@ -615,12 +618,14 @@ fn video_thread(
 ) {
     boost_thread_priority("video");
     let mut cap = Capturer::new(Some(out_name), out_rect);
+    cap.set_prefer_virtual(prefs.prefer_virtual);
     let mut ready_since: Option<Instant> = None;
     let mut sup = HwSupervisor::new();
     let mut first_input: Option<Instant> = None;
     let mut force_sw = false;
     let mut enc: Option<Box<dyn VideoEncoder>> = None;
     let mut enc_from_gpu = false;
+    let mut enc_device_id: Option<u64> = None;
     let mut active: Option<ActiveEnc> = None;
     let mut seen_gen = u32::MAX;
     let mut fail_streak: u32 = 0;
@@ -634,6 +639,11 @@ fn video_thread(
     let (mut w_start, mut w_frames, mut w_bytes, mut w_enc) = (Instant::now(), 0u32, 0u64, Duration::ZERO);
 
     while !sh.stop.load(Ordering::Relaxed) {
+        if let Ok(mut g) = sh.preferred_output.lock() {
+            if let Some(name) = g.take() {
+                cap.set_preferred_name(name);
+            }
+        }
         if !sh.ready.load(Ordering::Relaxed) || sh.paused.load(Ordering::Relaxed) {
             ready_since = None;
             std::thread::sleep(Duration::from_millis(5));
@@ -663,6 +673,13 @@ fn video_thread(
             let wait_ms = if dirty { 0 } else { (1000 / fps).clamp(2, 8) };
             cap.acquire(wait_ms).unwrap_or(None)
         };
+        if cap.take_reset_flag() {
+            // Desktop switched (Winlogon <-> Default / UAC) or DXGI reopened on a new ID3D11Device:
+            // drop any stale frame tied to the previous device and ask for a fresh IDR.
+            last_frame = None;
+            dirty = false;
+            sh.idr.store(true, Ordering::Relaxed);
+        }
         if let Some(f) = acquired {
             last_frame = Some(f);
             dirty = true;
@@ -696,7 +713,7 @@ fn video_thread(
             continue;
         }
 
-        // (Re)configure the encoder when settings, capture size, or GPU-texture availability changed.
+        // (Re)configure the encoder when settings, capture size, D3D device, or GPU availability changed.
         let gen = sh.cfg_gen.load(Ordering::SeqCst);
         let (nw, nh) = (frame.width, frame.height);
         let rw = sh.width.load(Ordering::Relaxed);
@@ -726,12 +743,22 @@ fn video_thread(
         let codec_mismatch = eff_codec == CodecPref::H264
             && enc.as_ref().is_some_and(|e| e.codec() == rv_proto::codec_flags::CODEC_H265);
         let gpu_frame = is_gpu_frame(frame);
+        let frame_device_id = frame.device_id();
         let gpu_upgraded = enc.is_some() && gpu_frame && !enc_from_gpu && !sw_mode && prefs.encoder != EncoderPref::Sw;
+        let gpu_downgraded = enc.is_some() && enc_from_gpu && !gpu_frame;
+        let device_changed = enc.is_some() && enc_from_gpu && gpu_frame && frame_device_id != enc_device_id;
         if gpu_upgraded {
             info!("video: DXGI GPU frame arrived; upgrading encoder from CPU init to GPU zero-copy");
+        } else if device_changed {
+            info!("video: DXGI D3D11 device changed (desktop switch / reset); rebuilding GPU encoder cleanly");
+        } else if gpu_downgraded {
+            info!("video: capture switched to CPU/GDI fallback; rebuilding encoder for CPU input");
         }
-        let geometry_changed =
-            codec_mismatch || gpu_upgraded || active.is_none_or(|a| (a.width, a.height, a.fps) != (tw, th, fps));
+        let geometry_changed = codec_mismatch
+            || gpu_upgraded
+            || gpu_downgraded
+            || device_changed
+            || active.is_none_or(|a| (a.width, a.height, a.fps) != (tw, th, fps));
         if enc.is_none() || geometry_changed || gen != seen_gen {
             seen_gen = gen;
             let mut applied_live = false;
@@ -764,6 +791,7 @@ fn video_thread(
                         info!("encoder active: {} {}x{}@{} {} kbps", a.kind.name(), tw, th, fps, a.bitrate_bps / 1000);
                         sh.codec_flag.store(e.codec() as u32, Ordering::SeqCst);
                         enc_from_gpu = gpu_frame;
+                        enc_device_id = frame_device_id;
                         active = Some(a);
                         enc = Some(e);
                         empty_since = None;
@@ -867,49 +895,111 @@ fn video_thread(
 }
 
 fn audio_thread(start: Instant, sh: Arc<Shared>, tx: SyncSender<AudioOut>) {
-    let mut cap = match LoopbackCapture::new() {
-        Ok(c) => c,
-        Err(e) => return warn!("audio: disabled ({e})"),
-    };
     let mut enc = match OpusFrameEncoder::new(128_000) {
         Ok(e) => e,
         Err(e) => return warn!("audio: opus init failed: {e}"),
     };
     let (mut seq, mut pcm) = (0u16, Vec::new());
+    let mut backoff = Duration::from_secs(1);
+    let mut warn_gate = WarnGate::new();
     while !sh.stop.load(Ordering::Relaxed) {
-        std::thread::sleep(Duration::from_millis(5));
-        pcm.clear();
-        if let Err(e) = cap.poll(&mut pcm) {
-            return warn!("audio: capture error: {e}");
-        }
-        // Drained above; drop it while no client is ready or the client paused (backgrounded).
-        if pcm.is_empty() || !sh.ready.load(Ordering::Relaxed) || sh.paused.load(Ordering::Relaxed) {
-            continue;
-        }
-        match enc.push(&pcm) {
-            Ok(pkts) => {
-                for p in pkts {
-                    let out = AudioOut { seq, ts_us: start.elapsed().as_micros() as u32, payload: p };
-                    seq = seq.wrapping_add(1);
-                    let _ = tx.try_send(out); // audio: drop on overflow, never block
+        let mut cap = match LoopbackCapture::new() {
+            Ok(c) => {
+                if let Some(n) = warn_gate.recovered() {
+                    info!("audio: loopback capture active (recovered after {n} retries)");
                 }
+                backoff = Duration::from_secs(1);
+                c
             }
-            Err(e) => warn!("audio: encode error: {e}"),
+            Err(e) => {
+                let msg = format!("audio: waiting for loopback device ({e})");
+                if warn_gate.should_log(&msg) {
+                    warn!("{msg}");
+                }
+                let deadline = Instant::now() + backoff;
+                while Instant::now() < deadline && !sh.stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+                continue;
+            }
+        };
+        while !sh.stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(5));
+            pcm.clear();
+            if let Err(e) = cap.poll(&mut pcm) {
+                let msg = format!("audio: capture interrupted ({e}); re-initializing");
+                if warn_gate.should_log(&msg) {
+                    warn!("{msg}");
+                }
+                break;
+            }
+            // Drained above; drop it while no client is ready or the client paused (backgrounded).
+            if pcm.is_empty() || !sh.ready.load(Ordering::Relaxed) || sh.paused.load(Ordering::Relaxed) {
+                continue;
+            }
+            match enc.push(&pcm) {
+                Ok(pkts) => {
+                    for p in pkts {
+                        let out = AudioOut { seq, ts_us: start.elapsed().as_micros() as u32, payload: p };
+                        seq = seq.wrapping_add(1);
+                        let _ = tx.try_send(out); // audio: drop on overflow, never block
+                    }
+                }
+                Err(e) => warn!("audio: encode error: {e}"),
+            }
         }
     }
 }
 
 /// While a client is connected: keep Windows awake (no sleep / display off /
-/// screen saver), nudge the idle timer, and publish whether the desktop is locked.
-fn session_monitor_thread(sh: Arc<Shared>) {
+/// screen saver), nudge the idle timer, re-apply SudoVDA after Winlogon -> Default
+/// login transitions, and publish whether the desktop is locked.
+fn session_monitor_thread(
+    sh: Arc<Shared>,
+    vdd: Option<Arc<Mutex<crate::sudovda::SudoVdaMonitor>>>,
+    virtual_primary: bool,
+) {
     let mut awake = false;
     let mut last_nudge = Instant::now();
     // SYSTEM: this is the one thread that logs "desktop: Default -> Winlogon"; it also follows
     // the input desktop so the idle nudge below reaches it.
     let mut follower = crate::session_state::DesktopFollower::new("monitor", Duration::from_millis(250), true);
     let system = follower.active();
+    let mut prev_desktop: Option<String> = None;
+    let mut pending_vdd_reapply: Option<Instant> = None;
     while !sh.stop.load(Ordering::Relaxed) {
-        follower.poll();
+        if follower.poll() {
+            let now_name = follower.current_name().map(str::to_string);
+            let left_locked = prev_desktop
+                .as_deref()
+                .is_some_and(crate::session_state::is_locked_desktop_name)
+                && now_name
+                    .as_deref()
+                    .is_some_and(|n| !crate::session_state::is_locked_desktop_name(n));
+            if left_locked && vdd.is_some() {
+                // Give Windows ~500 ms to apply the logged-in user's CCD display profile,
+                // then re-assert SudoVDA's 120 Hz mode and primary status.
+                pending_vdd_reapply = Some(Instant::now() + Duration::from_millis(500));
+            }
+            prev_desktop = now_name;
+        }
+        if let Some(at) = pending_vdd_reapply {
+            if Instant::now() >= at {
+                pending_vdd_reapply = None;
+                if let Some(ref vdd_arc) = vdd {
+                    if let Ok(mut guard) = vdd_arc.lock() {
+                        if guard.reapply(virtual_primary) {
+                            let name = guard.gdi_name().to_string();
+                            if let Ok(mut p) = sh.preferred_output.lock() {
+                                *p = Some(name);
+                            }
+                            sh.idr.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
         let ready = sh.ready.load(Ordering::Relaxed);
         if ready != awake {
             awake = ready;
@@ -1074,7 +1164,8 @@ pub fn scan_devices(last_name: &mut Option<String>) -> Vec<DeviceItem> {
 
 fn list_devices(scan_all: bool, sh: &Shared, last_name: &mut Option<String>) -> Vec<DeviceItem> {
     let peer_name = sh.peer_name.lock().unwrap().clone();
-    list_devices_with(scan_all, sh.usb_link_open.load(Ordering::Relaxed), false, peer_name.as_deref(), last_name)
+    let link_open = sh.usb_link_open.load(Ordering::Relaxed);
+    list_devices_with(scan_all, link_open, !link_open, peer_name.as_deref(), last_name)
 }
 
 fn devices_thread(scan_all: bool, sh: Arc<Shared>) {
@@ -1374,11 +1465,13 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
     let mut session =
         HostSession::new(transport, ctx.kp.clone(), &session_otp, rv_session::USB_HOST_ID).map_err(|e| e.to_string())?;
     session.set_codec(rv_proto::codec_flags::CODEC_H264);
+    session.set_reliable(reliable);
     ctx.sh.usb_link_open.store(link != "lan", Ordering::Relaxed);
     ctx.sh.dev_refresh.store(true, Ordering::Relaxed);
     let _guard = LinkGuard { sh: ctx.sh.clone(), lan_established: lan_established.clone() };
     let mut last_dbg = Instant::now();
     let mut last_session_err = String::new();
+    let mut session_err_gate = WarnGate::new();
     ctx.set_status(State::Waiting, link, None, waiting_message(link));
 
     let (mut established, mut streaming, mut connecting) = (false, false, false);
@@ -1434,7 +1527,7 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                             last_rx_peer_key = rv_session::peer_key(&addr);
                         }
                     }
-                    if !established && !connecting {
+                    if !established && !connecting && dg.first() == Some(&rv_session::HS_MAGIC) {
                         connecting = true;
                         let peer = lan_peer.as_ref().and_then(|p| p.lock().unwrap().map(|a| a.to_string()));
                         ctx.set_status(State::Connecting, link, peer, "Đang bắt tay bảo mật với thiết bị...");
@@ -1442,7 +1535,9 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                     if let Err(e) = session.handle_datagram_from(last_rx_peer_key, &dg, Instant::now()) {
                         match e {
                             rv_session::SessionError::RateLimited => {
-                                warn!("handshake rate limited");
+                                if session_err_gate.should_log("rate_limited") {
+                                    warn!("handshake rate limited");
+                                }
                             }
                             rv_session::SessionError::Locked(ms) => {
                                 warn!("peer locked out after wrong OTP ({ms} ms left)");
@@ -1453,8 +1548,11 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                                 }
                             }
                             e => {
-                                last_session_err = e.to_string();
-                                warn!("session: {e}");
+                                let msg = e.to_string();
+                                last_session_err = msg.clone();
+                                if session_err_gate.should_log(&msg) {
+                                    warn!("session: {msg}");
+                                }
                             }
                         }
                     }
@@ -1518,6 +1616,8 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                     established = true;
                     connecting = false;
                     streaming = false;
+                    last_session_err.clear();
+                    let _ = session_err_gate.recovered();
                     if let Some(est) = &lan_established {
                         est.store(true, Ordering::SeqCst);
                     }
@@ -1554,20 +1654,35 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                     }
                 }
                 HostSessionEvent::Input { event, .. } => {
-                    if ctx.sh.locked.load(Ordering::Relaxed) {
+                    if matches!(event, rv_proto::InputEvent::SecureAttention)
+                        && control::json_mode()
+                        && crate::session_state::running_as_system()
+                    {
+                        // Delegate Ctrl+Alt+Del to the Session-0 RemoteViewSvc parent so
+                        // `sas.dll!SendSAS(FALSE)` runs in Session 0 per Microsoft's contract.
+                        control::emit(&serde_json::json!({"event": "sas_req"}));
+                    } else if ctx.sh.locked.load(Ordering::Relaxed) {
                         // Injection into the lock screen is refused by Windows; say so once, not per event.
                         if input_gate.should_log("locked") {
                             warn!("input: bỏ qua thao tác vì màn hình đang khóa");
                         }
                     } else if let Some(inj) = ctx.injector.as_mut() {
-                        input_follow.poll();
+                        if input_follow.poll() {
+                            inj.on_desktop_changed();
+                        }
                         // The captured output's rect follows mode changes: map onto the live one.
                         if let Ok(r) = ctx.sh.cap_rect.lock() {
                             if r.width() > 0 && r.height() > 0 {
                                 inj.set_display(*r);
                             }
                         }
-                        match inj.inject(&event) {
+                        let mut res = inj.inject(&event);
+                        if res.is_err() && input_follow.active() {
+                            input_follow.force_poll();
+                            inj.on_desktop_changed();
+                            res = inj.inject(&event);
+                        }
+                        match res {
                             Ok(()) => {
                                 if let Some(n) = input_gate.recovered() {
                                     info!("input: hoạt động trở lại (đã ẩn {n} cảnh báo lặp lại)");
@@ -1803,7 +1918,8 @@ fn run(argv: Vec<String>) -> Result<(), String> {
     let _timer = HighResTimerGuard::new();
     let dpi_line = crate::session_state::set_dpi_aware();
     if crate::session_state::running_as_system() {
-        info!("service: chạy dưới LocalSystem — theo dõi được desktop khóa/Winlogon (ghi hình + điều khiển khi khóa máy)");
+        let desk = crate::session_state::follow_input_desktop().unwrap_or_else(|| "?".into());
+        info!("service: chạy dưới LocalSystem (desktop={desk}) — theo dõi được desktop khóa/Winlogon (ghi hình + điều khiển khi khóa máy)");
     }
     if !a.json && !a.list {
         // Under the GUI the GUI owns the log file (it receives these lines as JSON events).
@@ -1837,6 +1953,7 @@ fn run(argv: Vec<String>) -> Result<(), String> {
         dev_refresh: AtomicBool::new(false),
         locked: AtomicBool::new(false),
         cap_rect: Mutex::new(crate::Rect::default()),
+        preferred_output: Mutex::new(None),
     });
     let link0 = match a.mode {
         Mode::Usb => "usb",
@@ -1870,23 +1987,42 @@ fn run(argv: Vec<String>) -> Result<(), String> {
     // mirroring "nothing" would only ever give a black picture.
     let any_attached = outputs.iter().any(|o| o.attached);
     let want_vdd = !a.mirror || a.virtual_primary || !any_attached;
-    let mut _vdd_guard: Option<crate::sudovda::SudoVdaMonitor> = None;
+    let make_primary = a.virtual_primary || !any_attached;
+    let mut vdd_guard: Option<Arc<Mutex<crate::sudovda::SudoVdaMonitor>>> = None;
     let mut vdd_output = None;
     if want_vdd {
-        match create_vdd(a.display_mode, a.virtual_primary || !any_attached) {
-            Ok((guard, out)) => {
-                _vdd_guard = Some(guard);
-                vdd_output = Some(out);
+        // At early Windows boot (Winlogon), UMDF/IddCx SudoVDA may take a few seconds to finish
+        // initializing; retry briefly before giving up.
+        let attempts = if crate::session_state::running_as_system() { 10 } else { 2 };
+        let mut last_err = String::new();
+        for attempt in 1..=attempts {
+            if crate::session_state::running_as_system() {
+                let _ = crate::session_state::follow_input_desktop();
             }
-            Err(e) => {
-                warn!("vdisplay: {e}");
-                if a.json {
-                    control::emit(&control::log_json(control::Level::Warn, &format!("Màn hình ảo: {e}")));
+            match create_vdd(a.display_mode, make_primary) {
+                Ok((guard, out)) => {
+                    vdd_guard = Some(Arc::new(Mutex::new(guard)));
+                    vdd_output = Some(out);
+                    break;
                 }
+                Err(e) => {
+                    last_err = e;
+                    if attempt < attempts {
+                        warn!("vdisplay: lần thử {attempt}/{attempts} thất bại ({last_err}); thử lại sau 1.5s");
+                        std::thread::sleep(Duration::from_millis(1500));
+                    }
+                }
+            }
+        }
+        if vdd_output.is_none() && !last_err.is_empty() {
+            warn!("vdisplay: {last_err}");
+            if a.json {
+                control::emit(&control::log_json(control::Level::Warn, &format!("Màn hình ảo: {last_err}")));
             }
         }
     }
     let outputs = if vdd_output.is_some() { list_outputs().map_err(|e| e.to_string())? } else { outputs };
+    let prefer_virtual = vdd_output.is_some() || a.virtual_primary;
     let monitor = if let Some(m) = vdd_output {
         m
     } else if a.mirror {
@@ -1938,7 +2074,7 @@ fn run(argv: Vec<String>) -> Result<(), String> {
     {
         let sh = sh.clone();
         let (out_name, out_rect) = (monitor.name.clone(), monitor.desktop_rect);
-        let prefs = VideoPrefs { codec: a.codec, encoder: a.encoder };
+        let prefs = VideoPrefs { codec: a.codec, encoder: a.encoder, prefer_virtual };
         std::thread::spawn(move || video_thread(out_name, out_rect, prefs, start, sh, vtx, evtx));
     }
     {
@@ -1947,7 +2083,8 @@ fn run(argv: Vec<String>) -> Result<(), String> {
     }
     {
         let sh = sh.clone();
-        std::thread::spawn(move || session_monitor_thread(sh));
+        let vdd_mon = vdd_guard.clone();
+        std::thread::spawn(move || session_monitor_thread(sh, vdd_mon, make_primary));
     }
     {
         let sh = sh.clone();
@@ -2114,6 +2251,7 @@ mod tests {
             dev_refresh: AtomicBool::new(false),
             locked: AtomicBool::new(false),
             cap_rect: Mutex::new(crate::Rect::default()),
+            preferred_output: Mutex::new(None),
         });
         let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let bind_addr = probe.local_addr().unwrap();

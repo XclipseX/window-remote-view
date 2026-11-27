@@ -247,11 +247,99 @@ mod imp {
     }
 
     // ----------------------------------------------------------------------
-    // service side
+    // ----------------------------------------------------------------------
+    // service side (Always-On Boot Daemon — starts worker at Winlogon without GUI)
     // ----------------------------------------------------------------------
 
     static STATUS_HANDLE: AtomicUsize = AtomicUsize::new(0);
     static STOP: AtomicBool = AtomicBool::new(false);
+    static SESSION_CHANGED: AtomicBool = AtomicBool::new(false);
+    static POWER_RESUMED: AtomicBool = AtomicBool::new(false);
+
+    const PBT_APMRESUMESUSPEND: u32 = 0x0007;
+    const PBT_APMRESUMEAUTOMATIC: u32 = 0x0012;
+
+    fn service_config_path() -> Option<std::path::PathBuf> {
+        rv_host_win::control::shared_data_dir().map(|d| d.join("service_config.json"))
+    }
+
+    fn load_boot_config() -> ServiceBootConfig {
+        service_config_path()
+            .map(|p| ServiceBootConfig::load_from(&p))
+            .unwrap_or_default()
+    }
+
+    fn save_boot_config(enabled: bool, args: &[String]) {
+        if let Some(p) = service_config_path() {
+            let cfg = ServiceBootConfig { enabled, args: args.to_vec() };
+            let _ = cfg.save_to(&p);
+        }
+    }
+
+    /// Calls `sas.dll!SendSAS(FALSE)` directly from Session 0 (`RemoteViewSvc`),
+    /// which is Microsoft's supported context for Software SAS (Ctrl+Alt+Del).
+    fn send_sas_session0() {
+        use std::sync::OnceLock;
+        use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
+        type SendSasFn = unsafe extern "system" fn(windows::core::BOOL);
+        static FN: OnceLock<Option<SendSasFn>> = OnceLock::new();
+        let f = *FN.get_or_init(|| unsafe {
+            let lib = wide("sas.dll");
+            let Ok(h) = LoadLibraryExW(PCWSTR(lib.as_ptr()), None, LOAD_LIBRARY_SEARCH_SYSTEM32) else {
+                log("warn", "SendSAS: failed to load sas.dll from System32");
+                return None;
+            };
+            let Some(p) = GetProcAddress(h, windows::core::s!("SendSAS")) else {
+                log("warn", "SendSAS: symbol not found in sas.dll");
+                return None;
+            };
+            Some(std::mem::transmute::<*const c_void, SendSasFn>(p as *const c_void))
+        });
+        if let Some(send_sas) = f {
+            log("info", "SendSAS(FALSE) invoked from Session 0");
+            // SAFETY: resolved `VOID WINAPI SendSAS(BOOL AsUser)` from System32\sas.dll.
+            unsafe { send_sas(windows::core::BOOL(0)) };
+        }
+    }
+
+    struct DaemonState {
+        desired_enabled: bool,
+        desired_args: Vec<String>,
+        active_args: Vec<String>,
+        active_session: Option<u32>,
+        worker_running: bool,
+        restart_requested: bool,
+        worker_stdin: Option<std::fs::File>,
+        cache: EventCache,
+        client_id: u64,
+        client_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    }
+
+    impl DaemonState {
+        fn new(cfg: ServiceBootConfig) -> Self {
+            Self {
+                desired_enabled: cfg.enabled,
+                desired_args: cfg.args,
+                active_args: Vec::new(),
+                active_session: None,
+                worker_running: false,
+                restart_requested: false,
+                worker_stdin: None,
+                cache: EventCache::default(),
+                client_id: 0,
+                client_tx: None,
+            }
+        }
+    }
+
+    fn init_service_log() {
+        if let Some(dir) = rv_host_win::logfile::shared_logs_dir() {
+            if rv_host_win::logfile::init_in(&dir, "remoteview-service").is_some() {
+                return;
+            }
+        }
+        let _ = rv_host_win::logfile::init("remoteview-service");
+    }
 
     fn report(state: SERVICE_STATUS_CURRENT_STATE, accepted: u32, wait_hint: u32) {
         let h = SERVICE_STATUS_HANDLE(STATUS_HANDLE.load(Ordering::SeqCst) as *mut c_void);
@@ -273,7 +361,7 @@ mod imp {
 
     /// Entry of `RemoteView.exe --service`: hands the thread to the service control manager.
     pub fn run_service() -> i32 {
-        let _ = rv_host_win::logfile::init("remoteview-service");
+        init_service_log();
         log("info", &format!("start (pid {})", std::process::id()));
         let mut name = wide(SERVICE_NAME);
         let table = [
@@ -290,13 +378,25 @@ mod imp {
         }
     }
 
-    unsafe extern "system" fn ctrl_handler(ctrl: u32, _ev: u32, _data: *mut c_void, _ctx: *mut c_void) -> u32 {
+    unsafe extern "system" fn ctrl_handler(ctrl: u32, ev: u32, _data: *mut c_void, _ctx: *mut c_void) -> u32 {
         match ctrl {
             SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
                 log("info", "stop requested");
                 STOP.store(true, Ordering::SeqCst);
                 report(SERVICE_STOP_PENDING, 0, 10_000);
                 wake_acceptor();
+                0
+            }
+            SERVICE_CONTROL_SESSIONCHANGE => {
+                log("info", &format!("session change event={ev}"));
+                SESSION_CHANGED.store(true, Ordering::SeqCst);
+                0
+            }
+            SERVICE_CONTROL_POWEREVENT => {
+                if ev == PBT_APMRESUMEAUTOMATIC || ev == PBT_APMRESUMESUSPEND {
+                    log("info", &format!("power resume event={ev}"));
+                    POWER_RESUMED.store(true, Ordering::SeqCst);
+                }
                 0
             }
             SERVICE_CONTROL_INTERROGATE => 0,
@@ -315,11 +415,213 @@ mod imp {
             }
         }
         report(SERVICE_START_PENDING, 0, 5_000);
-        report(SERVICE_RUNNING, SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN, 0);
-        log("info", &format!("running, pipe {PIPE_NAME}"));
-        serve();
+        enable_software_sas();
+        let accepted = SERVICE_ACCEPT_STOP
+            | SERVICE_ACCEPT_SHUTDOWN
+            | SERVICE_ACCEPT_SESSIONCHANGE
+            | SERVICE_ACCEPT_POWEREVENT;
+        report(SERVICE_RUNNING, accepted, 0);
+
+        let boot_cfg = load_boot_config();
+        log(
+            "info",
+            &format!(
+                "running always-on daemon, pipe {PIPE_NAME}, boot_enabled={}, args={}",
+                boot_cfg.enabled,
+                boot_cfg.args.join(" ")
+            ),
+        );
+        let daemon = Arc::new(std::sync::Mutex::new(DaemonState::new(boot_cfg)));
+        let sup_daemon = daemon.clone();
+        let supervisor = thread::spawn(move || supervise_worker(sup_daemon));
+        serve(daemon);
+        STOP.store(true, Ordering::SeqCst);
+        let _ = supervisor.join();
         log("info", "stopped");
         report(SERVICE_STOPPED, 0, 0);
+    }
+
+    /// Autonomous supervisor: keeps a single `--host-worker` alive in the active console
+    /// session starting right at Windows boot (Winlogon) — even before any user logs in
+    /// or opens the GUI — and respawns it if the console Session ID changes or after crashes.
+    fn supervise_worker(daemon: Arc<std::sync::Mutex<DaemonState>>) {
+        let mut backoff = Duration::from_secs(1);
+        while !STOP.load(Ordering::SeqCst) {
+            let (enabled, args) = {
+                let mut g = daemon.lock().unwrap_or_else(|e| e.into_inner());
+                g.restart_requested = false;
+                (g.desired_enabled, g.desired_args.clone())
+            };
+            if !enabled {
+                thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            let session = unsafe { WTSGetActiveConsoleSessionId() };
+            if session == 0xFFFF_FFFF || session == 0 {
+                // Early boot before Session 1 Winlogon is ready.
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+
+            log("info", &format!("spawn worker in console session {session}, args: {}", args.join(" ")));
+            let mut worker = match spawn_worker(&args, session) {
+                Ok(w) => w,
+                Err(m) => {
+                    log("warn", &format!("spawn_worker failed (session {session}): {m}; retrying in {:?}", backoff));
+                    let until = Instant::now() + backoff;
+                    while Instant::now() < until && !STOP.load(Ordering::SeqCst) {
+                        if SESSION_CHANGED.swap(false, Ordering::SeqCst) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(150));
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(8));
+                    continue;
+                }
+            };
+            let started = Instant::now();
+            log("info", &format!("worker pid {} started in console session {session}", worker.pid));
+            let stdin = worker.stdin.take().expect("stdin");
+            let stdout = worker.stdout.take().expect("stdout");
+            {
+                let mut g = daemon.lock().unwrap_or_else(|e| e.into_inner());
+                g.active_args = args.clone();
+                g.active_session = Some(session);
+                g.worker_running = true;
+                g.worker_stdin = Some(stdin);
+                g.cache.clear();
+            }
+
+            let reader_daemon = daemon.clone();
+            let reader = thread::spawn(move || {
+                let mut br = BufReader::new(stdout);
+                let mut line = Vec::new();
+                loop {
+                    line.clear();
+                    match br.read_until(b'\n', &mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if let Ok(s) = std::str::from_utf8(&line) {
+                                let trimmed = s.trim();
+                                if trimmed.contains("\"sas_req\"")
+                                    && serde_json::from_str::<serde_json::Value>(trimmed)
+                                        .ok()
+                                        .and_then(|v| v.get("event").and_then(|e| e.as_str()).map(|e| e == "sas_req"))
+                                        == Some(true)
+                                {
+                                    send_sas_session0();
+                                    continue;
+                                }
+                            }
+                            let mut g = reader_daemon.lock().unwrap_or_else(|e| e.into_inner());
+                            g.cache.record(&line);
+                            if let Some(tx) = g.client_tx.as_ref() {
+                                if tx.send(line.clone()).is_err() {
+                                    g.client_tx = None;
+                                }
+                            } else if let Ok(s) = std::str::from_utf8(&line) {
+                                // No GUI attached (e.g. Winlogon boot): persist worker log/status lines
+                                // into the shared service log so diagnostics are never lost.
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(s.trim()) {
+                                    match v.get("event").and_then(|e| e.as_str()) {
+                                        Some("log") => {
+                                            let lvl = v.get("level").and_then(|x| x.as_str()).unwrap_or("info");
+                                            let msg = v.get("msg").and_then(|x| x.as_str()).unwrap_or("");
+                                            write_line(lvl, &format!("worker: {msg}"));
+                                        }
+                                        Some("status") => {
+                                            let st = v.get("state").and_then(|x| x.as_str()).unwrap_or("");
+                                            let msg = v.get("message").and_then(|x| x.as_str()).unwrap_or("");
+                                            write_line("info", &format!("worker status={st}: {msg}"));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            // Supervise running worker until it exits, session ID changes, wake/reconfig happens, or STOP.
+            let mut intentional_stop = false;
+            while !STOP.load(Ordering::SeqCst) && worker.running() {
+                let cur_session = unsafe { WTSGetActiveConsoleSessionId() };
+                let session_moved = cur_session != 0xFFFF_FFFF && cur_session != 0 && cur_session != session;
+                let power_woke = POWER_RESUMED.swap(false, Ordering::SeqCst);
+                let _ = SESSION_CHANGED.swap(false, Ordering::SeqCst);
+                let (want_stop, reason) = {
+                    let g = daemon.lock().unwrap_or_else(|e| e.into_inner());
+                    if !g.desired_enabled {
+                        (true, "sharing disabled")
+                    } else if g.restart_requested {
+                        (true, "reconfigure requested")
+                    } else if session_moved {
+                        (true, "console session changed")
+                    } else if power_woke {
+                        (true, "system resumed from sleep")
+                    } else {
+                        (false, "")
+                    }
+                };
+                if want_stop {
+                    intentional_stop = true;
+                    log("info", &format!("stopping worker pid {} ({reason})", worker.pid));
+                    break;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+
+            // Tear down worker cleanly.
+            let stdin_opt = {
+                let mut g = daemon.lock().unwrap_or_else(|e| e.into_inner());
+                g.worker_stdin.take()
+            };
+            if worker.running() {
+                if let Some(mut stdin_f) = stdin_opt {
+                    let _ = stdin_f.write_all(b"{\"cmd\":\"stop\"}\n");
+                    let _ = stdin_f.flush();
+                }
+                if !worker.wait(STOP_GRACE) {
+                    log("warn", &format!("worker pid {} did not stop in time: terminating", worker.pid));
+                    worker.kill();
+                }
+            }
+            let _ = reader.join();
+            let code = worker.exit_code();
+            log("info", &format!("worker pid {} exited (code={code:?})", worker.pid));
+            {
+                let mut g = daemon.lock().unwrap_or_else(|e| e.into_inner());
+                g.worker_running = false;
+                g.active_session = None;
+                g.worker_stdin = None;
+                // Only drop GUI client pipe if sharing was explicitly disabled; on session/power
+                // respawn the GUI stays attached seamlessly to receive the new worker's events!
+                if !g.desired_enabled || STOP.load(Ordering::SeqCst) {
+                    g.client_tx = None;
+                }
+            }
+
+            if STOP.load(Ordering::SeqCst) {
+                break;
+            }
+            if intentional_stop || started.elapsed() > Duration::from_secs(15) {
+                backoff = Duration::from_secs(1);
+            } else {
+                let until = Instant::now() + backoff;
+                while Instant::now() < until && !STOP.load(Ordering::SeqCst) {
+                    let wake = {
+                        let g = daemon.lock().unwrap_or_else(|e| e.into_inner());
+                        g.restart_requested || !g.desired_enabled
+                    };
+                    if wake {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(8));
+            }
+        }
     }
 
     /// Connects (and drops) a dummy client so a blocked `ConnectNamedPipe` returns.
@@ -337,7 +639,7 @@ mod imp {
             .map_err(|e| format!("pipe ACL: {e}"))?;
         let sa = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: sd.0, bInheritHandle: false.into() };
         let name = wide(PIPE_NAME);
-        // One instance only (FIRST_PIPE_INSTANCE stops a squatter, max 1 = one client at a time).
+        // One instance only (FIRST_PIPE_INSTANCE stops a squatter, max 1 = one GUI controller at a time).
         // SAFETY: valid name + attributes for the duration of the call.
         let h = unsafe {
             CreateNamedPipeW(
@@ -362,7 +664,7 @@ mod imp {
         Ok(h)
     }
 
-    fn serve() {
+    fn serve(daemon: Arc<std::sync::Mutex<DaemonState>>) {
         let pipe = match create_pipe() {
             Ok(h) => h,
             Err(e) => {
@@ -389,13 +691,13 @@ mod imp {
             if STOP.load(Ordering::SeqCst) {
                 break;
             }
-            log("info", "client connected");
-            handle_client(pipe);
+            log("info", "GUI client connected");
+            handle_client(pipe, &daemon);
             // SAFETY: valid handle; the client end is closed / done.
             unsafe {
                 let _ = DisconnectNamedPipe(pipe);
             }
-            log("info", "client disconnected");
+            log("info", "GUI client disconnected (daemon worker stays autonomous)");
         }
         // SAFETY: we own the handle.
         unsafe {
@@ -403,8 +705,10 @@ mod imp {
         }
     }
 
-    /// Runs one client session on the already connected pipe.
-    fn handle_client(pipe: HANDLE) {
+    /// Attaches one GUI client session to the autonomous daemon worker.
+    /// Closing the GUI pipe detaches cleanly WITHOUT killing the running worker;
+    /// only an explicit `stop_sharing` op or `{"cmd":"stop"}` command stops the worker.
+    fn handle_client(pipe: HANDLE, daemon: &Arc<std::sync::Mutex<DaemonState>>) {
         let (otx, orx) = channel::<Vec<u8>>(); // service -> client
         let (itx, irx) = channel::<Vec<u8>>(); // client -> service
         let stop_pump = Arc::new(AtomicBool::new(false));
@@ -424,74 +728,131 @@ mod imp {
             let _ = otx.send(l.into_bytes());
         };
 
-        let first = read_first_line(&irx, SPAWN_TIMEOUT).and_then(|(line, rest)| parse_spawn_line(&line).map(|a| (a, rest)));
-        let (args, rest) = match first {
+        let first = read_first_line(&irx, SPAWN_TIMEOUT).and_then(|(line, rest)| parse_client_op(&line).map(|op| (op, rest)));
+        let (op, rest) = match first {
             Ok(v) => v,
             Err(m) => {
                 fail(&otx, &m);
-                drop(otx);
-                let _ = pump_thread.join(); // flushes the error line, then ends (outgoing closed)
-                thread::sleep(Duration::from_millis(150)); // let the client read it before disconnecting
-                return;
-            }
-        };
-        log("info", &format!("spawn worker, args: {}", args.join(" ")));
-        let mut worker = match spawn_worker(&args) {
-            Ok(w) => w,
-            Err(m) => {
-                fail(&otx, &format!("không chạy được tiến trình host: {m}"));
                 drop(otx);
                 let _ = pump_thread.join();
                 thread::sleep(Duration::from_millis(150));
                 return;
             }
         };
-        log("info", &format!("worker pid {} started in console session", worker.pid));
 
-        // worker stdout -> client (every complete line); closing the sender ends the pump.
-        let reader = {
-            let out = worker.stdout.take().expect("stdout");
-            thread::spawn(move || {
-                let mut br = BufReader::new(out);
-                let mut line = Vec::new();
-                loop {
-                    line.clear();
-                    match br.read_until(b'\n', &mut line) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {
-                            if otx.send(line.clone()).is_err() {
-                                break;
-                            }
-                        }
+        let my_id: u64;
+        match op {
+            ClientOp::StopSharing => {
+                log("info", "GUI requested stop_sharing");
+                let mut g = daemon.lock().unwrap_or_else(|e| e.into_inner());
+                g.desired_enabled = false;
+                g.restart_requested = true;
+                g.client_tx = None;
+                let args = g.desired_args.clone();
+                drop(g);
+                save_boot_config(false, &args);
+                drop(otx);
+                let _ = pump_thread.join();
+                return;
+            }
+            ClientOp::Attach(args) | ClientOp::Spawn(args) => {
+                let mut g = daemon.lock().unwrap_or_else(|e| e.into_inner());
+                g.client_id = g.client_id.wrapping_add(1);
+                my_id = g.client_id;
+                let already_matching = g.worker_running && g.desired_enabled && g.active_args == args;
+                if already_matching {
+                    log("info", "GUI attached seamlessly to running daemon worker (zero disconnect)");
+                    for line in g.cache.snapshot() {
+                        let _ = otx.send(line);
+                    }
+                    g.client_tx = Some(otx.clone());
+                } else {
+                    log("info", &format!("GUI configuring daemon worker: {}", args.join(" ")));
+                    g.desired_enabled = true;
+                    g.desired_args = args.clone();
+                    if g.worker_running {
+                        g.restart_requested = true;
+                    }
+                    g.client_tx = Some(otx.clone());
+                    drop(g);
+                    save_boot_config(true, &args);
+                }
+            }
+        }
+
+        // Relay GUI commands -> current worker stdin.
+        let mut pending_bytes = rest;
+        let mut explicit_stop = false;
+        while !STOP.load(Ordering::SeqCst) {
+            if !pending_bytes.is_empty() {
+                if let Ok(s) = std::str::from_utf8(&pending_bytes) {
+                    if s.lines().any(|l| {
+                        serde_json::from_str::<serde_json::Value>(l.trim())
+                            .ok()
+                            .and_then(|v| v.get("cmd").and_then(|c| c.as_str()).map(|c| c == "stop"))
+                            == Some(true)
+                    }) {
+                        explicit_stop = true;
                     }
                 }
-            })
-        };
+                let mut g = daemon.lock().unwrap_or_else(|e| e.into_inner());
+                if explicit_stop {
+                    log("info", "GUI sent explicit stop command -> stopping daemon worker");
+                    g.desired_enabled = false;
+                    g.restart_requested = true;
+                    let args = g.desired_args.clone();
+                    if let Some(stdin) = g.worker_stdin.as_mut() {
+                        let _ = stdin.write_all(&pending_bytes).and_then(|_| stdin.flush());
+                    }
+                    drop(g);
+                    save_boot_config(false, &args);
+                    pending_bytes.clear();
+                    break;
+                }
+                if let Some(stdin) = g.worker_stdin.as_mut() {
+                    let _ = stdin.write_all(&pending_bytes).and_then(|_| stdin.flush());
+                    pending_bytes.clear();
+                } else {
+                    // Worker is still starting up: keep buffered up to 16 KiB and retry on next tick.
+                    if pending_bytes.len() > 16 * 1024 {
+                        pending_bytes.clear();
+                    }
+                }
+            }
 
-        // client -> worker stdin
-        let mut stdin = worker.stdin.take().expect("stdin");
-        let mut alive = stdin.write_all(&rest).and_then(|_| stdin.flush()).is_ok();
-        while alive && !STOP.load(Ordering::SeqCst) {
-            match irx.recv_timeout(Duration::from_millis(200)) {
-                Ok(chunk) => alive = stdin.write_all(&chunk).and_then(|_| stdin.flush()).is_ok(),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => alive = worker.running(),
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break, // client gone or worker output ended
+            match irx.recv_timeout(Duration::from_millis(100)) {
+                Ok(chunk) => pending_bytes.extend_from_slice(&chunk),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let g = daemon.lock().unwrap_or_else(|e| e.into_inner());
+                    if g.client_id != my_id || g.client_tx.is_none() {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-        if worker.running() {
-            log("info", "client left: asking the worker to stop");
-            let _ = stdin.write_all(b"{\"cmd\":\"stop\"}\n");
-            let _ = stdin.flush();
-            if !worker.wait(STOP_GRACE) {
-                log("warn", "worker did not stop in time: terminating");
-                worker.kill();
+
+        // Wait briefly for explicit stop to complete so the GUI knows USB handles are released.
+        if explicit_stop {
+            let t0 = Instant::now();
+            while t0.elapsed() < STOP_GRACE + Duration::from_millis(500) {
+                let running = daemon.lock().unwrap_or_else(|e| e.into_inner()).worker_running;
+                if !running {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
             }
         }
-        drop(stdin);
-        let _ = reader.join();
+
+        {
+            let mut g = daemon.lock().unwrap_or_else(|e| e.into_inner());
+            if g.client_id == my_id {
+                g.client_tx = None;
+            }
+        }
+        drop(otx);
         stop_pump.store(true, Ordering::SeqCst);
         let _ = pump_thread.join();
-        log("info", &format!("worker exit code {:?}", worker.exit_code()));
     }
 
     struct Worker {
@@ -533,8 +894,8 @@ mod imp {
         }
     }
 
-    /// Launches `<this exe> --host-worker <args>` as SYSTEM in the active console session.
-    fn spawn_worker(args: &[String]) -> Result<Worker, String> {
+    /// Launches `<this exe> --host-worker <args>` as SYSTEM in the given console `session`.
+    fn spawn_worker(args: &[String], session: u32) -> Result<Worker, String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let mut cmd = quote_arg(&exe.to_string_lossy());
         cmd.push_str(" --host-worker");
@@ -546,7 +907,6 @@ mod imp {
         let mut desktop = wide("winsta0\\default");
         // SAFETY: plain Win32 calls; every handle opened here is closed on all paths below.
         unsafe {
-            let session = WTSGetActiveConsoleSessionId();
             if session == 0xFFFF_FFFF {
                 return Err("không có phiên console đang hoạt động".into());
             }
@@ -804,10 +1164,31 @@ mod imp {
             }
             Err(e) => return Err(format!("OpenService: {e}")),
         };
-        let mut desc = wide("Cho phép RemoteView hiển thị và điều khiển cả màn hình khóa / đăng nhập / UAC của Windows.");
+        let mut desc = wide("Tự động chạy RemoteView ngay khi bật máy (cắm cáp USB là nhận cả màn hình khóa / đăng nhập / UAC).");
         let info = SERVICE_DESCRIPTIONW { lpDescription: PWSTR(desc.as_mut_ptr()) };
         // SAFETY: `info` outlives the call. Cosmetic: errors ignored.
         let _ = unsafe { ChangeServiceConfig2W(svc.0, SERVICE_CONFIG_DESCRIPTION, Some(&info as *const _ as *const c_void)) };
+        // Configure automatic SCM recovery (restart after 2s, 5s, 10s; reset failure count after 24h).
+        let mut actions = [
+            SC_ACTION { Type: SC_ACTION_RESTART, Delay: 2_000 },
+            SC_ACTION { Type: SC_ACTION_RESTART, Delay: 5_000 },
+            SC_ACTION { Type: SC_ACTION_RESTART, Delay: 10_000 },
+        ];
+        let fa = SERVICE_FAILURE_ACTIONSW {
+            dwResetPeriod: 86_400,
+            lpRebootMsg: PWSTR::null(),
+            lpCommand: PWSTR::null(),
+            cActions: actions.len() as u32,
+            lpsaActions: actions.as_mut_ptr(),
+        };
+        // SAFETY: `actions` and `fa` live for the duration of the call.
+        let _ = unsafe { ChangeServiceConfig2W(svc.0, SERVICE_CONFIG_FAILURE_ACTIONS, Some(&fa as *const _ as *const c_void)) };
+        // Ensure a valid machine-wide boot config exists so the daemon starts immediately on boot.
+        if let Some(p) = service_config_path() {
+            if !p.exists() {
+                let _ = ServiceBootConfig::default().save_to(&p);
+            }
+        }
         enable_software_sas();
         // SAFETY: valid handle, no start arguments.
         match unsafe { StartServiceW(svc.0, None) } {
@@ -821,7 +1202,7 @@ mod imp {
 
     /// `--install-all <dir|->`: SudoVDA (unless `-`) + service. Exit code 0 only if both worked.
     pub fn install_all_main(dir: Option<String>) -> i32 {
-        let _ = rv_host_win::logfile::init("remoteview-service");
+        init_service_log();
         let mut ok = true;
         match dir.as_deref() {
             None => return 2,

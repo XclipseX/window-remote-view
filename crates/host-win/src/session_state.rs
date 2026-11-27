@@ -109,6 +109,86 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(windows)]
+fn desktop_warn_gate() -> &'static std::sync::Mutex<crate::logfile::WarnGate> {
+    use std::sync::{Mutex, OnceLock};
+    static GATE: OnceLock<Mutex<crate::logfile::WarnGate>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(crate::logfile::WarnGate::new()))
+}
+
+#[cfg(windows)]
+fn warn_desktop_err(msg: String) {
+    if let Ok(mut g) = desktop_warn_gate().lock() {
+        if g.should_log(&msg) {
+            crate::control::log(crate::control::Level::Warn, &msg);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn clear_desktop_err() {
+    if let Ok(mut g) = desktop_warn_gate().lock() {
+        let _ = g.recovered();
+    }
+}
+
+#[cfg(windows)]
+fn open_input_desktop_handle(
+) -> windows::core::Result<windows::Win32::System::StationsAndDesktops::HDESK> {
+    use windows::Win32::System::StationsAndDesktops::*;
+    let explicit = DESKTOP_ACCESS_FLAGS(
+        DESKTOP_READOBJECTS.0
+            | DESKTOP_WRITEOBJECTS.0
+            | DESKTOP_CREATEWINDOW.0
+            | DESKTOP_SWITCHDESKTOP.0
+            | DESKTOP_HOOKCONTROL.0
+            | DESKTOP_ENUMERATE.0,
+    );
+    const MAXIMUM_ALLOWED: DESKTOP_ACCESS_FLAGS = DESKTOP_ACCESS_FLAGS(0x0200_0000);
+    // SAFETY: plain Win32 call returning a desktop handle owned by the caller.
+    unsafe {
+        OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, explicit)
+            .or_else(|_| OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, MAXIMUM_ALLOWED))
+    }
+}
+
+#[cfg(windows)]
+fn follow_input_desktop_inner(force: bool) -> Option<String> {
+    use windows::Win32::System::StationsAndDesktops::*;
+    // SAFETY: plain Win32 calls; handles are owned by the thread-local until replaced.
+    unsafe {
+        let desk = match open_input_desktop_handle() {
+            Ok(d) => d,
+            Err(e) => {
+                warn_desktop_err(format!("desktop: OpenInputDesktop failed: {e}"));
+                return None;
+            }
+        };
+        let Some(name) = desktop_name(desk) else {
+            let _ = CloseDesktop(desk);
+            return None;
+        };
+        ATTACHED.with(|a| {
+            let mut a = a.borrow_mut();
+            if !force && a.as_ref().is_some_and(|(n, _)| *n == name) {
+                let _ = CloseDesktop(desk); // already attached to this desktop
+                clear_desktop_err();
+                return Some(name);
+            }
+            if let Err(e) = SetThreadDesktop(desk) {
+                warn_desktop_err(format!("desktop: SetThreadDesktop({name}) failed: {e}"));
+                let _ = CloseDesktop(desk);
+                return None;
+            }
+            if let Some((_, old)) = a.replace((name.clone(), desk)) {
+                let _ = CloseDesktop(old);
+            }
+            clear_desktop_err();
+            Some(name)
+        })
+    }
+}
+
 /// Attaches the calling thread to the current *input* desktop (`OpenInputDesktop` +
 /// `SetThreadDesktop`) and returns its name (`Default`, `Winlogon`, `Screen-saver`, ...).
 /// Needed so DXGI duplication, GDI, cursor reads and `SendInput` of this thread see / reach the
@@ -117,35 +197,24 @@ thread_local! {
 /// `None` on failure (the thread then stays where it was). Cheap when the desktop did not change.
 #[cfg(windows)]
 pub fn follow_input_desktop() -> Option<String> {
-    use windows::Win32::System::StationsAndDesktops::*;
-    // GENERIC_ALL maps to every DESKTOP_* right (capture, input, hooks, window creation).
-    // SAFETY: plain Win32 calls; handles are owned by the thread-local until replaced.
-    unsafe {
-        let desk = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_ACCESS_FLAGS(0x1000_0000)).ok()?;
-        let Some(name) = desktop_name(desk) else {
-            let _ = CloseDesktop(desk);
-            return None;
-        };
-        ATTACHED.with(|a| {
-            let mut a = a.borrow_mut();
-            if a.as_ref().is_some_and(|(n, _)| *n == name) {
-                let _ = CloseDesktop(desk); // already attached to this desktop
-                return Some(name);
-            }
-            if SetThreadDesktop(desk).is_err() {
-                let _ = CloseDesktop(desk);
-                return None;
-            }
-            if let Some((_, old)) = a.replace((name.clone(), desk)) {
-                let _ = CloseDesktop(old);
-            }
-            Some(name)
-        })
-    }
+    follow_input_desktop_inner(false)
 }
 
 #[cfg(not(windows))]
 pub fn follow_input_desktop() -> Option<String> {
+    None
+}
+
+/// Like [`follow_input_desktop`], but always calls `SetThreadDesktop` even when
+/// the input desktop name matches the previously attached one (handles recreated
+/// `"Default"` desktops after logoff/logon).
+#[cfg(windows)]
+pub fn force_follow_input_desktop() -> Option<String> {
+    follow_input_desktop_inner(true)
+}
+
+#[cfg(not(windows))]
+pub fn force_follow_input_desktop() -> Option<String> {
     None
 }
 
@@ -171,10 +240,44 @@ impl DesktopFollower {
         self.system
     }
 
+    /// Name of the currently attached input desktop, if known.
+    pub fn current_name(&self) -> Option<&str> {
+        self.current.as_deref()
+    }
+
     /// Like [`poll`](Self::poll) but ignores the rate limit (call right before re-opening capture).
     pub fn poll_now(&mut self) -> bool {
         self.last_check = None;
         self.poll()
+    }
+
+    /// Unconditionally re-attaches the calling thread to the current input desktop
+    /// (even if its name is unchanged, e.g. a recreated `"Default"` desktop after
+    /// logoff/logon). Updates `self.current`, logs transitions, and returns `true`
+    /// when re-attachment succeeded.
+    pub fn force_poll(&mut self) -> bool {
+        if !self.system {
+            return false;
+        }
+        self.last_check = Some(std::time::Instant::now());
+        let Some(name) = force_follow_input_desktop() else { return false };
+        let changed = self.current.as_deref() != Some(name.as_str());
+        if self.log {
+            if changed {
+                let from = self.current.as_deref().unwrap_or("?");
+                crate::control::log(
+                    crate::control::Level::Info,
+                    &format!("desktop: {from} -> {name} ({})", self.tag),
+                );
+            } else {
+                crate::control::log(
+                    crate::control::Level::Info,
+                    &format!("desktop: re-attached to {name} ({})", self.tag),
+                );
+            }
+        }
+        self.current = Some(name);
+        true
     }
 
     /// Re-attaches the thread when the input desktop changed (rate-limited). Returns `true`

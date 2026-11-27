@@ -116,8 +116,30 @@ object NativeBridge {
     /** Gửi file log (UTF-8) lên máy tính qua phiên đang mở; [name] là tên file đề xuất. Trả true nếu đã gửi. */
     external fun nativeUploadLog(handle: Long, name: String, data: ByteArray): Boolean
 
-    /** Rust yêu cầu gửi một datagram ra liên kết USB; [datagramSender] do SessionController đặt. */
-    @Volatile var datagramSender: ((ByteArray) -> Unit)? = null
+    private val senderLock = Any()
+    private var senderOwner: Any? = null
+    @Volatile private var activeDatagramSender: ((ByteArray) -> Unit)? = null
+
+    /** Rust yêu cầu gửi một datagram ra liên kết USB; gắn kèm [owner] để phiên cũ không ghi đè hoặc xóa link phiên mới. */
+    fun setDatagramSender(owner: Any, sender: (ByteArray) -> Unit) {
+        synchronized(senderLock) {
+            senderOwner = owner
+            activeDatagramSender = sender
+        }
+    }
+
+    /** Gỡ datagramSender chỉ khi [owner] vẫn là chủ sở hữu hiện tại. */
+    fun clearDatagramSender(owner: Any) {
+        synchronized(senderLock) {
+            if (senderOwner === owner) {
+                senderOwner = null
+                activeDatagramSender = null
+            }
+        }
+    }
+
+    /** Kiểm tra [owner] có đang sở hữu datagramSender hay không. */
+    fun isDatagramSenderOwner(owner: Any): Boolean = synchronized(senderLock) { senderOwner === owner }
 
     // --- Hàm Rust gọi ngược (qua JNI) để đẩy dữ liệu lên Kotlin ---
     @JvmStatic @Keep
@@ -137,7 +159,7 @@ object NativeBridge {
 
     @JvmStatic @Keep
     fun onSendDatagramFromNative(data: ByteArray) {
-        datagramSender?.invoke(data)
+        activeDatagramSender?.invoke(data)
     }
 
     @JvmStatic @Keep

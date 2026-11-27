@@ -44,6 +44,21 @@ pub struct SudoVdaMonitor {
     pub gdi_name: String,
 }
 
+#[cfg(not(windows))]
+impl SudoVdaMonitor {
+    pub fn gdi_name(&self) -> &str {
+        &self.gdi_name
+    }
+
+    pub fn refresh_gdi_name(&mut self) -> Option<String> {
+        None
+    }
+
+    pub fn reapply(&mut self, _virtual_primary: bool) -> bool {
+        false
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use super::*;
@@ -199,6 +214,9 @@ mod imp {
         h: SendHandle,
         stop: Arc<AtomicBool>,
         ping: Option<std::thread::JoinHandle<()>>,
+        luid: LUID,
+        target: u32,
+        mode: DisplayMode,
         /// GDI name (`\\.\DISPLAYn`) of the new monitor.
         pub gdi_name: String,
     }
@@ -266,7 +284,15 @@ mod imp {
                     })
                     .ok()
             };
-            let mut me = SudoVdaMonitor { h: SendHandle(h), stop, ping, gdi_name: String::new() };
+            let mut me = SudoVdaMonitor {
+                h: SendHandle(h),
+                stop,
+                ping,
+                luid: out.luid,
+                target: out.target_id,
+                mode,
+                gdi_name: String::new(),
+            };
             // Windows attaches the new monitor asynchronously.
             let t0 = Instant::now();
             while t0.elapsed() < Duration::from_secs(10) {
@@ -282,6 +308,38 @@ mod imp {
             info!("sudovda: monitor is {} after {} ms", me.gdi_name, t0.elapsed().as_millis());
             ensure_display_mode(&me.gdi_name, mode);
             Ok(me)
+        }
+
+        /// Current GDI name (`\\.\DISPLAYn`) of this virtual monitor.
+        pub fn gdi_name(&self) -> &str {
+            &self.gdi_name
+        }
+
+        /// Re-queries the active GDI source name for `(self.luid, self.target)` and updates
+        /// `self.gdi_name`. Returns `Some(name)` when the monitor path is active.
+        pub fn refresh_gdi_name(&mut self) -> Option<String> {
+            let name = gdi_name_for(self.luid, self.target)?;
+            if !name.eq_ignore_ascii_case(&self.gdi_name) {
+                info!("sudovda: GDI name updated {} -> {name}", self.gdi_name);
+            }
+            self.gdi_name = name.clone();
+            Some(name)
+        }
+
+        /// Refreshes the monitor's GDI name, re-applies its display mode, and optionally
+        /// promotes it to primary display (useful after desktop/session transitions).
+        pub fn reapply(&mut self, virtual_primary: bool) -> bool {
+            let Some(name) = self.refresh_gdi_name() else {
+                warn!("sudovda: reapply: target {} not active in DisplayConfig", self.target);
+                return false;
+            };
+            ensure_display_mode(&name, self.mode);
+            if virtual_primary {
+                if let Err(e) = make_primary(&name) {
+                    warn!("sudovda: reapply make_primary({name}) failed: {e}");
+                }
+            }
+            true
         }
     }
 
@@ -344,7 +402,14 @@ mod imp {
                 return;
             };
             target.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
-            let r = ChangeDisplaySettingsExW(PCWSTR(wname.as_ptr()), Some(&target), None, CDS_UPDATEREGISTRY, None);
+            let mut r = ChangeDisplaySettingsExW(PCWSTR(wname.as_ptr()), Some(&target), None, CDS_UPDATEREGISTRY, None);
+            if r != DISP_CHANGE_SUCCESSFUL {
+                warn!(
+                    "sudovda: ChangeDisplaySettingsExW({gdi_name}, {}x{}@{}Hz, CDS_UPDATEREGISTRY) returned {}; retrying dynamic-only",
+                    target.dmPelsWidth, target.dmPelsHeight, target.dmDisplayFrequency, r.0
+                );
+                r = ChangeDisplaySettingsExW(PCWSTR(wname.as_ptr()), Some(&target), None, CDS_TYPE(0), None);
+            }
             if r != DISP_CHANGE_SUCCESSFUL {
                 warn!(
                     "sudovda: ChangeDisplaySettingsExW({gdi_name}, {}x{}@{}Hz) returned {}",
@@ -424,6 +489,7 @@ mod imp {
             let target = wide(gdi_name);
             let tdm = cur(&target).ok_or("không đọc được vị trí màn hình ảo")?;
             let origin = tdm.Anonymous1.Anonymous2.dmPosition;
+            let mut displays: Vec<(String, bool)> = Vec::new();
             let mut i = 0;
             loop {
                 let mut dd = DISPLAY_DEVICEW { cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32, ..Default::default() };
@@ -434,19 +500,41 @@ mod imp {
                 if dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP == DISPLAY_DEVICE_STATE_FLAGS(0) {
                     continue;
                 }
-                let name = wstr(&dd.DeviceName);
-                let wname = wide(&name);
+                let is_primary = dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE != DISPLAY_DEVICE_STATE_FLAGS(0);
+                displays.push((wstr(&dd.DeviceName), is_primary));
+            }
+            if origin.x == 0
+                && origin.y == 0
+                && displays.iter().any(|(n, prim)| *prim && n.eq_ignore_ascii_case(gdi_name))
+            {
+                return Ok(());
+            }
+            for (name, _) in &displays {
+                let wname = wide(name);
                 let Some(mut dm) = cur(&wname) else { continue };
                 let is_target = name.eq_ignore_ascii_case(gdi_name);
                 let pos = dm.Anonymous1.Anonymous2.dmPosition;
                 dm.Anonymous1.Anonymous2.dmPosition.x = if is_target { 0 } else { pos.x - origin.x };
                 dm.Anonymous1.Anonymous2.dmPosition.y = if is_target { 0 } else { pos.y - origin.y };
                 dm.dmFields = DM_POSITION;
-                let mut flags = CDS_UPDATEREGISTRY | CDS_NORESET;
-                if is_target {
-                    flags |= CDS_SET_PRIMARY;
+                let primary_flag = if is_target { CDS_SET_PRIMARY } else { CDS_TYPE(0) };
+                let mut r = ChangeDisplaySettingsExW(
+                    PCWSTR(wname.as_ptr()),
+                    Some(&dm),
+                    None,
+                    CDS_UPDATEREGISTRY | CDS_NORESET | primary_flag,
+                    None,
+                );
+                if r != DISP_CHANGE_SUCCESSFUL {
+                    warn!("make_primary: {name}: DISP_CHANGE {} with CDS_UPDATEREGISTRY; retrying dynamic-only", r.0);
+                    r = ChangeDisplaySettingsExW(
+                        PCWSTR(wname.as_ptr()),
+                        Some(&dm),
+                        None,
+                        CDS_NORESET | primary_flag,
+                        None,
+                    );
                 }
-                let r = ChangeDisplaySettingsExW(PCWSTR(wname.as_ptr()), Some(&dm), None, flags, None);
                 if r != DISP_CHANGE_SUCCESSFUL {
                     warn!("make_primary: {name}: DISP_CHANGE {}", r.0);
                 }

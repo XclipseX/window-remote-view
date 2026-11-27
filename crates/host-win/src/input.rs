@@ -39,6 +39,7 @@ pub fn text_units(s: &str) -> Vec<u16> {
 
 pub trait InputInjector {
     fn inject(&mut self, ev: &InputEvent) -> Result<()>;
+    fn on_desktop_changed(&mut self) {}
 }
 
 #[cfg(windows)]
@@ -54,6 +55,7 @@ impl WinInjector {
         Err(HostError::Unsupported("input injection needs Windows"))
     }
     pub fn set_display(&mut self, _display: Rect) {}
+    pub fn on_desktop_changed(&mut self) {}
 }
 
 #[cfg(not(windows))]
