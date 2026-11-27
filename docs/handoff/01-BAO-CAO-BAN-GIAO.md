@@ -168,6 +168,44 @@ Overlay Android vẽ theo `CursorPos` chuẩn hóa trên khung capture; ở ch�
 
 Mỗi agent: đọc vault + graphify trước, chỉ sửa vùng của mình, chạy test vùng mình, ghi ADR/bug, báo cáo ngắn cho A1.
 
+## 10. Hiện trạng chi tiết từng thành phần
+
+**rv-proto (giao thức v2).** Header ngoài 12 byte gồm version, session_id, packet_type và nonce 48 bit. Gói video có header 20 byte, các trường shard_idx/data_k/parity_m kiểu u16, block_idx/block_count kiểu u8. Gói âm thanh 10 byte, gói input 6 byte, gói control 6 byte. Bộ test có round-trip cho từng loại và fuzz 50.000 mẫu ngẫu nhiên không làm panic. Điểm yếu: chưa có cơ chế đàm phán phiên bản, v1 và v2 từ chối nhau hoàn toàn. Nếu sau này đổi giao thức tiếp, nên thêm trường "min/max version" trong Hello để báo lỗi rõ ràng thay vì im lặng.
+
+**rv-crypto.** Dùng snow (Noise) với ba mẫu XX, XXpsk3 và IK. OTP được đưa qua argon2id (salt là host_id) để làm PSK. `Session::seal/open` dùng nonce tường minh, phù hợp với UDP và AOA. Header được bảo vệ bằng cách nhúng hash 16 byte vào phần mã hóa, nên mỗi gói tốn thêm 32 byte. Có thể tối ưu bằng cách dùng trực tiếp ChaCha20-Poly1305 với AAD sau khi bắt tay. Đã có AttemptLimiter, khóa từng peer khi sai OTP.
+
+**rv-transport / rv-session.** FEC theo khối hoạt động tốt trong test, chịu được 5% mất gói với khung 3–8 MB. Keepalive 1 giây, timeout 5 giây, cho phép bắt tay lại mà không cần khởi động lại tiến trình. Khi chạy qua USB thì gần như không mất gói, nên có thể giảm parity về 0 để tiết kiệm băng thông và CPU. Cần thêm một cờ "link tin cậy" truyền từ usb-link vào session.
+
+**rv-usb-link.** AOA đã chạy trên thiết bị thật: mở được accessory, xác định đúng endpoint IN 0x81 và OUT 0x01, đọc ghi ổn định ở vài MB/s. Chưa đo thông lượng tối đa. USB 3 về lý thuyết đạt hàng trăm MB/s, đủ cho 2800×1752@120 ở 100+ Mbps. Đã có lần ghi bị timeout ("link write failed: Operation timed out") khi Android ngừng đọc, cần xử lý đóng mở lại mượt hơn. Driver WinUSB: máy chủ dự án đã có driver sẵn từ Zadig, còn đường libwdi tự cài chưa được thử trên máy sạch.
+
+**rv-host-win.** Capture: DXGI Desktop Duplication tự phục hồi, có GDI fallback, chọn output theo thứ tự ưu tiên (màn trong > màn vật lý > màn ảo). Trên máy chủ dự án chỉ có màn ảo TeamViewer nên app chọn nó, như vậy là đúng. Encode: supervisor thử MF HEVC phần cứng, rồi MF ở chế độ bộ nhớ hệ thống, rồi OpenH264. Audio: WASAPI loopback + Opus 10 ms, chưa xác nhận phía Android phát ra tiếng. Input: SendInput, Touch và Pen injection, chưa kiểm chứng trên thiết bị. Cursor: GetCursorInfo + DrawIconEx, gửi shape và vị trí. Power: giữ máy không ngủ khi đang chia sẻ. Lock: phát hiện desktop không phải "Default" thì gửi khung cuối.
+
+**rv-win-ui.** Gồm các màn hình: trang chính (thẻ thiết bị, nút Kết nối, trạng thái, thống kê, biểu đồ FPS), cài đặt (độ phân giải, FPS, chất lượng, codec, bộ mã hóa, màn hình cần chia sẻ, tự khởi động, tự cập nhật), hướng dẫn USB, nhật ký có nút Xuất log, và Giới thiệu kèm nút cập nhật. Font Segoe UI để hiển thị tiếng Việt. Chưa có tray icon, chưa nhúng icon vào .exe, chưa có trình cài đặt.
+
+**Android.** Giao diện Material 3 thích ứng (thanh điều hướng dưới trên điện thoại, NavigationRail hai cột trên tablet). Decoder có thang khóa vendor cho Exynos và MTK, stall watchdog, latest-frame rendering, khóa 120 Hz, ADPF, thermal governor. Input gồm touch, trackpad, S Pen, pointer capture và Telex qua BaseInputConnection. Ngoài ra có chẩn đoán 13 mục, stress test, updater dùng PackageInstaller, log ra file kèm chia sẻ và upload, overlay con trỏ, letterbox.
+
+## 11. Checklist kiểm thử trên thiết bị cho mỗi bản phát hành
+
+1. Cài APK đè và cập nhật RemoteView.exe bằng nút cập nhật, xác nhận SHA giống nhau ở cả hai app.
+2. Mở RemoteView.exe, bấm Bắt đầu, cắm cáp: Tab phải tự mở app và tự kết nối trong vòng 3 giây, không hỏi PIN.
+3. Có hình trong vòng 2 giây sau khi bắt tay, đúng tỷ lệ, không phải thoát vào lại app.
+4. Overlay Tab hiển thị encoder đang dùng, FPS nhận, độ trễ giải mã. Encoder phải là phần cứng (AMF/MF), không phải OpenH264.
+5. Kéo một cửa sổ nhanh: không giật, không mờ chữ. Gõ văn bản: chữ sắc nét.
+6. Con trỏ khớp vị trí thật khi rê bằng trackpad, khi chạm trực tiếp và khi dùng chuột Bluetooth.
+7. Chạm, nhấn giữ, cuộn hai ngón, S Pen vẽ có lực nhấn, gõ Telex trên Samsung Keyboard.
+8. Âm thanh: phát video trên laptop, Tab có tiếng, không lệch nhiều so với hình.
+9. Rút cáp ra cắm lại: tự kết nối lại. Đưa app Android vào nền 10 giây rồi mở lại: tiếp tục chạy.
+10. Khóa màn hình laptop: Tab báo laptop đang khóa, không văng. Mở khóa thì hình quay lại.
+11. Xuất log (Tab gửi lên, laptop Xuất log) và kiểm tra file zip có đủ cả hai phía.
+
+## 12. Rủi ro và cách giảm thiểu
+
+- **Ký driver IddCx:** Windows 11 yêu cầu driver kernel và UMDF phải được Microsoft ký. Nếu tự viết thì cần chứng chỉ EV và attestation signing, vừa tốn phí vừa mất thời gian. Phương án thực tế là tận dụng driver mã nguồn mở đã ký sẵn (kiểm tra giấy phép và cách phân phối), hoặc tạm thời yêu cầu người dùng cài driver đó một lần, rồi app điều khiển nó qua API của driver.
+- **AMF/FFmpeg:** AMF SDK có giấy phép MIT, có thể gọi trực tiếp. FFmpeg (LGPL) làm file phát hành nặng thêm, cần build tĩnh trên CI. Nên ưu tiên AMF native, giữ MF làm dự phòng.
+- **Android 17 trên Tab là bản rất mới:** hành vi USB, quyền và FileProvider có thể khác các bản trước. Luôn dựa vào log thật.
+- **Chi phí CI:** máy Windows build chậm. Đã cache wdi và bỏ test trên Windows. Nếu thêm FFmpeg thì phải cache cả FFmpeg.
+- **Bảo mật:** token USB là bí mật cục bộ. Đổi token thì Tab phải cắm lại. Updater phải xác minh nguồn tải (HTTPS từ GitHub, kiểm tra kích thước và header PE/APK). Nên thêm kiểm tra chữ ký hoặc checksum SHA-256 đăng trong Release body.
+
 ## 9. Lưu ý vận hành với chủ dự án
 
 - Chủ dự án test trên máy thật và gửi log; **luôn nói rõ cái gì chưa kiểm chứng**. Đừng đoán nguyên nhân thiết bị (ví dụ từng nghi spacedesk nhưng thực tế là TeamViewer) — hỏi hoặc đọc log danh sách output.
