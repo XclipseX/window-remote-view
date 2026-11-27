@@ -8,6 +8,7 @@ mod control;
 mod driver;
 mod host;
 mod logexport;
+mod service;
 mod update;
 mod util;
 
@@ -22,6 +23,11 @@ fn main() -> eframe::Result {
         }
         // Elevated helper mode (started by the GUI through UAC): install SudoVDA from <dir>.
         Some(driver::INSTALL_VDD_FLAG) => std::process::exit(install_vdd_main(args.next())),
+        // Elevated: SudoVDA (+ the RemoteView service, so the lock screen can be shown/controlled).
+        Some(service::INSTALL_ALL_FLAG) => std::process::exit(service::install_all_main(args.next())),
+        Some(service::UNINSTALL_SERVICE_FLAG) => std::process::exit(service::uninstall_main()),
+        // Started by the Windows service manager: runs the host engine as SYSTEM on request.
+        Some(service::SERVICE_FLAG) => std::process::exit(service::run_service()),
         _ => {}
     }
     init_logging();

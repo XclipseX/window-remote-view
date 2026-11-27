@@ -4,9 +4,9 @@
 //! stuck capture therefore cannot take the GUI down.
 
 use crate::control::{parse_event, HostCmd, HostEvent, LogLevel};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -42,8 +42,11 @@ pub fn host_command(custom: Option<&str>) -> (PathBuf, Vec<String>) {
     (me, vec![WORKER_FLAG.to_string()])
 }
 
+/// Where the host engine's command lines go (child stdin or the service pipe).
+type CmdWriter = Box<dyn Write + Send>;
+
 pub struct HostProcess {
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    stdin: Arc<Mutex<Option<CmdWriter>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -100,11 +103,105 @@ fn spawn_child(exe: &PathBuf, args: &[String]) -> std::io::Result<Child> {
     cmd.spawn()
 }
 
+/// One running host engine, wherever it lives: a child process of the GUI, or a worker started
+/// by the RemoteView service (as SYSTEM) behind the named pipe.
+struct Link {
+    stdout: Box<dyn Read + Send>,
+    stderr: Option<Box<dyn Read + Send>>,
+    stdin: CmdWriter,
+    end: LinkEnd,
+}
+
+enum LinkEnd {
+    Child(Child),
+    Pipe { close: Arc<AtomicBool>, done: Arc<AtomicBool> },
+}
+
+impl LinkEnd {
+    /// `Some(exit code)` once ended (`Some(None)` = ended, code unknown).
+    fn try_wait(&mut self) -> Option<Option<i32>> {
+        match self {
+            LinkEnd::Child(c) => match c.try_wait() {
+                Ok(Some(st)) => Some(st.code()),
+                Ok(None) => None,
+                Err(_) => Some(None),
+            },
+            LinkEnd::Pipe { done, .. } => done.load(Ordering::SeqCst).then_some(None),
+        }
+    }
+
+    /// Hard stop after the grace period (the service stops its worker when the pipe closes).
+    fn kill(&mut self) -> Option<i32> {
+        match self {
+            LinkEnd::Child(c) => {
+                let _ = c.kill();
+                c.wait().ok().and_then(|s| s.code())
+            }
+            LinkEnd::Pipe { close, done } => {
+                close.store(true, Ordering::SeqCst);
+                let t = Instant::now();
+                while !done.load(Ordering::SeqCst) && t.elapsed() < Duration::from_secs(1) {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                None
+            }
+        }
+    }
+}
+
+/// Whether `args` start the engine as this exe's own worker (as opposed to a custom `rv-host`).
+fn is_self_worker(args: &[String]) -> bool {
+    args.first().map(String::as_str) == Some(WORKER_FLAG)
+}
+
+/// Connects to the RemoteView service (lock-screen capable, runs the engine as SYSTEM).
+/// `None` when the service is not installed / not reachable.
+fn connect_service(worker_args: &[String]) -> Option<Link> {
+    let mut c = match crate::service::connect() {
+        Ok(c) => c,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound && e.kind() != std::io::ErrorKind::Unsupported {
+                rv_host_win::logfile::write_line("warn", &format!("host: service pipe unusable ({e}); using a child process"));
+            }
+            return None;
+        }
+    };
+    let line = rv_host_win::service_proto::spawn_line(worker_args);
+    if c.writer.write_all(line.as_bytes()).is_err() {
+        c.close.store(true, Ordering::SeqCst);
+        return None;
+    }
+    Some(Link {
+        stdout: Box::new(c.reader),
+        stderr: None,
+        stdin: Box::new(c.writer),
+        end: LinkEnd::Pipe { close: c.close, done: c.done },
+    })
+}
+
+/// Starts the engine: through the service when this is the self-worker and the service answers,
+/// otherwise as a child process. Returns the link and a log line naming the transport.
+fn open_link(exe: &PathBuf, args: &[String]) -> std::io::Result<(Link, &'static str)> {
+    if is_self_worker(args) {
+        if let Some(l) = connect_service(&args[1..]) {
+            return Ok((l, "host: dịch vụ RemoteView (SYSTEM) qua pipe — hiển thị được cả màn hình khóa"));
+        }
+    }
+    let mut child = spawn_child(exe, args)?;
+    let link = Link {
+        stdout: Box::new(child.stdout.take().expect("piped stdout")),
+        stderr: child.stderr.take().map(|e| Box::new(e) as Box<dyn Read + Send>),
+        stdin: Box::new(child.stdin.take().expect("piped stdin")),
+        end: LinkEnd::Child(child),
+    };
+    Ok((link, "host: tiến trình con của app (không xử lý được màn hình khóa; cài dịch vụ để có)"))
+}
+
 fn supervise(
     exe: PathBuf,
     args: Vec<String>,
     tx: Sender<UiMsg>,
-    stdin_slot: Arc<Mutex<Option<ChildStdin>>>,
+    stdin_slot: Arc<Mutex<Option<CmdWriter>>>,
     stop: Arc<AtomicBool>,
     repaint: Arc<dyn Fn() + Send + Sync>,
 ) {
@@ -115,20 +212,24 @@ fn supervise(
     let mut backoff = Duration::from_secs(1);
     while !stop.load(Ordering::SeqCst) {
         let started = Instant::now();
-        let mut child = match spawn_child(&exe, &args) {
-            Ok(c) => c,
+        let (mut link, transport) = match open_link(&exe, &args) {
+            Ok(l) => l,
             Err(e) => {
                 send(UiMsg::SpawnFailed(format!("{}: {e}", exe.display())));
                 // Missing executable will not fix itself: do not loop.
                 return;
             }
         };
+        if cfg!(windows) {
+            send(UiMsg::Event(HostEvent::Log { level: LogLevel::Info, msg: transport.into() }));
+        }
         if let Ok(mut g) = stdin_slot.lock() {
-            *g = child.stdin.take();
+            *g = Some(link.stdin);
         }
         let mut readers = Vec::new();
-        if let Some(out) = child.stdout.take() {
+        {
             let (tx, rp) = (tx.clone(), repaint.clone());
+            let out = link.stdout;
             readers.push(thread::spawn(move || {
                 for line in BufReader::new(out).lines().map_while(Result::ok) {
                     let msg = match parse_event(&line) {
@@ -144,7 +245,7 @@ fn supervise(
                 }
             }));
         }
-        if let Some(err) = child.stderr.take() {
+        if let Some(err) = link.stderr.take() {
             let (tx, rp) = (tx.clone(), repaint.clone());
             readers.push(thread::spawn(move || {
                 for line in BufReader::new(err).lines().map_while(Result::ok) {
@@ -156,16 +257,13 @@ fn supervise(
 
         let mut stop_at: Option<Instant> = None;
         let status = loop {
-            match child.try_wait() {
-                Ok(Some(st)) => break Some(st),
-                Ok(None) => {}
-                Err(_) => break None,
+            if let Some(code) = link.end.try_wait() {
+                break code;
             }
             if stop.load(Ordering::SeqCst) {
                 let t = *stop_at.get_or_insert_with(Instant::now);
                 if t.elapsed() > Duration::from_secs(2) {
-                    let _ = child.kill();
-                    break child.wait().ok();
+                    break link.end.kill();
                 }
             }
             thread::sleep(Duration::from_millis(50));
@@ -173,10 +271,11 @@ fn supervise(
         if let Ok(mut g) = stdin_slot.lock() {
             *g = None;
         }
+        // A pipe link only ends when its I/O thread did, which also ends the reader.
         for r in readers {
             let _ = r.join();
         }
-        let code = status.and_then(|s| s.code());
+        let code = status;
         if stop.load(Ordering::SeqCst) {
             send(UiMsg::Stopped);
             return;

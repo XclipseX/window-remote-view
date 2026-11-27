@@ -83,6 +83,11 @@ struct Args {
     list: bool,
 }
 
+/// Whether the engine's own parser accepts `argv` (used by the service to vet client requests).
+pub fn check_args(argv: &[String]) -> Result<(), String> {
+    parse_args(argv.to_vec()).map(|_| ())
+}
+
 fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     let mut a = Args {
         mode: Mode::Auto,
@@ -683,7 +688,12 @@ fn audio_thread(start: Instant, sh: Arc<Shared>, tx: SyncSender<AudioOut>) {
 fn session_monitor_thread(sh: Arc<Shared>) {
     let mut awake = false;
     let mut last_nudge = Instant::now();
+    // SYSTEM: this is the one thread that logs "desktop: Default -> Winlogon"; it also follows
+    // the input desktop so the idle nudge below reaches it.
+    let mut follower = crate::session_state::DesktopFollower::new("monitor", Duration::from_millis(250), true);
+    let system = follower.active();
     while !sh.stop.load(Ordering::Relaxed) {
+        follower.poll();
         let ready = sh.ready.load(Ordering::Relaxed);
         if ready != awake {
             awake = ready;
@@ -692,7 +702,8 @@ fn session_monitor_thread(sh: Arc<Shared>) {
         } else if awake && last_nudge.elapsed() >= Duration::from_secs(20) {
             crate::session_state::set_keep_awake(true); // re-assert
         }
-        let locked = ready && crate::session_state::desktop_locked();
+        // As SYSTEM the lock screen is capturable and controllable: never treated as "locked".
+        let locked = ready && !system && crate::session_state::desktop_locked();
         if sh.locked.swap(locked, Ordering::Relaxed) != locked {
             if locked {
                 warn!("session: màn hình đang khóa / secure desktop; không thể ghi hình hay điều khiển cho tới khi mở khóa");
@@ -704,7 +715,7 @@ fn session_monitor_thread(sh: Arc<Shared>) {
             last_nudge = Instant::now();
             crate::session_state::nudge_idle();
         }
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(if system { 250 } else { 500 }));
     }
     crate::session_state::set_keep_awake(false);
 }
@@ -714,7 +725,12 @@ fn cursor_thread(sh: Arc<Shared>, tx: Sender<CursorUpdate>) {
     let mut tracker = CursorTracker::new();
     let mut last_rect = crate::Rect::default();
     let mut scale = 1.0f64;
+    // SYSTEM: the cursor of the input desktop (lock screen) is only readable from that desktop.
+    let mut follower = crate::session_state::DesktopFollower::new("cursor", Duration::from_millis(100), false);
     while !sh.stop.load(Ordering::Relaxed) {
+        if follower.poll() {
+            tracker.reset(); // shapes / handles differ per desktop
+        }
         if !sh.ready.load(Ordering::Relaxed) {
             tracker.reset(); // the next client gets shape + position again
             std::thread::sleep(Duration::from_millis(50));
@@ -1134,6 +1150,9 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
     let mut locked_shown = false;
     let mut logs = LogAssembler::new();
     let mut input_gate = WarnGate::new();
+    // SYSTEM: SendInput only reaches the desktop of the calling thread. This thread owns no
+    // windows or hooks, so SetThreadDesktop works here (no dedicated injection thread needed).
+    let mut input_follow = crate::session_state::DesktopFollower::new("input", Duration::from_millis(50), false);
     let mut last_log_flush = Instant::now();
 
     loop {
@@ -1278,6 +1297,7 @@ fn run_session(ctx: &mut Ctx, transport: Transport, link: &'static str) -> Resul
                             warn!("input: bỏ qua thao tác vì màn hình đang khóa");
                         }
                     } else if let Some(inj) = ctx.injector.as_mut() {
+                        input_follow.poll();
                         // The captured output's rect follows mode changes: map onto the live one.
                         if let Ok(r) = ctx.sh.cap_rect.lock() {
                             if r.width() > 0 && r.height() > 0 {
@@ -1460,6 +1480,9 @@ fn run(argv: Vec<String>) -> Result<(), String> {
     };
     control::set_json_mode(a.json);
     let dpi_line = crate::session_state::set_dpi_aware();
+    if crate::session_state::running_as_system() {
+        info!("service: chạy dưới LocalSystem — theo dõi được desktop khóa/Winlogon (ghi hình + điều khiển khi khóa máy)");
+    }
     if !a.json && !a.list {
         // Under the GUI the GUI owns the log file (it receives these lines as JSON events).
         if let Some(p) = crate::logfile::init("remoteview-host") {

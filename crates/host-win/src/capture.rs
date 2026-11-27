@@ -216,6 +216,8 @@ pub struct Capturer {
     gdi_announced: bool,
     #[cfg(windows)]
     last_enum: Option<Instant>,
+    /// Keeps this thread on the input desktop (lock screen / UAC) when running as SYSTEM.
+    follower: crate::session_state::DesktopFollower,
 }
 
 impl Capturer {
@@ -237,7 +239,18 @@ impl Capturer {
             gdi_announced: false,
             #[cfg(windows)]
             last_enum: None,
+            follower: crate::session_state::DesktopFollower::new("capture", Duration::from_millis(250), false),
         }
+    }
+
+    #[cfg(windows)]
+    fn has_gdi(&self) -> bool {
+        self.gdi.is_some()
+    }
+
+    #[cfg(not(windows))]
+    fn has_gdi(&self) -> bool {
+        false
     }
 
     /// Output rectangle in virtual-desktop coordinates of the current source.
@@ -269,6 +282,19 @@ impl Capturer {
     /// Same contract as [`DesktopDuplicator::acquire`] but never returns an
     /// error: failures are handled internally.
     pub fn acquire(&mut self, timeout_ms: u32) -> Result<Option<CapturedFrame>> {
+        // SYSTEM only: the input desktop changed (Default <-> Winlogon). A duplication / DC made on
+        // the old desktop is useless, so drop both and re-open at once on the new one.
+        if self.follower.poll() && (self.dup.is_some() || self.has_gdi()) {
+            Self::log(crate::control::Level::Info, "capture: input desktop changed; re-opening capture".into());
+            self.dup = None;
+            #[cfg(windows)]
+            {
+                self.gdi = None;
+            }
+            self.retry_at = Instant::now();
+            self.backoff = Duration::from_millis(50);
+            self.fail_since = None;
+        }
         if let Some(d) = self.dup.as_mut() {
             match d.acquire(timeout_ms) {
                 Ok(f) => {
@@ -290,6 +316,7 @@ impl Capturer {
             }
         }
         if Instant::now() >= self.retry_at {
+            self.follower.poll_now(); // be on the right desktop before duplicating
             match DesktopDuplicator::open(self.prefer.as_deref()) {
                 Ok(d) => {
                     self.rect = d.desktop_rect();

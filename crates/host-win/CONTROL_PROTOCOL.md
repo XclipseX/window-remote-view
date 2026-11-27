@@ -63,3 +63,44 @@ bitrate live (no re-init when the encoder supports it); `set_fps` / `set_resolut
 the encoder (the client is told through `StreamConfig`). `new_otp` re-emits `status` with the
 new OTP; if a client is already connected it applies to the next connection. `stop` shuts
 down (process exits within 2 s at most).
+
+## Service pipe (lock screen support)
+
+Only a LocalSystem process in the user's console session can capture and control the Winlogon
+desktop (lock screen, sign-in, UAC). `RemoteView.exe --service` is a Windows service
+(`RemoteViewSvc`, display name "RemoteView Service", auto start, LocalSystem) that starts the very
+same engine as SYSTEM and relays the stdin/stdout JSON lines above over a named pipe. The GUI uses
+it when the pipe answers and falls back to a plain child process otherwise (same JSON either way,
+`HostCmd` / `HostEvent` unchanged).
+
+* Pipe: `\\.\pipe\RemoteViewSvc`, byte mode, one instance (one client at a time; others get
+  `ERROR_PIPE_BUSY`), remote clients rejected. ACL (SDDL) `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`:
+  SYSTEM and Administrators full control, interactive users read/write.
+* **First line from the client** (UTF-8, `\n`-terminated, <= 16 KiB, within 10 s):
+  `{"op":"spawn","args":["--usb","--fps","60","--json-status"]}`. `args` are the engine arguments
+  from the top of this document, *without* `--host-worker`.
+* The service **validates** `args` against an allow-list (`rv_host_win::service_proto`): only
+  `--usb --adb --lan --json-status` and `--display --mode --fps --width --height --quality --codec
+  --encoder --bitrate-mbps --otp --monitor <value>` with well-formed values (`--monitor` must be a
+  GDI name such as `\\.\DISPLAY1`); anything else (`--host-path`, `--bind`, paths, `--list`,
+  `--scan-all`, ...) is refused, and the engine's own parser must accept it as well. `--json-status`
+  is added when missing. On refusal / launch failure the service sends one
+  `{"event":"status","state":"error",...,"message":"service: ..."}` line and closes the pipe.
+* The service then launches **its own exe** with `--host-worker <args>`: a primary token duplicated
+  from the service's own SYSTEM token, `TokenSessionId` set to `WTSGetActiveConsoleSessionId()`,
+  `CreateProcessAsUserW`, desktop `winsta0\default`, `CREATE_NO_WINDOW`, stdin/stdout (and stderr)
+  on anonymous pipes. The environment is the logged-on user's when there is one (same
+  `%APPDATA%` / `%LOCALAPPDATA%`), SYSTEM's on the sign-in screen.
+* After that the pipe is transparent: worker stdout lines -> client, client lines -> worker stdin.
+  stderr lines arrive as non-JSON lines (the GUI shows them as log lines).
+* Client disconnects: the service writes `{"cmd":"stop"}` to the worker, waits 3 s, then
+  terminates it. Worker exits: the service closes the pipe (the GUI's supervisor restarts it with
+  backoff, like a crashed child). Service stop (`sc stop RemoteViewSvc`): same as a disconnect.
+* As SYSTEM the worker attaches its capture, cursor, input and monitor threads to the *input
+  desktop* (`OpenInputDesktop` + `SetThreadDesktop`) and logs `desktop: Default -> Winlogon`; the
+  "locked" gate (`LOCKED_MESSAGE`, input dropped while locked) is disabled in that mode.
+
+Install / uninstall (elevated, one UAC prompt from the GUI):
+`RemoteView.exe --install-all <dir|->` installs SudoVDA from `<dir>` (`-` = skip) and creates or
+updates the service (`"<this exe>" --service`) and starts it; `RemoteView.exe --uninstall-service`
+stops and deletes it.

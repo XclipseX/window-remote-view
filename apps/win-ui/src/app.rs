@@ -68,6 +68,8 @@ pub struct App {
     vdd_busy: bool,
     vdd_tried: bool,
     vdd_present: bool,
+    /// RemoteView service (shows / controls the lock screen) is registered.
+    svc_present: bool,
     /// Connect to this device as soon as its driver install succeeds.
     connect_after_driver: Option<DeviceItem>,
     local_ip: String,
@@ -173,6 +175,7 @@ impl App {
             vdd_busy: false,
             vdd_tried: false,
             vdd_present: rv_host_win::sudovda::driver_present(),
+            svc_present: driver::service_installed(),
             connect_after_driver: None,
             local_ip: util::local_ip(),
             demo: None,
@@ -187,9 +190,14 @@ impl App {
         };
         if !demo {
             app.refresh_outputs();
-            // Cài driver màn hình ảo ngay lần đầu mở app (một hộp thoại UAC), không cần bấm nút.
-            if cfg!(windows) && driver::vdd_bundled() && !app.vdd_present && !app.cfg.vdd_auto_declined {
-                app.install_vdd(false);
+            // Cài driver màn hình ảo + dịch vụ RemoteView (xem/điều khiển cả màn hình khóa) ngay lần
+            // đầu mở app: một hộp thoại UAC, không cần bấm nút. Thiếu dịch vụ (driver đã có) vẫn chạy một lần.
+            if cfg!(windows) && !app.cfg.vdd_auto_declined {
+                if driver::vdd_bundled() && !app.vdd_present {
+                    app.install_vdd(false);
+                } else if !app.svc_present {
+                    app.install_service();
+                }
             }
         }
         if !demo && app.cfg.auto_update_check {
@@ -285,20 +293,34 @@ impl App {
         });
     }
 
+    /// Chỉ cài dịch vụ RemoteView (driver màn hình ảo đã có): một hộp thoại UAC.
+    fn install_service(&mut self) {
+        self.vdd_busy = true;
+        self.driver_note = Some((true, "Đang cài dịch vụ RemoteView (xem được cả màn hình khóa)... hãy bấm \"Có\" ở hộp thoại quyền quản trị.".into()));
+        self.log(LogLevel::Info, "Đang cài dịch vụ RemoteView".into());
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let r = driver::install_service();
+            let _ = tx.send(UiMsg::Vdd((r, false)));
+            ctx.request_repaint();
+        });
+    }
+
     fn vdd_done(&mut self, (result, then_start): (DriverResult, bool)) {
         self.vdd_busy = false;
         self.vdd_present = rv_host_win::sudovda::driver_present();
+        self.svc_present = driver::service_installed();
         match result {
             DriverResult::Installed => {
-                self.log(LogLevel::Info, "Đã cài driver màn hình ảo".into());
-                self.driver_note = Some((true, "Đã cài driver màn hình ảo.".into()));
+                self.log(LogLevel::Info, "Đã cài driver màn hình ảo và dịch vụ RemoteView".into());
+                self.driver_note = Some((true, "Đã cài driver màn hình ảo và dịch vụ RemoteView (xem được cả màn hình khóa).".into()));
             }
             DriverResult::Cancelled => {
                 // Không hỏi lại mỗi lần mở app; vẫn còn nút "Cài / cài lại" và lần chia sẻ cần màn ảo.
                 self.cfg.vdd_auto_declined = true;
                 self.cfg.save();
                 self.log(LogLevel::Warn, "Bạn đã từ chối quyền quản trị, chưa cài driver màn hình ảo".into());
-                self.driver_note = Some((false, "Chưa cài driver màn hình ảo vì bạn từ chối quyền quản trị.".into()));
+                self.driver_note = Some((false, "Chưa cài driver màn hình ảo / dịch vụ vì bạn từ chối quyền quản trị.".into()));
             }
             DriverResult::Failed(e) => {
                 self.log(LogLevel::Error, format!("Cài driver màn hình ảo thất bại: {e}"));
@@ -1106,6 +1128,19 @@ impl App {
                         let can = cfg!(windows) && driver::vdd_bundled() && !self.vdd_busy;
                         if ui.add_enabled(can, egui::Button::new("Cài / cài lại")).clicked() {
                             self.install_vdd(false);
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label("Dịch vụ (màn hình khóa)");
+                    ui.horizontal(|ui| {
+                        if self.svc_present {
+                            ui.colored_label(Color32::from_rgb(60, 170, 90), "Đã cài (xem/điều khiển được màn hình khóa)");
+                        } else {
+                            ui.colored_label(Color32::from_rgb(230, 160, 40), "Chưa cài (khi khóa máy sẽ không thấy gì)");
+                        }
+                        if ui.add_enabled(cfg!(windows) && !self.vdd_busy, egui::Button::new("Cài / cài lại")).clicked() {
+                            self.install_service();
                         }
                     });
                     ui.end_row();

@@ -54,7 +54,16 @@ pub fn vdd_bundled() -> bool {
         || std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("sudovda").join("SudoVDA.inf").exists())).unwrap_or(false)
 }
 
-/// Installs SudoVDA: runs this exe elevated with `--install-vdd <dir>`. Blocking.
+#[cfg(windows)]
+use crate::service::INSTALL_ALL_FLAG;
+
+/// Whether the RemoteView service (lock-screen support) is registered.
+pub fn service_installed() -> bool {
+    crate::service::service_installed()
+}
+
+/// Installs the SudoVDA driver **and** the RemoteView service with one UAC prompt: runs this exe
+/// elevated with `--install-all <dir>`. Blocking.
 pub fn install_vdd() -> DriverResult {
     #[cfg(windows)]
     {
@@ -66,12 +75,27 @@ pub fn install_vdd() -> DriverResult {
             Ok(m) => m,
             Err(e) => return DriverResult::Failed(e.to_string()),
         };
-        run_elevated(&me, &format!("{INSTALL_VDD_FLAG} \"{}\"", dir.display()))
+        run_elevated(&me, &format!("{INSTALL_ALL_FLAG} \"{}\"", dir.display()))
     }
     #[cfg(not(windows))]
     {
         let _ = locate_vdd as fn() -> _;
         DriverResult::Failed("chỉ hỗ trợ cài driver trên Windows".into())
+    }
+}
+
+/// Installs only the RemoteView service (driver already present): `--install-all -`. Blocking.
+pub fn install_service() -> DriverResult {
+    #[cfg(windows)]
+    {
+        match std::env::current_exe() {
+            Ok(me) => run_elevated(&me, &format!("{INSTALL_ALL_FLAG} -")),
+            Err(e) => DriverResult::Failed(e.to_string()),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        DriverResult::Failed("chỉ hỗ trợ cài dịch vụ trên Windows".into())
     }
 }
 

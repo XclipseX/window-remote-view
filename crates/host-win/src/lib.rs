@@ -13,6 +13,7 @@ pub mod encode;
 pub mod engine;
 pub mod input;
 pub mod logfile;
+pub mod service_proto;
 pub mod session_state;
 pub mod sysinfo;
 pub mod sudovda;
