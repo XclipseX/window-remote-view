@@ -323,7 +323,13 @@ class MainActivity : ComponentActivity() {
                     screen = Screen.HOME
                 } else {
                     BackHandler { endSession(); screen = Screen.HOME }
-                    SessionScreen(s, showModifierBar = !s.usbDisplay || settings.usbShowModifierBar, debugEnabled = settings.debugOverlay)
+                    SessionScreen(
+                        s,
+                        showModifierBar = !s.usbDisplay || settings.usbShowModifierBar,
+                        debugEnabled = settings.debugOverlay,
+                        showFpsHud = settings.showFpsHud,
+                        onFpsHudChanged = { on -> settings = settings.copy(showFpsHud = on).also { repo.save(it) } },
+                    )
                 }
             }
         }

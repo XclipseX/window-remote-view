@@ -12,7 +12,7 @@ data class StreamSettings(
     /** 30 / 60 / 90 / 120. */
     val fps: Int = 120,
     /** 1..100 -> ánh xạ ra bitrate. */
-    val qualityPercent: Int = 70,
+    val qualityPercent: Int = 85,
     val codec: CodecPreference = CodecPreference.AUTO,
     val hardwareDecode: Boolean = true,
     val allowAv1: Boolean = false,
@@ -33,6 +33,8 @@ data class StreamSettings(
     val autoCheckUpdate: Boolean = true,
     /** Tự gửi log hiện tại lên máy tính khi phiên kết thúc vì lỗi. */
     val autoSendLogOnError: Boolean = true,
+    /** Hiện bộ đo FPS (FPS/Avg/1% low/ms±σ/variance) trong phiên. */
+    val showFpsHud: Boolean = false,
 ) {
     /** Placeholder: 5..120 Mbps tuyến tính theo chất lượng (mặc định LAN 60–120 Mbps). */
     fun targetBitrateKbps(): Int = 5_000 + ((qualityPercent.coerceIn(1, 100) - 1) / 99f * 115_000).toInt()
@@ -67,6 +69,7 @@ class SettingsRepository(context: Context) {
             debugOverlay = prefs.getBoolean("dbg_overlay", d.debugOverlay),
             autoCheckUpdate = prefs.getBoolean("upd_auto", d.autoCheckUpdate),
             autoSendLogOnError = prefs.getBoolean("log_auto_send", d.autoSendLogOnError),
+            showFpsHud = prefs.getBoolean("fps_hud", d.showFpsHud),
         )
     }
 
@@ -88,6 +91,7 @@ class SettingsRepository(context: Context) {
             .putBoolean("dbg_overlay", s.debugOverlay)
             .putBoolean("upd_auto", s.autoCheckUpdate)
             .putBoolean("log_auto_send", s.autoSendLogOnError)
+            .putBoolean("fps_hud", s.showFpsHud)
             .apply()
     }
 }

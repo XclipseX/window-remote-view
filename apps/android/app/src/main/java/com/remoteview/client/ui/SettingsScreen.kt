@@ -232,6 +232,10 @@ private fun CategoryContent(
             }
         }
         Category.DEBUG -> {
+            SwitchRow(R.string.settings_fps_hud, R.string.settings_fps_hud_hint, settings.showFpsHud) {
+                onChange(settings.copy(showFpsHud = it))
+            }
+            RowDivider()
             SwitchRow(R.string.settings_debug_overlay, R.string.settings_debug_overlay_hint, settings.debugOverlay) {
                 onChange(settings.copy(debugOverlay = it))
             }

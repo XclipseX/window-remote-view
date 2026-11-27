@@ -63,11 +63,17 @@ import com.remoteview.client.session.SessionController
 
 /** Màn hình điều khiển: SurfaceView toàn màn + thanh phím nổi. */
 @Composable
-fun SessionScreen(controller: SessionController, showModifierBar: Boolean = true, debugEnabled: Boolean = true) {
+fun SessionScreen(
+    controller: SessionController,
+    showModifierBar: Boolean = true,
+    debugEnabled: Boolean = true,
+    showFpsHud: Boolean = false,
+    onFpsHudChanged: (Boolean) -> Unit = {},
+) {
     val usb = controller.usbDisplay
     val view = LocalView.current
-    if (usb) {
-        // Màn hình phụ: immersive toàn màn hình, tắt cạnh tai thỏ, luôn sáng.
+    run {
+        // Mọi phiên: immersive toàn màn hình, ẩn thanh hệ thống, tắt cạnh tai thỏ, luôn sáng.
         DisposableEffect(Unit) {
             val window = (view.context as? Activity)?.window
             if (window != null) {
@@ -98,6 +104,8 @@ fun SessionScreen(controller: SessionController, showModifierBar: Boolean = true
     val streamSize by controller.streamSize.collectAsState()
     val aspect = if (streamSize.second > 0) streamSize.first.toFloat() / streamSize.second.toFloat() else 16f / 9f
     var zoomState by remember { mutableStateOf(Triple(1f, 0f, 0f)) }
+    var hudOn by remember { mutableStateOf(showFpsHud) }
+    LaunchedEffect(hudOn) { controller.setHudEnabled(hudOn) }
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         // Khung video đúng tỉ lệ luồng, căn giữa; phần còn lại đen (letterbox/pillarbox) và không nhận chạm.
         // Toàn bộ ánh xạ chạm/bút dùng kích thước của View này = content rect.
@@ -143,6 +151,22 @@ fun SessionScreen(controller: SessionController, showModifierBar: Boolean = true
                 )
             }
         }
+        if (hudOn) {
+            // Không nhận chạm: Box thường, không clickable/pointerInput.
+            val hud by controller.hud.collectAsState()
+            Text(
+                hudText(hud),
+                color = Color(0xFFE8FFE8),
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+                lineHeight = 14.sp,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(top = 8.dp, start = 8.dp)
+                    .background(Color(0x99000000), RoundedCornerShape(8.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+            )
+        }
         // --- Gỡ lỗi + chờ hình ---
         var tick by remember { mutableStateOf(0) }
         LaunchedEffect(Unit) { while (true) { tick++; delay(500) } }
@@ -172,7 +196,7 @@ fun SessionScreen(controller: SessionController, showModifierBar: Boolean = true
             Column(
                 modifier = Modifier
                     .align(Alignment.TopStart)
-                    .padding(top = 8.dp, start = 8.dp)
+                    .padding(top = if (hudOn) 64.dp else 8.dp, start = 8.dp)
                     .background(Color(0xB31C1B1F), RoundedCornerShape(16.dp))
                     .border(1.dp, Color(0x33FFFFFF), RoundedCornerShape(16.dp))
                     .padding(12.dp),
@@ -183,6 +207,15 @@ fun SessionScreen(controller: SessionController, showModifierBar: Boolean = true
                     fontFamily = FontFamily.Monospace,
                     fontSize = 11.sp,
                     lineHeight = 13.sp,
+                )
+                Text(
+                    stringResource(R.string.session_fps_hud_toggle),
+                    color = Color(0xFF9CFF9C),
+                    fontSize = 13.sp,
+                    modifier = Modifier
+                        .padding(top = 8.dp)
+                        .clickable { hudOn = !hudOn; onFpsHudChanged(hudOn) }
+                        .padding(vertical = 6.dp),
                 )
                 Text(
                     stringResource(R.string.log_upload),
@@ -233,6 +266,15 @@ fun SessionScreen(controller: SessionController, showModifierBar: Boolean = true
 fun rememberSessionController(settings: StreamSettings): SessionController {
     val activity = LocalContext.current as Activity
     return remember(settings) { SessionController(activity, settings) }
+}
+
+private fun hudText(h: com.remoteview.client.session.HudState): String {
+    val s = h.stats
+    fun f1(v: Float) = String.format(java.util.Locale.US, "%.1f", v)
+    val line1 = "FPS ${s.fpsNow.roundToInt()} · Avg ${f1(s.avgFps)} · 1% ${f1(s.low1Fps)} · ${f1(s.meanMs)}±${f1(s.stdMs)} ms · var ${f1(s.varianceMs2)}"
+    val res = if (h.width > 0 && h.height > 0) "${h.width}x${h.height}" else "-"
+    val drop = if (h.dropped > 0) " · bỏ ${h.dropped}" else ""
+    return "$line1\n${h.decoderName} · $res$drop"
 }
 
 private fun debugText(d: com.remoteview.client.session.DebugSnapshot, now: Long): String {

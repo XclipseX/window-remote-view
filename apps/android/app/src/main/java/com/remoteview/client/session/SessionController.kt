@@ -116,6 +116,34 @@ class SessionController(
         )
     }
 
+    private val _hud = MutableStateFlow(HudState())
+    /** Số liệu FPS cho lớp phủ; chỉ được cập nhật khi [setHudEnabled](true). */
+    val hud: StateFlow<HudState> = _hud
+    @Volatile private var hudEnabled = false
+    private val hudTick = object : Runnable {
+        override fun run() {
+            if (released || !hudEnabled) return
+            val pres = presenter
+            val (w, h) = _streamSize.value
+            _hud.value = HudState(
+                stats = pres?.stats?.snapshot(System.nanoTime()) ?: com.remoteview.client.render.FrameStatsSnapshot(),
+                decoderName = decoder?.info?.codecName ?: "-",
+                width = w,
+                height = h,
+                dropped = pres?.droppedStale?.get() ?: 0L,
+            )
+            mainHandler.postDelayed(this, HUD_INTERVAL_MS)
+        }
+    }
+
+    /** Bật/tắt bộ đo FPS. Gọi từ main thread. */
+    fun setHudEnabled(on: Boolean) {
+        if (hudEnabled == on) return
+        hudEnabled = on
+        mainHandler.removeCallbacks(hudTick)
+        if (on && !released) mainHandler.post(hudTick)
+    }
+
     private val _reconnecting = MutableStateFlow(false)
     /** true khi host im lặng (state 4): UI hiện lớp phủ "đang kết nối lại", không thoát phiên. */
     val reconnecting: StateFlow<Boolean> = _reconnecting
@@ -470,5 +498,6 @@ class SessionController(
 
     private companion object {
         const val CONFIG_WAIT_MS = 1500L
+        const val HUD_INTERVAL_MS = 500L
     }
 }

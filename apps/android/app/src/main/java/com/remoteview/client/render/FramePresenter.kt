@@ -28,6 +28,9 @@ class FramePresenter(
     val presented = AtomicLong()
     val droppedStale = AtomicLong()
 
+    /** Số liệu FPS/1% low/variance của các khung thực sự được trả ra surface. */
+    val stats = FrameStats()
+
     private val main = Handler(Looper.getMainLooper())
     private val lock = Any()
     private val pending = ArrayList<Int>(4)
@@ -44,8 +47,10 @@ class FramePresenter(
     /** Callback từ LowLatencyDecoder.onOutput. */
     fun onOutput(index: Int, @Suppress("UNUSED_PARAMETER") ptsUs: Long) {
         if (mode == Mode.DIRECT) {
-            releaser.releaseAt(index, System.nanoTime())
+            val now = System.nanoTime()
+            releaser.releaseAt(index, now)
             presented.incrementAndGet()
+            stats.record(now)
             noteFrame()
             return
         }
@@ -72,6 +77,8 @@ class FramePresenter(
         }
         releaser.releaseAt(batch.last(), frameTimeNanos)
         presented.incrementAndGet()
+        // frameTimeNanos cùng gốc với System.nanoTime và khớp vsync -> phản ánh nhịp hiển thị thật.
+        stats.record(frameTimeNanos)
         noteFrame()
     }
 

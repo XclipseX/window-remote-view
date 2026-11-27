@@ -337,6 +337,9 @@
     <string name="log_copied">Đã sao chép nhật ký</string>
     <string name="log_empty">Chưa có dòng nhật ký nào.</string>
     <string name="log_share">Chia sẻ file log</string>
+    <string name="settings_fps_hud">Hiện bộ đo FPS</string>
+    <string name="settings_fps_hud_hint">FPS, trung bình, 1% thấp nhất, thời gian khung ± độ lệch và phương sai trong phiên</string>
+    <string name="session_fps_hud_toggle">Bật/tắt bộ đo FPS</string>
     <string name="log_upload">Gửi log lên máy tính</string>
     <string name="log_upload_ok">Đã gửi log lên máy tính</string>
     <string name="log_upload_fail">Gửi log thất bại</string>

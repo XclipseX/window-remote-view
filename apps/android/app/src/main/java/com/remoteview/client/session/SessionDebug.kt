@@ -20,3 +20,13 @@ data class DebugSnapshot(
     /** SystemClock.elapsedRealtime() lúc state ESTABLISHED lần đầu; 0 nếu chưa. */
     val establishedAtMs: Long = 0,
 )
+
+/** Số liệu cho bộ đo FPS trong phiên (cập nhật ~2 lần/giây). */
+data class HudState(
+    val stats: com.remoteview.client.render.FrameStatsSnapshot = com.remoteview.client.render.FrameStatsSnapshot(),
+    val decoderName: String = "-",
+    val width: Int = 0,
+    val height: Int = 0,
+    /** Số khung giải mã xong nhưng bị bỏ vì có khung mới hơn (chỉ chế độ Choreographer). */
+    val dropped: Long = 0,
+)
