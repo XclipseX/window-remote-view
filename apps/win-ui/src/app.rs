@@ -187,6 +187,10 @@ impl App {
         };
         if !demo {
             app.refresh_outputs();
+            // Cài driver màn hình ảo ngay lần đầu mở app (một hộp thoại UAC), không cần bấm nút.
+            if cfg!(windows) && driver::vdd_bundled() && !app.vdd_present && !app.cfg.vdd_auto_declined {
+                app.install_vdd(false);
+            }
         }
         if !demo && app.cfg.auto_update_check {
             app.check_update(false);
@@ -290,6 +294,9 @@ impl App {
                 self.driver_note = Some((true, "Đã cài driver màn hình ảo.".into()));
             }
             DriverResult::Cancelled => {
+                // Không hỏi lại mỗi lần mở app; vẫn còn nút "Cài / cài lại" và lần chia sẻ cần màn ảo.
+                self.cfg.vdd_auto_declined = true;
+                self.cfg.save();
                 self.log(LogLevel::Warn, "Bạn đã từ chối quyền quản trị, chưa cài driver màn hình ảo".into());
                 self.driver_note = Some((false, "Chưa cài driver màn hình ảo vì bạn từ chối quyền quản trị.".into()));
             }

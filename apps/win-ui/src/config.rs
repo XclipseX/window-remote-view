@@ -68,9 +68,9 @@ impl Encoder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Display {
-    #[default]
     Mirror,
     Extend,
+    #[default]
     /// RemoteView's own virtual monitor (SudoVDA), made the main display.
     Virtual,
 }
@@ -99,6 +99,8 @@ pub struct Config {
     pub monitor: Option<String>,
     pub autostart: bool,
     pub minimize_to_tray: bool,
+    /// The user declined the automatic virtual display driver install (UAC) once.
+    pub vdd_auto_declined: bool,
     /// Check GitHub for a newer build on startup.
     pub auto_update_check: bool,
     /// Optional explicit path to rv-host executable.
@@ -114,10 +116,11 @@ impl Default for Config {
             quality: 80,
             codec: Codec::Auto,
             encoder: Encoder::Auto,
-            display: Display::Mirror,
+            display: Display::Virtual,
             monitor: None,
             autostart: false,
             minimize_to_tray: false,
+            vdd_auto_declined: false,
             auto_update_check: true,
             host_path: None,
         }
